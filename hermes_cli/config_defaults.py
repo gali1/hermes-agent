@@ -1319,7 +1319,7 @@ DEFAULT_CONFIG = {
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
-        # External memory provider plugin (empty = built-in only); only ONE at a time: "holographic",
+        # External memory provider plugin (empty = built-in only); only ONE at a time: "rekal", "holographic",
         # "retaindb", "byterover", or a catalog-installed one ("honcho", "hindsight", "supermemory",
         # "mem0", "openviking").
         "provider": "",

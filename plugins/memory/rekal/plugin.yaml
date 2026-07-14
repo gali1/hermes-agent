@@ -1,0 +1,3 @@
+name: rekal
+version: 1.0.0
+description: "Rekal local SQLite memory engine with FTS5 hybrid search, conflict detection, memory lifecycle, and session ingest."
