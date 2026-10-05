@@ -257,6 +257,34 @@ def test_temporal_retrieval(tmp_path):
     assert plain["retrieval"].get("temporal_window") is None
 
 
+def test_query_aware_boosts_and_lexical_anchor(tmp_path):
+    store = make_store(tmp_path)
+    exact = store.store(
+        "Error ERR_4512 raised by module auth_service on login", project="p"
+    )["memory_id"]
+    linked = store.store(
+        "Troubleshooting notes for authentication failures in production", project="p"
+    )["memory_id"]
+    store.link(exact, linked, "related_to")
+
+    # Lookup-shaped query: FTS leads and the strongest BM25 hit is pinned at
+    # rank 1 even though the linked graph candidate carries a graph bonus.
+    lookup = store.search(
+        "ERR_4512 auth_service", limit=5, project="p", fusion="rrf", graph_expand=True
+    )
+    assert lookup["results"][0]["id"] == exact
+    assert lookup["results"][0].get("anchored") is True
+    assert lookup["retrieval"].get("anchored") == exact
+    assert linked in [r["id"] for r in lookup["results"]]
+
+    # Conceptual query: no lexical anchor is applied.
+    conceptual = store.search(
+        "what do we know about authentication failures?",
+        limit=5, project="p", fusion="rrf", graph_expand=True,
+    )
+    assert "anchored" not in conceptual["retrieval"]
+
+
 def test_failure_containment(tmp_path):
     store = make_store(tmp_path)
     store.store("A memory about container scheduling", project="p")

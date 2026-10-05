@@ -4,6 +4,46 @@ All notable changes to this project are documented here. Entries follow
 GitHub release-note style: feature, change, test, documentation and
 installation categories with a compare link per release.
 
+## 2026-10-05 — Retrieval calibration: query-aware boosts + lexical anchor (`2026-10-05-fastembed` branch)
+
+Follow-up to the branch's vector work, measured with `scripts/memory_eval.py`
+on 400 real session messages (200 memories, 732 queries).
+
+### ✨ Features
+
+- `infer_strategy_boosts()` (`agent/memory/ranking.py`): rule-based query
+  classification feeds the existing rank-space boosts — natural-language
+  questions lean on the vector/graph arms, identifiers/quoted spans/filenames/
+  versions/short keyword bags lean on FTS. Boosts are filtered to arms that
+  actually produced candidates, and a question classification with no semantic
+  arm degrades to plain RRF instead of damping FTS.
+- **Lexical anchoring**: for lookup-shaped queries the strongest BM25 candidate
+  is pinned at rank 1 when it is a strong match or a clear leader, so graph or
+  vector arms cannot displace exact matches. Exposed as `retrieval.anchored`
+  and a per-result `anchored` flag. Question-like queries are never anchored.
+- `DEFAULT_RRF_K` 60 → 20: sharpens rank differences for the handful of short
+  arms a memory store fuses.
+
+### 🔧 Changed
+
+- Deterministic candidate iteration in `MemoryStore._search_inner` (ordered
+  list instead of a set): set order varied with `PYTHONHASHSEED` across
+  processes, so identical searches could return different orderings run to run.
+- `MemoryStore.search(..., track_access=False)` added; the eval harness uses it
+  so benchmarking does not mutate access counts mid-run.
+
+### 📊 Eval (before → after)
+
+- hybrid overall: R@1 `0.30 → 0.54`, R@5 `0.75 → 0.79`, MRR `0.45 → 0.64`
+- exact lookups: R@1 `0.22 → 0.75–0.82`, R@5 `0.91 → 0.99`
+- keywords: R@1 `0.52 → 0.64–0.80`
+- concept: R@1 `0.23 → 0.32–0.38`; entity R@5 `0.51 → 0.55`
+
+### 🧪 Tests
+
+- 248 targeted tests pass; new tests cover the classifier, the anchor, the
+  effective-boost filtering, and the ordered candidate iteration.
+
 ## 2026-10-05 — Experimental FastEmbed vector backend (`2026-10-05-fastembed` branch)
 
 Experimental branch for trying the vector path. Not intended to merge into

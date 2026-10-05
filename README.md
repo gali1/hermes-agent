@@ -431,7 +431,15 @@ ln -sfn ~/hermes-agent-fastembed/.venv/bin/hermes ~/.local/bin/hermes
 python scripts/memory_eval.py --vector-backend fastembed --limit 600
 ```
 
-Run it from the clone with the venv active.
+Run it from the clone with the venv active. The first run downloads
+`BAAI/bge-small-en-v1.5` (~130 MB, cached afterwards). The harness mines
+durable candidates from `$HERMES_HOME/state.db`, derives queries per memory,
+and reports recall@1 / recall@k / MRR for `fts`, `hybrid`, `vector` and
+`hybrid+vector`. No memory contents are printed. A lexical/hybrid baseline on
+400 real messages (200 memories, 732 queries) shows the calibrated hybrid at
+overall R@1 0.54 / R@5 0.79 versus FTS 0.41 / 0.43, with exact-lookup R@1 at
+0.75–0.82 — run the vector column to see whether embeddings add to that on
+your data.
 
 | Config key                        | Default         | Meaning                                                                                        |
 | --------------------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
