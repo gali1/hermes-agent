@@ -18,6 +18,14 @@ import math
 # large, between rank 200 and 201 negligible.
 DEFAULT_RRF_K = 60
 
+# Hard ceiling for the vector arm's contribution to the additive relevance
+# score (enforced by ``MemoryStore._resolve_weights``).  Embeddings are
+# high-recall but low-precision: above this share, semantically-adjacent noise
+# can outrank exact lexical matches.  The separate ``vector_max_share`` cap in
+# the store bounds how many vector-only memories may appear near the top of a
+# fused result list.
+MAX_VECTOR_WEIGHT = 0.4
+
 
 def reciprocal_rank_fusion(result_lists, k=DEFAULT_RRF_K):
     """Fuse ranked candidate lists by rank position rather than by score.

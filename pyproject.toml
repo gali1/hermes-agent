@@ -291,6 +291,10 @@ matrix = [
 # replacement for stdlib xml.etree.ElementTree) to block billion-laughs
 # and XXE. aiohttp/httpx are already in [messaging]; defusedxml lands
 # here to keep the dependency local to wecom_callback's threat model.
+# Local embedding backend for the enhanced memory layer's optional vector arm
+# (memory.enhanced.vector_backend: fastembed). Opt-in only; deliberately not
+# in [all], mirroring the other heavy/niche backends.
+fastembed = ["fastembed>=0.4,<1"]
 wecom = ["defusedxml==0.7.1"]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [

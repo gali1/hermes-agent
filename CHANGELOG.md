@@ -4,6 +4,55 @@ All notable changes to this project are documented here. Entries follow
 GitHub release-note style: feature, change, test, documentation and
 installation categories with a compare link per release.
 
+## 2026-10-05 — Experimental FastEmbed vector backend (`2026-10-05-fastembed` branch)
+
+Experimental branch for trying the vector path. Not intended to merge into
+`main` as-is.
+
+### ✨ Features
+
+- **Feature-flagged vector ladder** behind `memory.enhanced.vector_backend`:
+  `none` (default), `fastembed` (local ONNX, no PyTorch), `remote`
+  (OpenAI-compatible `/embeddings`), `mempalace` adapter.
+- **Async embedding indexer**: a daemon worker batches backfill of missing
+  embeddings (`vector_index_batch`), so store/search never block on embedding;
+  graceful degradation to FTS5-only when the provider is absent.
+- **Bounded influence**: `w_vec` is hard-capped at `0.4`, and vector-only
+  entries are capped at `vector_max_share` of fused results — the vector arm
+  can never dominate lexical retrieval.
+- **Recall@k eval harness** (`agent/memory/eval.py` + `scripts/memory_eval.py`):
+  mines durable candidates from a real `$HERMES_HOME/state.db`, derives
+  exact/keyword/entity/concept queries per memory, and reports recall@1,
+  recall@k and MRR for `fts`, `hybrid`, `vector` and `hybrid+vector` without
+  printing memory contents.
+
+### 🔧 Changed
+
+- `agent/memory/store.py`: `memory_embeddings` table (FK cascade), embedding
+  lifecycle methods, vector-id resolution into the hybrid candidate set,
+  `set_vector_weight` / `set_vector_max_share`, vector-only share cap in RRF,
+  embedding counts in `health()`.
+- `agent/memory/backend.py`: vector support lifecycle in `initialize`/`shutdown`,
+  enqueue on store/write/remember, `embedding` block in `health()`.
+- `hermes_cli/config.py`: `vector_backend`, `vector_model`, `vector_weight`,
+  `vector_max_share`, `vector_index_batch`, `vector_remote` defaults.
+- `pyproject.toml`: optional extra `fastembed = ["fastembed>=0.4,<1"]` (not in
+  `[all]`). `uv.lock` is not regenerated on this experimental branch (no `uv`
+  in the environment) — run `uv lock` before any merge.
+
+### 🧪 Tests
+
+- 17 new tests: `tests/agent/test_memory_vector.py` (12) and
+  `tests/agent/test_memory_eval.py` (5); 243 pass across the targeted memory
+  matrix.
+
+### 📊 Baseline (real session data, lexical/hybrid only)
+
+- 400 messages → 200 memories → 732 queries: overall R@5 `0.430` (fts) →
+  `0.757` (hybrid RRF); concept-query R@5 `0.025` → `0.555`; entity-query R@5
+  `0.023` → `0.508`. Vector columns require `pip install '.[fastembed]'` and a
+  one-time model download.
+
 ## 2026-10-05 — Enhanced memory layer, upstream Rekal plugin & install docs
 
 **Full Changelog**:

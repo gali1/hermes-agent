@@ -30,6 +30,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from array import array
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +38,7 @@ from agent.memory.contradiction import detect_contradiction
 from agent.memory.dedup import is_degenerate
 from agent.memory.graph import expand_links
 from agent.memory.ranking import (
+    MAX_VECTOR_WEIGHT,
     boosted_rrf_score,
     combined_score,
     proof_norm,
@@ -142,6 +144,15 @@ CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance DESC);
 CREATE INDEX IF NOT EXISTS idx_links_from          ON memory_links(from_id);
 CREATE INDEX IF NOT EXISTS idx_links_to            ON memory_links(to_id);
 CREATE INDEX IF NOT EXISTS idx_links_relation      ON memory_links(relation);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON memory_embeddings(model);
 """
 
 _MIGRATIONS = [
@@ -289,6 +300,8 @@ class MemoryStore:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._write_lock = threading.RLock()
+        self._vector_max_share = 0.5
+        self._vector_weight: Optional[float] = None
         self.db = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -736,6 +749,149 @@ class MemoryStore:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
+    # -- Embeddings ---------------------------------------------------------
+
+    def set_vector_max_share(self, value) -> None:
+        """Bound the share of fused results that may be vector-only."""
+        try:
+            self._vector_max_share = max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            self._vector_max_share = 0.5
+
+    def set_vector_weight(self, value) -> None:
+        """Set the default vector-arm weight, hard-capped at MAX_VECTOR_WEIGHT.
+
+        Applied as a default only: per-project ``memory_config`` rows and
+        per-call ``w_vec`` arguments still override it, and the final value is
+        clamped so the vector arm can never dominate lexical retrieval.
+        """
+        try:
+            self._vector_weight = max(0.0, min(MAX_VECTOR_WEIGHT, float(value)))
+        except (TypeError, ValueError):
+            self._vector_weight = None
+
+    def set_embedding(self, memory_id: str, vector, model: str) -> bool:
+        """Persist a float32 embedding for a memory. Failure-safe."""
+        try:
+            values = [float(x) for x in vector]
+            if not values:
+                return False
+            blob = array("f", values).tobytes()
+            with self._write_lock:
+                self._execute(
+                    "INSERT INTO memory_embeddings (memory_id, model, dim, vector, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(memory_id) DO UPDATE SET model = excluded.model, "
+                    "dim = excluded.dim, vector = excluded.vector, updated_at = excluded.updated_at",
+                    (memory_id, str(model), len(values), blob, _now()),
+                )
+                self._commit()
+            return True
+        except Exception:
+            logger.debug("memory set_embedding failed", exc_info=True)
+            return False
+
+    def get_embedding(self, memory_id: str) -> Optional[Tuple[List[float], str, int]]:
+        """Return ``(vector, model, dim)`` for a memory, or None."""
+        try:
+            row = self._execute(
+                "SELECT model, dim, vector FROM memory_embeddings WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()
+            if not row:
+                return None
+            values = array("f")
+            values.frombytes(row["vector"])
+            return list(values), row["model"], int(row["dim"])
+        except Exception:
+            logger.debug("memory get_embedding failed", exc_info=True)
+            return None
+
+    def delete_embedding(self, memory_id: str) -> bool:
+        try:
+            with self._write_lock:
+                self._execute(
+                    "DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,)
+                )
+                self._commit()
+            return True
+        except Exception:
+            logger.debug("memory delete_embedding failed", exc_info=True)
+            return False
+
+    def load_embeddings(self, model: str) -> Dict[str, List[float]]:
+        """All stored vectors for ``model`` as ``{memory_id: [floats]}``."""
+        try:
+            rows = self._execute(
+                "SELECT memory_id, vector FROM memory_embeddings WHERE model = ?",
+                (model,),
+            ).fetchall()
+            result: Dict[str, List[float]] = {}
+            for row in rows:
+                values = array("f")
+                values.frombytes(row["vector"])
+                result[row["memory_id"]] = list(values)
+            return result
+        except Exception:
+            logger.debug("memory load_embeddings failed", exc_info=True)
+            return {}
+
+    def embedding_count(self, model: Optional[str] = None) -> int:
+        try:
+            if model is None:
+                row = self._execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()
+            else:
+                row = self._execute(
+                    "SELECT COUNT(*) FROM memory_embeddings WHERE model = ?", (model,)
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            logger.debug("memory embedding_count failed", exc_info=True)
+            return 0
+
+    def missing_embedding_count(self, model: Optional[str] = None) -> int:
+        """Active memories with no embedding row.
+
+        ``model=None`` means "no embedding row for any model".
+        """
+        try:
+            if model is None:
+                row = self._execute(
+                    "SELECT COUNT(*) FROM memories m WHERE m.status = 'active' "
+                    "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e "
+                    "WHERE e.memory_id = m.id)"
+                ).fetchone()
+            else:
+                row = self._execute(
+                    "SELECT COUNT(*) FROM memories m WHERE m.status = 'active' "
+                    "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e "
+                    "WHERE e.memory_id = m.id AND e.model = ?)",
+                    (model,),
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            logger.debug("memory missing_embedding_count failed", exc_info=True)
+            return 0
+
+    def missing_embedding_ids(self, model: str, limit: int = 64) -> List[Tuple[str, str]]:
+        """``(id, content)`` for active memories lacking an embedding for ``model``.
+
+        Oldest-created first so a background indexer makes steady forward
+        progress without rescanning the same rows.
+        """
+        try:
+            rows = self._execute(
+                "SELECT m.id, m.content FROM memories m WHERE m.status = 'active' "
+                "AND NOT EXISTS (SELECT 1 FROM memory_embeddings e "
+                "WHERE e.memory_id = m.id AND e.model = ?) "
+                "ORDER BY m.created_at ASC, m.rowid ASC LIMIT ?",
+                (model, max(1, int(limit or 64))),
+            ).fetchall()
+            return [(row["id"], row["content"]) for row in rows]
+        except Exception:
+            logger.debug("memory missing_embedding_ids failed", exc_info=True)
+            return []
+
     # -- Config -------------------------------------------------------------
 
     def _resolve_weights(self, project=None, w_fts=None, w_vec=None,
@@ -748,6 +904,8 @@ class MemoryStore:
             "w_access": _DEFAULT_W_ACCESS,
             "half_life": _DEFAULT_HALF_LIFE,
         }
+        if self._vector_weight is not None:
+            result["w_vec"] = self._vector_weight
         if project:
             try:
                 for row in self._execute(
@@ -769,6 +927,10 @@ class MemoryStore:
                     result[key] = float(value)
                 except (TypeError, ValueError):
                     pass
+        try:
+            result["w_vec"] = max(0.0, min(MAX_VECTOR_WEIGHT, float(result["w_vec"])))
+        except (TypeError, ValueError):
+            result["w_vec"] = _DEFAULT_W_VEC
         return result
 
     def set_config(self, project: str, key: str, value: Any) -> Dict[str, Any]:
@@ -874,25 +1036,51 @@ class MemoryStore:
 
         vec_distances: Dict[str, float] = {}
         vec_rows: List[Dict[str, Any]] = []
+        vector_ids: set = set()
         if vector_search_fn is not None:
             try:
                 raw = vector_search_fn(query=query, limit=limit * 4)
-                for hit in (raw or {}).get("results", []) or []:
+                hits = [
+                    hit for hit in ((raw or {}).get("results", []) or [])
+                    if isinstance(hit, dict)
+                ]
+                # Vector hits from a real index carry the store id, so the
+                # memory row can be scored with its actual metadata.  Resolve
+                # them in one query; unresolvable hits keep the content-key
+                # path and the synthetic fallback row below.
+                hit_ids = [str(hit.get("id")) for hit in hits if hit.get("id")]
+                if hit_ids:
+                    placeholders = ",".join("?" for _ in hit_ids)
+                    try:
+                        for row in self._execute(
+                            f"SELECT id FROM memories WHERE id IN ({placeholders})",
+                            tuple(hit_ids),
+                        ):
+                            vector_ids.add(row["id"])
+                    except Exception:
+                        logger.debug("vector id resolution failed (non-fatal)", exc_info=True)
+                for hit in hits:
                     text = hit.get("text") or ""
                     if not text:
                         continue
                     key = _content_key(text)
+                    hit_id = str(hit["id"]) if hit.get("id") else None
                     distance = hit.get("distance")
                     if distance is not None:
                         try:
-                            vec_distances[key] = float(distance)
+                            distance_val = float(distance)
                         except (TypeError, ValueError):
-                            pass
-                    vec_rows.append(hit)
+                            distance_val = None
+                        if distance_val is not None:
+                            vec_distances[key] = distance_val
+                            if hit_id in vector_ids:
+                                vec_distances[hit_id] = distance_val
+                    if hit_id not in vector_ids:
+                        vec_rows.append(hit)
             except Exception:
                 logger.debug("vector arm failed (non-fatal)", exc_info=True)
 
-        candidate_ids = set(fts_scores)
+        candidate_ids = set(fts_scores) | vector_ids
         if len(candidate_ids) < limit * 2:
             conditions, params = self._filter_sql(
                 project, memory_type, scope, tags, min_importance
@@ -925,7 +1113,10 @@ class MemoryStore:
             key = _content_key(mem.get("content") or "")
             seen_keys.add(key)
             fts_norm = _normalize_fts(fts_scores.get(memory_id, 0.0))
-            vec_norm = _normalize_vec(vec_distances.get(key, 1.0))
+            vec_distance = vec_distances.get(memory_id)
+            if vec_distance is None:
+                vec_distance = vec_distances.get(key, 1.0)
+            vec_norm = _normalize_vec(vec_distance)
             rec_norm = _recency_score(_days_since(mem.get("created_at")), weights["half_life"])
             acc_norm = _access_score(mem.get("access_count"))
             importance = _clamp_importance(mem.get("importance"))
@@ -1191,6 +1382,30 @@ class MemoryStore:
                 if entry["id"] not in fused_ids:
                     entry["score"] = round((entry.get("score") or 0.0) * 0.01, 6)
                     results.append(entry)
+
+            # Bounded vector influence: RRF lets convergent evidence
+            # accumulate across arms, but a memory surfaced by the vector arm
+            # alone must never dominate the fused ranking.  Keep at most `cap`
+            # vector-only entries in the ranked prefix and defer the rest to
+            # the tail (still retrievable, just not promoted).  The caller
+            # re-sorts by score afterwards, so deferred entries are also
+            # pushed below the lowest kept score to keep the split stable.
+            cap = max(1, int(len(results) * self._vector_max_share))
+            kept, deferred, vec_only_seen = [], [], 0
+            for entry in results:
+                ranks = entry.get("source_ranks") or {}
+                is_vec_only = bool(ranks) and set(ranks.keys()) == {"vec_rank"}
+                if is_vec_only:
+                    vec_only_seen += 1
+                    if vec_only_seen > cap:
+                        deferred.append(entry)
+                        continue
+                kept.append(entry)
+            if deferred:
+                floor = min((entry.get("score", 0.0) for entry in kept), default=0.0)
+                for entry in deferred:
+                    entry["score"] = round(min(entry.get("score", 0.0), floor * 0.5), 6)
+            results = kept + deferred
             return results, meta
         except Exception as exc:
             logger.debug("advanced retrieval failed; falling back to base ranking", exc_info=True)
@@ -1351,6 +1566,8 @@ class MemoryStore:
                 "memories_by_type": by_type,
                 "memories_by_project": by_project,
                 "fts_ok": fts_ok,
+                "embeddings_indexed": self.embedding_count(),
+                "embeddings_missing": self.missing_embedding_count(None),
                 "db_size_bytes": db_size,
                 "wal_size_bytes": wal_size,
                 "schema_version": _SCHEMA_VERSION,

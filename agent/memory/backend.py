@@ -78,6 +78,7 @@ class EnhancedMemoryBackend:
         self._store: Optional[MemoryStore] = None
         self._session_id = ""
         self._vector_backend: Optional[Callable[..., Any]] = None
+        self._embedding_indexer = None
 
     # -- State -------------------------------------------------------------
 
@@ -120,12 +121,41 @@ class EnhancedMemoryBackend:
             )
             self._store = None
             self._enabled = False
+            return
+
+        try:
+            from agent.memory.embeddings import EmbeddingUnavailable, build_vector_support
+        except Exception:
+            logger.warning(
+                "vector backend unavailable (import failed); lexical retrieval only",
+                exc_info=True,
+            )
+            return
+        try:
+            search_fn, indexer = build_vector_support(self._config, self._store)
+            if search_fn is not None:
+                self._vector_backend = search_fn
+                self._store.set_vector_weight(self._config.get("vector_weight", 0.3))
+                self._store.set_vector_max_share(self._config.get("vector_max_share", 0.5))
+            if indexer is not None:
+                indexer.start()
+                self._embedding_indexer = indexer
+        except EmbeddingUnavailable as exc:
+            logger.warning("vector backend unavailable (%s); lexical retrieval only", exc)
+        except Exception:
+            logger.warning("vector backend init failed; lexical retrieval only", exc_info=True)
 
     def set_session(self, session_id: str) -> None:
         if session_id:
             self._session_id = session_id
 
     def shutdown(self) -> None:
+        if self._embedding_indexer is not None:
+            try:
+                self._embedding_indexer.stop()
+            except Exception:
+                logger.debug("embedding indexer stop failed", exc_info=True)
+            self._embedding_indexer = None
         if self._store is not None:
             try:
                 self._store.close()
@@ -208,9 +238,23 @@ class EnhancedMemoryBackend:
             logger.debug("enhanced memory pre-compress mining failed (non-fatal)", exc_info=True)
         return ""
 
+    def _enqueue_embeddings(self, memory_ids: Optional[List[str]]) -> None:
+        """Queue freshly stored memories for background embedding (no-op when
+        no embedding indexer is configured)."""
+        if self._embedding_indexer is None:
+            return
+        ids = [memory_id for memory_id in (memory_ids or []) if memory_id]
+        if not ids:
+            return
+        try:
+            self._embedding_indexer.enqueue(ids)
+        except Exception:
+            logger.debug("embedding enqueue failed (non-fatal)", exc_info=True)
+
     def _store_candidates(self, candidates: List[Dict[str, Any]], *,
                           session_id: str = "", skip_existing: bool = False) -> int:
         stored = 0
+        stored_ids: List[str] = []
         for candidate in candidates or []:
             content = (candidate.get("content") or "").strip()
             if not content or is_secret(content):
@@ -226,6 +270,10 @@ class EnhancedMemoryBackend:
             )
             if result.get("success"):
                 stored += 1
+                memory_id = result.get("memory_id")
+                if memory_id:
+                    stored_ids.append(memory_id)
+        self._enqueue_embeddings(stored_ids)
         return stored
 
     def on_memory_write(self, action: str, target: str, content: str,
@@ -236,12 +284,14 @@ class EnhancedMemoryBackend:
         if not content or is_secret(content):
             return
         try:
-            self._store.store(
+            result = self._store.store(
                 content,
                 memory_type="preference" if target == "user" else "fact",
                 scope="user" if target == "user" else "global",
                 source={"type": "memory", "detail": str(target or "memory")},
             )
+            if isinstance(result, dict) and result.get("memory_id"):
+                self._enqueue_embeddings([result["memory_id"]])
         except Exception:
             logger.debug("enhanced memory write mirror failed (non-fatal)", exc_info=True)
 
@@ -253,6 +303,14 @@ class EnhancedMemoryBackend:
         try:
             health = dict(self._store.health())
             health.update({"enabled": self._enabled, "available": True, "db_path": self.db_path})
+            if self._embedding_indexer is not None:
+                health["embedding"] = {
+                    **self._embedding_indexer.stats(),
+                    "indexed": self._store.embedding_count(),
+                    "missing": self._store.missing_embedding_count(None),
+                }
+            else:
+                health["embedding"] = {"provider": "none"}
             return health
         except Exception as exc:
             return {"enabled": self._enabled, "available": False, "error": str(exc)}
@@ -282,12 +340,15 @@ class EnhancedMemoryBackend:
                  tags: Optional[List[str]] = None, importance: float = 0.5) -> Dict[str, Any]:
         if self._store is None:
             return {"success": False, "error": "enhanced memory is not available"}
-        return self._store.store(
+        result = self._store.store(
             content, memory_type=memory_type, scope=scope, project=project,
             tags=tags, importance=importance,
             session_id=self._session_id,
             source={"type": "agent"},
         )
+        if isinstance(result, dict) and result.get("memory_id"):
+            self._enqueue_embeddings([result["memory_id"]])
+        return result
 
     def reinforce(self, memory_id: str) -> Dict[str, Any]:
         if self._store is None:
