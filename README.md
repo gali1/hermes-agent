@@ -373,13 +373,65 @@ The agent maintains two bounded, human-readable files under `$HERMES_HOME/memori
 
 ### Vector retrieval (experimental — `-fastembed` branch)
 
-This branch adds an optional dense-retrieval arm beside FTS5. It is **off by default** and degrades to FTS5-only retrieval when the backend is unavailable.
+This branch adds an optional dense-retrieval arm beside FTS5. It is **off by default** and degrades to FTS5-only retrieval when the backend is unavailable. Hermes requires **Python 3.11–3.13** — do not install into system Python.
+
+**1. Get the branch**
 
 ```bash
-pip install '.[fastembed]'                                  # local ONNX embeddings
+git clone --branch 2026-10-05-fastembed --single-branch \
+  https://github.com/gali1/hermes-agent.git hermes-agent-fastembed
+cd hermes-agent-fastembed
+```
+
+Already have a clone?
+
+```bash
+cd ~/hermes-agent-fastembed
+git fetch origin 2026-10-05-fastembed
+git checkout 2026-10-05-fastembed
+```
+
+**2. Install the `fastembed` extra** — uv (recommended; manages the interpreter for you):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is not installed
+cd ~/hermes-agent-fastembed
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python '.[fastembed]'
+```
+
+Or pip into a virtualenv:
+
+```bash
+cd ~/hermes-agent-fastembed
+python3.12 -m venv .venv          # or python3.11 / python3.13
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install '.[fastembed]'
+```
+
+> A `uv venv` is not seeded with pip — use `uv pip install --python .venv/bin/python ...`,
+> or run `.venv/bin/python -m ensurepip --upgrade` first if you prefer plain pip.
+
+**3. Enable the backend**
+
+```bash
 hermes config set memory.enhanced.enabled true
 hermes config set memory.enhanced.vector_backend fastembed
 ```
+
+To make this branch the default `hermes` without activating the venv:
+
+```bash
+ln -sfn ~/hermes-agent-fastembed/.venv/bin/hermes ~/.local/bin/hermes
+```
+
+**4. Measure recall on your own sessions**
+
+```bash
+python scripts/memory_eval.py --vector-backend fastembed --limit 600
+```
+
+Run it from the clone with the venv active.
 
 | Config key                        | Default         | Meaning                                                                                        |
 | --------------------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
