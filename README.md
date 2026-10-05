@@ -282,9 +282,10 @@ Run it from the clone with the venv active. The first run downloads
 durable candidates from `$HERMES_HOME/state.db`, derives queries per memory,
 and reports recall@1 / recall@k / MRR for `fts`, `hybrid`, `vector` and
 `hybrid+vector`. No memory contents are printed. A lexical/hybrid baseline on
-400 real messages (200 memories, 732 queries) shows hybrid RRF lifting overall
-R@5 from 0.430 to 0.757 and concept-query R@5 from 0.025 to 0.555 — run the
-vector column to see whether embeddings add to that on your data.
+400 real messages (200 memories, 732 queries) shows the calibrated hybrid at
+overall R@1 0.54 / R@5 0.79 versus FTS 0.41 / 0.43, with exact-lookup R@1 at
+0.75–0.82 — run the vector column to see whether embeddings add to that on
+your data.
 
 | Config key                        | Default         | Meaning                                                                                        |
 | --------------------------------- | --------------- | ---------------------------------------------------------------------------------------------- |

@@ -38,9 +38,12 @@ from agent.memory.contradiction import detect_contradiction
 from agent.memory.dedup import is_degenerate
 from agent.memory.graph import expand_links
 from agent.memory.ranking import (
+    LEXICAL_ANCHOR_MARGIN,
+    LEXICAL_ANCHOR_MIN_FTS,
     MAX_VECTOR_WEIGHT,
     boosted_rrf_score,
     combined_score,
+    infer_strategy_boosts,
     proof_norm,
     reciprocal_rank_fusion,
     recency_for_range,
@@ -959,7 +962,7 @@ class MemoryStore:
                min_importance: float = 0.0, fusion=None, graph_expand=False,
                temporal=False, strategy_boosts=None, vector_search_fn=None,
                now=None, w_fts=None, w_vec=None, w_recency=None,
-               w_access=None, half_life=None) -> Dict[str, Any]:
+               w_access=None, half_life=None, track_access: bool = True) -> Dict[str, Any]:
         try:
             limit = max(1, min(_DEFAULT_MAX_SEARCH, int(limit or _DEFAULT_SEARCH_LIMIT)))
         except (TypeError, ValueError):
@@ -988,6 +991,12 @@ class MemoryStore:
             except Exception:
                 temporal_window, lexical_query = None, query
 
+        # Query-aware arm weighting: identifier/short/literal queries lean on
+        # the FTS arm, natural-language questions on the vector/graph arms.
+        # Only inferred when the caller did not supply explicit boosts.
+        if strategy_boosts is None and (fusion or graph_expand or temporal):
+            strategy_boosts = infer_strategy_boosts(query)
+
         try:
             return self._search_inner(
                 query=query, lexical_query=lexical_query, temporal_window=temporal_window,
@@ -995,7 +1004,7 @@ class MemoryStore:
                 tags=tags, min_importance=min_importance, fusion=fusion,
                 graph_expand=graph_expand, temporal=temporal,
                 strategy_boosts=strategy_boosts, vector_search_fn=vector_search_fn,
-                now=now, weights=weights,
+                now=now, weights=weights, track_access=track_access,
             )
         except Exception as exc:
             logger.debug("memory search failed; returning recent rows", exc_info=True)
@@ -1014,7 +1023,7 @@ class MemoryStore:
     def _search_inner(self, *, query, lexical_query, temporal_window, limit,
                       project, memory_type, scope, tags, min_importance,
                       fusion, graph_expand, temporal, strategy_boosts,
-                      vector_search_fn, now, weights) -> Dict[str, Any]:
+                      vector_search_fn, now, weights, track_access=True) -> Dict[str, Any]:
         advanced = bool(fusion or graph_expand or temporal)
         fts_scores: Dict[str, float] = {}
         fts_query = _quote_fts(lexical_query, match_any=advanced)
@@ -1080,7 +1089,17 @@ class MemoryStore:
             except Exception:
                 logger.debug("vector arm failed (non-fatal)", exc_info=True)
 
-        candidate_ids = set(fts_scores) | vector_ids
+        # Ordered candidate list, not a set: iteration order decides tie-breaks
+        # in the scoring pass below, and set order varies with PYTHONHASHSEED
+        # across processes, which made otherwise identical searches return
+        # different orderings run to run.  FTS order first (best BM25 first),
+        # then vector hits, then the recency/importance backfill.
+        candidate_ids: List[str] = []
+        seen_candidates: set = set()
+        for memory_id in list(fts_scores) + sorted(vector_ids):
+            if memory_id not in seen_candidates:
+                seen_candidates.add(memory_id)
+                candidate_ids.append(memory_id)
         if len(candidate_ids) < limit * 2:
             conditions, params = self._filter_sql(
                 project, memory_type, scope, tags, min_importance
@@ -1090,7 +1109,9 @@ class MemoryStore:
                 + " ORDER BY importance DESC, created_at DESC LIMIT ?"
             )
             for row in self._execute(sql, tuple(params) + (limit * 4,)):
-                candidate_ids.add(row["id"])
+                if row["id"] not in seen_candidates:
+                    seen_candidates.add(row["id"])
+                    candidate_ids.append(row["id"])
 
         scored: List[Dict[str, Any]] = []
         seen_keys = set()
@@ -1186,18 +1207,19 @@ class MemoryStore:
 
         scored.sort(key=lambda item: item.get("score", 0.0), reverse=True)
         top = scored[:limit]
-        try:
-            with self._write_lock:
-                for item in top:
-                    if item.get("source") == "engine":
-                        self._execute(
-                            "UPDATE memories SET access_count = access_count + 1, "
-                            "last_accessed_at = ? WHERE id = ?",
-                            (_now(), item["id"]),
-                        )
-                self._commit()
-        except Exception:
-            logger.debug("access-count update failed (non-fatal)", exc_info=True)
+        if track_access:
+            try:
+                with self._write_lock:
+                    for item in top:
+                        if item.get("source") == "engine":
+                            self._execute(
+                                "UPDATE memories SET access_count = access_count + 1, "
+                                "last_accessed_at = ? WHERE id = ?",
+                                (_now(), item["id"]),
+                            )
+                    self._commit()
+            except Exception:
+                logger.debug("access-count update failed (non-fatal)", exc_info=True)
 
         envelope: Dict[str, Any] = {
             "query": query,
@@ -1348,6 +1370,25 @@ class MemoryStore:
             meta["mode"] = "rrf"
             meta["arms"] = [name for name, _ in arms]
 
+            # Only boost arms that actually produced candidates.  When no
+            # semantic arm is present, a question classification has nothing to
+            # lean on, so drop its lexical damping entirely rather than
+            # degrading an FTS-only install.  Lookup classifications keep their
+            # lexical boost regardless.
+            lexical_classified = (strategy_boosts or {}).get("fts") in ("high", "medium")
+            effective_boosts = strategy_boosts
+            if strategy_boosts:
+                available = {name for name, _ in arms}
+                effective_boosts = {
+                    arm: level
+                    for arm, level in strategy_boosts.items()
+                    if arm in available
+                }
+                if not (available & {"vec", "graph"}) and not lexical_classified:
+                    effective_boosts = None
+                if not effective_boosts:
+                    effective_boosts = None
+
             current = now or datetime.now(timezone.utc).replace(tzinfo=None)
             results: List[Dict[str, Any]] = []
             for item in fused:
@@ -1355,7 +1396,7 @@ class MemoryStore:
                 if entry is None:
                     continue
                 base = boosted_rrf_score(
-                    item["rrf_score"], item["source_ranks"], strategy_boosts or {}
+                    item["rrf_score"], item["source_ranks"], effective_boosts or {}
                 )
                 created = _parse_ts(entry.get("created_at"))
                 recency = recency_for_range(created, None, None, current)
@@ -1406,6 +1447,36 @@ class MemoryStore:
                 for entry in deferred:
                     entry["score"] = round(min(entry.get("score", 0.0), floor * 0.5), 6)
             results = kept + deferred
+
+            # Lexical anchoring: for lookup-shaped queries, pin the strongest
+            # BM25 candidate at rank 1.  Plain RRF can tie it with a graph or
+            # vector arm's favourite, and the multiplicative signals can then
+            # flip the order; the anchor guarantees exact matches are never
+            # displaced.  The other arms still order everything below it.
+            # Question-like queries are excluded: their top lexical hit is
+            # often not the intended memory at all.
+            if lexical_classified and effective_boosts and results:
+                fts_scores = sorted(
+                    (entry.get("fts_score", 0.0) for entry in results), reverse=True
+                )
+                best_fts_score = fts_scores[0] if fts_scores else 0.0
+                runner_up = fts_scores[1] if len(fts_scores) > 1 else 0.0
+                clear_leader = (
+                    best_fts_score > 0
+                    and best_fts_score >= runner_up + LEXICAL_ANCHOR_MARGIN
+                )
+                if best_fts_score >= LEXICAL_ANCHOR_MIN_FTS or clear_leader:
+                    best_fts = max(results, key=lambda entry: entry.get("fts_score", 0.0))
+                    top_score = max(entry.get("score", 0.0) for entry in results)
+                    if results[0] is not best_fts:
+                        best_fts["score"] = round(
+                            max(best_fts.get("score", 0.0), top_score * 1.02), 6
+                        )
+                        results = [best_fts] + [
+                            entry for entry in results if entry is not best_fts
+                        ]
+                    best_fts["anchored"] = True
+                    meta["anchored"] = best_fts.get("id")
             return results, meta
         except Exception as exc:
             logger.debug("advanced retrieval failed; falling back to base ranking", exc_info=True)

@@ -12,11 +12,23 @@ from __future__ import annotations
 
 import calendar
 import math
+import re
 
-# Hindsight uses k=60, the value from the original RRF paper. k damps the
-# influence of rank differences deep in a list: the gap between rank 1 and 2 is
-# large, between rank 200 and 201 negligible.
-DEFAULT_RRF_K = 60
+# RRF damping constant.  Hindsight inherited k=60 from the original RRF paper,
+# where result lists are hundreds deep and only the head matters.  A personal
+# memory store fuses a handful of short arms (fts/vec/graph/temporal), so k=60
+# flattens rank-1 vs rank-2 to 1/61 vs 1/62 and lets secondary arms tie the
+# lexical winner.  k=20 keeps head differences meaningful while still damping
+# the long tail (rank 100 contributes ~0.008 vs ~0.006 at k=60).
+DEFAULT_RRF_K = 20
+
+# When a query classifies as a lexical lookup, the fused list is anchored on
+# its best BM25 candidate when that candidate is a genuinely strong match:
+# either at least LEXICAL_ANCHOR_MIN_FTS normalized strength, or leading the
+# runner-up by LEXICAL_ANCHOR_MARGIN.  1/(1+exp(bm25)); 0.6 corresponds to
+# bm25 <= -0.4.  Question-like queries are never anchored.
+LEXICAL_ANCHOR_MIN_FTS = 0.6
+LEXICAL_ANCHOR_MARGIN = 0.15
 
 # Hard ceiling for the vector arm's contribution to the additive relevance
 # score (enforced by ``MemoryStore._resolve_weights``).  Embeddings are
@@ -105,6 +117,76 @@ def boosted_rrf_score(rrf_score, source_ranks, boosts, k=DEFAULT_RRF_K):
             continue
         delta += 1.0 / (k + rank / divisor) - 1.0 / (k + rank)
     return rrf_score + delta
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Query-aware strategy boosts
+# ══════════════════════════════════════════════════════════════════════════
+
+# Signals that a query is a lexical lookup (identifiers, code symbols, quoted
+# strings, versions, hashes, filenames) rather than a natural-language question.
+# Lexical lookups are answered by the FTS arm; conceptual questions are served
+# by the vector and graph arms.  Pure RRF treats every arm equally and therefore
+# trades away top-1 precision on lookups.
+_IDENTIFIER_RE = re.compile(
+    r"""
+    `[^`]+`                                             # backticked span
+    |"[^"]+"                                            # double-quoted phrase
+    |'[^']+'                                            # single-quoted phrase
+    |[A-Za-z_][A-Za-z0-9_]*[._/\\:][A-Za-z0-9_./\\:]+  # dotted/slashed/namespaced
+    |[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+                 # snake_case
+    |[a-z]+[A-Z][A-Za-z0-9]+                            # camelCase/PascalCase
+    |\b[A-Z][A-Z0-9_]{2,}\b                             # ALL_CAPS constant
+    |\bv?\d+\.\d+(?:\.\d+)?\b                           # version number
+    |\b[0-9a-fA-F]{7,}\b                                # commit hash / hex id
+    |\b[A-Za-z]+\.(?:py|js|ts|tsx|json|ya?ml|toml|md|sql|sh|go|rs|java|c|cpp|h)\b
+    """,
+    re.VERBOSE,
+)
+
+_QUESTION_WORDS = frozenset({
+    "what", "why", "how", "when", "where", "which", "who", "whom", "whose",
+    "explain", "describe", "summarize", "summary", "history", "context",
+    "reason", "rationale", "decide", "decided", "decision", "decisions",
+    "preference", "preferences", "prefer", "approach", "remember",
+    "discuss", "discussed", "know", "learned", "tell",
+})
+
+
+def infer_strategy_boosts(query):
+    """Classify a query and return rank-space boosts for the RRF arms.
+
+    Returns a dict suitable for :func:`boosted_rrf_score`, or an empty dict
+    when no classification applies (plain RRF).  The classification is
+    deliberately rule-based and cheap: it runs on every advanced retrieval.
+
+    * natural-language questions -> vector/graph lead, FTS damped;
+    * identifiers, quoted spans, filenames, versions, or <= 3 tokens ->
+      FTS leads, vector damped;
+    * longer statement-like phrases -> FTS leans up, vector damped;
+    * anything else -> balanced.
+    """
+    q = (query or "").strip()
+    if not q:
+        return {}
+    tokens = q.split()
+    if not tokens:
+        return {}
+
+    first_word = tokens[0].strip("?,.:;!()[]{}\"'`").lower() if tokens else ""
+    # Question words only count at the head of the query: a literal memory
+    # sentence ("We decided to use PostgreSQL 17 ...") must not be classified
+    # as a question just because it contains "decided" mid-sentence.
+    question_like = q.rstrip().endswith("?") or first_word in _QUESTION_WORDS
+    has_identifier = bool(_IDENTIFIER_RE.search(q))
+
+    if question_like:
+        return {"vec": "high", "graph": "medium", "fts": "low"}
+    if has_identifier or len(tokens) <= 3:
+        return {"fts": "high", "vec": "low"}
+    if len(tokens) >= 6:
+        return {"fts": "medium", "vec": "low"}
+    return {"fts": "medium", "vec": "medium"}
 
 
 # ══════════════════════════════════════════════════════════════════════════

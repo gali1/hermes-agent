@@ -161,15 +161,18 @@ def run_eval(store: MemoryStore, queries: Sequence[EvalQuery], k: int = 5,
 
     for query in queries:
         mode_hits: Dict[str, List[Dict[str, Any]]] = {
-            "fts": store.search(query.query, limit=k, fusion=None).get("results", []),
+            "fts": store.search(
+                query.query, limit=k, fusion=None, track_access=False
+            ).get("results", []),
             "hybrid": store.search(
-                query.query, limit=k, fusion="rrf", graph_expand=True, temporal=True
+                query.query, limit=k, fusion="rrf", graph_expand=True, temporal=True,
+                track_access=False,
             ).get("results", []),
         }
         if vector_search_fn is not None:
             mode_hits["hybrid+vector"] = store.search(
                 query.query, limit=k, fusion="rrf", graph_expand=True, temporal=True,
-                vector_search_fn=vector_search_fn,
+                vector_search_fn=vector_search_fn, track_access=False,
             ).get("results", [])
             raw = vector_search_fn(query=query.query, limit=k) or {}
             mode_hits["vector"] = [
