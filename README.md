@@ -67,6 +67,59 @@ source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
 
+### Reinstalling or upgrading over an existing install
+
+`pip install .` installs into the Python environment you run it from. If
+`hermes-agent` already exists in that environment, pip uninstalls the old copy
+first and replaces it, including the `hermes` launcher. Your config, sessions,
+skills, and memory under `~/.hermes` are not touched — it is a code-only swap.
+
+```bash
+# from a clone of this repo, using the environment that owns the current hermes
+pip install .        # add --force-reinstall for a guaranteed clean swap
+hermes --version     # verify
+```
+
+Notes:
+
+- It only replaces the copy in **that** environment. The one-line installer keeps
+  its managed copy in `~/.hermes/hermes-agent/venv`; installing elsewhere creates
+  a second copy and whichever `hermes` comes first on `PATH` wins. For managed
+  installs, use `hermes update` instead.
+- Stop a running gateway (`hermes gateway stop`) before replacing files.
+- System Python often rejects installs with `externally-managed-environment`
+  (PEP 668). Use a virtualenv rather than `--break-system-packages`.
+- pip/PyPI installs are **not an officially supported distribution method** and
+  show a deprecation notice on startup. See
+  [platform support](https://hermes-agent.nousresearch.com/docs/getting-started/platform-support)
+  for the supported paths (installer, Docker, Nix).
+
+### System-wide installs
+
+For a machine-wide install every user can run, give Hermes its own virtualenv
+and link the launcher into `PATH` — don't install into the system Python:
+
+```bash
+# as an admin user
+sudo python3 -m venv /opt/hermes/venv
+sudo /opt/hermes/venv/bin/pip install /path/to/hermes-agent
+sudo ln -sf /opt/hermes/venv/bin/hermes /usr/local/bin/hermes
+```
+
+Each user then gets their own state directory (`~/.hermes`), so configs,
+sessions, and credentials stay per-user. Set `HERMES_HOME=/some/path` to relocate
+a user's state (for example, a service account).
+
+Other system-wide options:
+
+- **Docker** (supported): `docker pull nousresearch/hermes-agent:latest`, with
+  `$HERMES_HOME` bind-mounted from the host so state survives image upgrades.
+- **pipx / uv tool** (per-user global CLI): `pipx install .` or
+  `uv tool install .` — isolated and on `PATH`, but still detected as an
+  unsupported pip/PyPI install.
+- **NixOS**: declarative module, see the
+  [Nix setup guide](https://hermes-agent.nousresearch.com/docs/getting-started/nix-setup).
+
 ### Troubleshooting
 
 #### Windows Defender or antivirus flags `uv.exe` as malware
