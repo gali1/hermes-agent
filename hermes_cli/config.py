@@ -2190,6 +2190,17 @@ DEFAULT_CONFIG = {
             "auto_capture": True,
             "max_recall": 6,
             "recall_budget_chars": 2400,
+            "vector_backend": "none",   # none | fastembed | remote | mempalace
+            "vector_model": "",         # provider default when empty
+            "vector_weight": 0.3,       # bounded to <= 0.4 by the store
+            "vector_max_share": 0.5,    # max share of fused results that may be vector-only
+            "vector_index_batch": 16,
+            "vector_remote": {
+                "base_url": "https://api.openai.com/v1",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "text-embedding-3-small",
+                "timeout": 30,
+            },
         },
     },
 

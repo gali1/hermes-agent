@@ -212,6 +212,48 @@ For the full command lists, see the [CLI guide](https://hermes-agent.nousresearc
 
 ---
 
+## Experimental: vector memory backend (`-fastembed` branch)
+
+This branch adds an optional dense-retrieval arm to the enhanced memory layer.
+It is **off by default** and degrades to FTS5-only retrieval when unavailable.
+
+```bash
+pip install '.[fastembed]'                                  # local ONNX embeddings
+hermes config set memory.enhanced.enabled true
+hermes config set memory.enhanced.vector_backend fastembed
+```
+
+| Config key                        | Default         | Meaning                                                                                        |
+| --------------------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
+| `memory.enhanced.vector_backend`  | `none`          | `none`, `fastembed` (local ONNX), `remote` (OpenAI-compatible `/embeddings`), `mempalace`     |
+| `memory.enhanced.vector_model`    | provider default | e.g. `BAAI/bge-small-en-v1.5`                                                                 |
+| `memory.enhanced.vector_weight`   | `0.3`           | vector-arm weight, hard-capped at `0.4` so vector never dominates                              |
+| `memory.enhanced.vector_max_share`| `0.5`           | max share of fused results that may be vector-only                                             |
+| `memory.enhanced.vector_index_batch` | `16`         | background indexing batch size                                                                 |
+
+Embeddings are indexed asynchronously on a daemon worker, so turns never block
+on embedding. The `remote` backend sends memory text to the configured
+endpoint — opt in deliberately.
+
+Measure recall on your own sessions before enabling:
+
+```bash
+python scripts/memory_eval.py --vector-backend fastembed --limit 600
+```
+
+The harness mines durable candidates from `$HERMES_HOME/state.db`, derives
+queries per memory, and reports recall@1 / recall@k / MRR for `fts`, `hybrid`,
+`vector` and `hybrid+vector`. No memory contents are printed. A lexical/hybrid
+baseline on 400 real messages (200 memories, 732 queries) shows hybrid RRF
+lifting overall R@5 from 0.430 to 0.757 and concept-query R@5 from 0.025 to
+0.555 — run the vector column to see whether embeddings add to that on your
+data.
+
+> Experimental: this branch exists to try the vector path. It is not intended
+> to merge into `main` as-is — review the eval numbers for your own data first.
+
+---
+
 ## Documentation
 
 All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
