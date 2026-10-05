@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-10-05 — README: reinstall-over-existing and system-wide install guidance
+
+- Document that `pip install .` replaces an existing `hermes-agent` in the
+  active environment (code-only; `~/.hermes` state untouched) and its caveats:
+  managed-copy shadowing, PEP 668 system Python, stopping a running gateway,
+  and the unsupported pip/PyPI distribution policy.
+- Document system-wide installs: a dedicated `/opt/hermes/venv` with a
+  symlinked launcher, per-user `HERMES_HOME`, plus Docker / pipx / uv tool /
+  NixOS alternatives.
+
 ## 2026-10-05 — Additive enhanced memory layer + upstream Rekal plugin
 
 Strictly additive: every existing memory capability (curated `MEMORY.md` /
