@@ -1224,6 +1224,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     old_text=next_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
+                    backend=agent._memory_manager.enhanced_backend if agent._memory_manager else None,
+                    query=next_args.get("query"),
+                    limit=next_args.get("limit"),
+                    memory_type=next_args.get("memory_type"),
+                    graph_expand=next_args.get("graph_expand"),
+                    temporal=next_args.get("temporal"),
+                    memory_id=next_args.get("memory_id"),
                 )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager

@@ -188,6 +188,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     tool_guidance = []
     if "memory" in agent.valid_tool_names:
         tool_guidance.append(MEMORY_GUIDANCE)
+    # Enhanced local memory protocol: static trust/retrieval rules injected
+    # only when the additive enhanced layer is active. Kept in the stable tier
+    # so it never changes mid-session (prefix-cache invariant).
+    _memory_manager = getattr(agent, "_memory_manager", None)
+    if _memory_manager is not None and getattr(_memory_manager, "enhanced_enabled", False):
+        from agent.memory.backend import SYSTEM_PROMPT_BLOCK as _ENHANCED_MEMORY_GUIDANCE
+        tool_guidance.append(_ENHANCED_MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:

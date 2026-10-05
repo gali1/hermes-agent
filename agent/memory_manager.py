@@ -357,10 +357,16 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, enhanced_config: Optional[Dict[str, Any]] = None) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        # Additive enhanced local memory layer (agent/memory/). Opt-in via
+        # memory.enhanced.enabled; when disabled every hook below is a no-op
+        # and behavior is identical to the builtin + provider path.
+        self._enhanced_config: Dict[str, Any] = dict(enhanced_config or {})
+        self._enhanced_requested: bool = bool(self._enhanced_config.get("enabled"))
+        self._enhanced = None  # EnhancedMemoryBackend | None
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -451,6 +457,21 @@ class MemoryManager:
                 return p
         return None
 
+    @property
+    def enhanced_requested(self) -> bool:
+        """True when config asked for the enhanced layer (even before init)."""
+        return self._enhanced_requested
+
+    @property
+    def enhanced_enabled(self) -> bool:
+        """True when the enhanced layer is initialized and available."""
+        return bool(self._enhanced is not None and self._enhanced.available)
+
+    @property
+    def enhanced_backend(self):
+        """The live enhanced backend, or None when disabled/unavailable."""
+        return self._enhanced if self.enhanced_enabled else None
+
     # -- System prompt -------------------------------------------------------
 
     def build_system_prompt(self) -> str:
@@ -512,6 +533,13 @@ class MemoryManager:
                     "Memory provider '%s' prefetch failed (non-fatal): %s",
                     provider.name, e,
                 )
+        if self.enhanced_enabled:
+            try:
+                enhanced_ctx = self._enhanced.prefetch(clean_query, session_id=session_id)
+                if enhanced_ctx and enhanced_ctx.strip():
+                    parts.append(enhanced_ctx)
+            except Exception as e:
+                logger.debug("Enhanced memory prefetch failed (non-fatal): %s", e)
         return "\n\n".join(parts)
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
@@ -581,7 +609,8 @@ class MemoryManager:
         ordering guarantees.
         """
         providers = list(self._providers)
-        if not providers:
+        enhanced = self._enhanced if self.enhanced_enabled else None
+        if not providers and enhanced is None:
             return
 
         clean_user_content = self._strip_skill_scaffolding(user_content)
@@ -610,6 +639,16 @@ class MemoryManager:
                         "Memory provider '%s' sync_turn failed: %s",
                         provider.name, e,
                     )
+            if enhanced is not None:
+                try:
+                    enhanced.observe_turn(
+                        user_content,
+                        assistant_content,
+                        session_id=session_id,
+                        messages=messages,
+                    )
+                except Exception as e:
+                    logger.debug("Enhanced memory observe_turn failed (non-fatal): %s", e)
 
         self._submit_background(_run)
 
@@ -782,6 +821,11 @@ class MemoryManager:
                     provider.name, e,
                     exc_info=True,
                 )
+        if self.enhanced_enabled:
+            try:
+                self._enhanced.on_session_end(messages)
+            except Exception as e:
+                logger.debug("Enhanced memory on_session_end failed: %s", e)
 
     def on_session_switch(
         self,
@@ -830,6 +874,11 @@ class MemoryManager:
                     "Memory provider '%s' on_session_switch failed: %s",
                     provider.name, e,
                 )
+        if self.enhanced_enabled:
+            try:
+                self._enhanced.set_session(new_session_id)
+            except Exception as e:
+                logger.debug("Enhanced memory set_session failed: %s", e)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Notify all providers before context compression.
@@ -848,6 +897,13 @@ class MemoryManager:
                     "Memory provider '%s' on_pre_compress failed: %s",
                     provider.name, e,
                 )
+        if self.enhanced_enabled:
+            try:
+                enhanced_result = self._enhanced.on_pre_compress(messages)
+                if enhanced_result and enhanced_result.strip():
+                    parts.append(enhanced_result)
+            except Exception as e:
+                logger.debug("Enhanced memory on_pre_compress failed: %s", e)
         return "\n\n".join(parts)
 
     @staticmethod
@@ -905,6 +961,13 @@ class MemoryManager:
                     "Memory provider '%s' on_memory_write failed: %s",
                     provider.name, e,
                 )
+        if self.enhanced_enabled:
+            try:
+                self._enhanced.on_memory_write(
+                    action, target, content, metadata=dict(metadata or {})
+                )
+            except Exception as e:
+                logger.debug("Enhanced memory on_memory_write failed: %s", e)
 
     # Actions the bridge mirrors to external providers. The built-in memory
     # tool can also return non-mutating shapes (errors, staged-for-approval
@@ -1011,6 +1074,11 @@ class MemoryManager:
         the interpreter rather than blocking exit.
         """
         self._drain_sync_executor()
+        if self._enhanced is not None:
+            try:
+                self._enhanced.shutdown()
+            except Exception as e:
+                logger.warning("Enhanced memory shutdown failed: %s", e)
         for provider in reversed(self._providers):
             try:
                 provider.shutdown()
@@ -1076,6 +1144,20 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        if self._enhanced_requested and self._enhanced is None:
+            try:
+                from agent.memory.backend import EnhancedMemoryBackend
+
+                self._enhanced = EnhancedMemoryBackend(
+                    str(kwargs["hermes_home"]), self._enhanced_config
+                )
+                self._enhanced.initialize(session_id, **kwargs)
+            except Exception as e:
+                logger.warning(
+                    "Enhanced memory backend initialization failed; continuing "
+                    "with built-in memory only: %s", e,
+                )
+                self._enhanced = None
         for provider in self._providers:
             try:
                 provider.initialize(session_id=session_id, **kwargs)

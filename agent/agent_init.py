@@ -1354,15 +1354,20 @@ def init_agent(
     if not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _enhanced_cfg = {}
+            if isinstance(mem_config, dict):
+                _enhanced_cfg = mem_config.get("enhanced") or {}
+            _enhanced_on = bool(_enhanced_cfg.get("enabled"))
 
-            if _mem_provider_name and _mem_provider_name.strip():
+            if (_mem_provider_name and _mem_provider_name.strip()) or _enhanced_on:
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
-                if agent._memory_manager.providers:
+                agent._memory_manager = _MemoryManager(enhanced_config=_enhanced_cfg)
+                if _mem_provider_name and _mem_provider_name.strip():
+                    _mp = _load_mem(_mem_provider_name)
+                    if _mp and _mp.is_available():
+                        agent._memory_manager.add_provider(_mp)
+                if agent._memory_manager.providers or agent._memory_manager.enhanced_requested:
                     _init_kwargs = {
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
@@ -1408,7 +1413,10 @@ def init_agent(
                     except Exception:
                         pass
                     agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    if agent._memory_manager.providers:
+                        _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    if agent._memory_manager.enhanced_enabled:
+                        _ra().logger.info("Enhanced memory layer activated")
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None
