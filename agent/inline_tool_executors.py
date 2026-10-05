@@ -145,8 +145,11 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
         (
             ("action", "action"), ("target", "target", "memory"), ("content", "content"),
             ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
+            ("query", "query"), ("limit", "limit"), ("memory_type", "memory_type"),
+            ("graph_expand", "graph_expand"), ("temporal", "temporal"), ("memory_id", "memory_id"),
         ),
         store=agent._memory_store,
+        backend=agent._memory_manager.enhanced_backend if agent._memory_manager else None,
     )
     # Mirror built-in memory writes to external providers; gating lives in
     # MemoryManager.notify_memory_tool_write.

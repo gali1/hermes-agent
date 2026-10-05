@@ -213,11 +213,32 @@ def _background_delete_gate(store, action, operations, target="memory", content=
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
                 new_text: str = None, operations: Optional[List[Dict[str, Any]]] = None,
-                store: Optional[MemoryStore] = None) -> str:
+                store: Optional[MemoryStore] = None, backend: Any = None, query: str = None,
+                limit: int = None, memory_type: str = None, graph_expand: bool = None,
+                temporal: bool = None, memory_id: str = None) -> str:
     """Tool entry point; returns a JSON string. Single op (action + content/old_text)
     or batch (``operations``, atomic against the final budget). ``new_text``
     aliases ``content`` -- for 'replace' both mean the COMPLETE new entry (the
-    whole matched entry is overwritten; old_text only locates it)."""
+    whole matched entry is overwritten; old_text only locates it).
+
+    Enhanced actions (search / recall / conflicts / timeline / topics /
+    health / reinforce) operate on the additive structured store through
+    ``backend`` and return an actionable error when it is not enabled.
+
+    Returns JSON string with results.
+    """
+    if action in _ENHANCED_ACTIONS:
+        return _enhanced_memory_action(
+            action,
+            backend,
+            query=query,
+            limit=limit,
+            memory_type=memory_type,
+            graph_expand=graph_expand,
+            temporal=temporal,
+            memory_id=memory_id,
+        )
+
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     token = FAILURE_CLASS.set("other")
@@ -271,7 +292,10 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
             "or 'operations' (batch list). Got neither."
         )
     if action not in _STORE_ACTIONS:
-        return _invalid(f"Unknown action '{action}'. Use: add, replace, remove")
+        return _invalid(
+            f"Unknown action '{action}'. Use: add, replace, remove "
+            "(enhanced: search, recall, conflicts, timeline, topics, health, reinforce)"
+        )
     invalid = (_validate_single_op(store, action, target, content, old_text)
                or _background_delete_gate(store, action, None, target, content, old_text)
                or _apply_write_gate(store, action, target, content, old_text))
@@ -298,6 +322,104 @@ def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> T
     """Return ``(memory_enabled, user_profile_enabled)`` from resolved config."""
     section = get_builtin_memory_config(config)
     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
+
+
+_ENHANCED_ACTIONS = {"search", "recall", "conflicts", "timeline", "topics", "health", "reinforce"}
+
+
+def _enhanced_memory_action(
+    action: str,
+    backend: Any,
+    *,
+    query: str = None,
+    limit: int = None,
+    memory_type: str = None,
+    graph_expand: bool = None,
+    temporal: bool = None,
+    memory_id: str = None,
+) -> str:
+    """Dispatch the enhanced-memory read/diagnostic actions.
+
+    These are additive: when the enhanced layer is disabled they return a
+    clear configuration hint instead of failing the turn.  All operations are
+    failure-contained by the backend.
+    """
+    if backend is None or not getattr(backend, "available", False):
+        return tool_error(
+            "Enhanced memory is not enabled. Set memory.enhanced.enabled: true "
+            "in config.yaml and start a new session.",
+            success=False,
+        )
+
+    try:
+        limit_value = max(1, min(50, int(limit))) if limit is not None else 10
+    except (TypeError, ValueError):
+        limit_value = 10
+
+    if action in {"search", "recall"}:
+        query = (query or "").strip()
+        if not query:
+            return tool_error(f"query is required for '{action}' action.", success=False)
+        advanced = action == "recall"
+        result = backend.search(
+            query,
+            limit=limit_value,
+            memory_type=memory_type or None,
+            fusion="rrf" if advanced else None,
+            graph_expand=True if advanced else bool(graph_expand),
+            temporal=True if advanced else bool(temporal),
+        )
+        results = result.get("results", []) if isinstance(result, dict) else []
+        formatted = [
+            {
+                "id": item.get("id", ""),
+                "content": item.get("content", ""),
+                "memory_type": item.get("memory_type", ""),
+                "scope": item.get("scope", "global"),
+                "score": item.get("score", 0.0),
+                "proof_count": item.get("proof_count", 1),
+                "created_at": item.get("created_at", ""),
+                "updated_at": item.get("updated_at", ""),
+                "tags": item.get("tags", []),
+            }
+            for item in results
+        ]
+        payload: Dict[str, Any] = {"results": formatted, "count": len(formatted)}
+        if isinstance(result, dict) and result.get("retrieval"):
+            payload["retrieval"] = result["retrieval"]
+        return json.dumps(payload, ensure_ascii=False)
+
+    if action == "conflicts":
+        return json.dumps({"conflicts": backend.conflicts()}, ensure_ascii=False)
+
+    if action == "timeline":
+        items = backend.timeline(limit=limit_value)
+        formatted = [
+            {
+                "id": item.get("id", ""),
+                "content": (item.get("content") or "")[:200],
+                "memory_type": item.get("memory_type", ""),
+                "scope": item.get("scope", "global"),
+                "importance": item.get("importance", 0.5),
+                "created_at": item.get("created_at", ""),
+            }
+            for item in items
+        ]
+        return json.dumps({"results": formatted, "count": len(formatted)}, ensure_ascii=False)
+
+    if action == "topics":
+        return json.dumps({"topics": backend.topics()}, ensure_ascii=False)
+
+    if action == "health":
+        return json.dumps(backend.health(), ensure_ascii=False)
+
+    if action == "reinforce":
+        memory_id = (memory_id or "").strip()
+        if not memory_id:
+            return tool_error("memory_id is required for 'reinforce' action.", success=False)
+        return json.dumps(backend.reinforce(memory_id), ensure_ascii=False)
+
+    return tool_error(f"Unknown action '{action}'.", success=False)
 
 
 @no_cache_check_fn
@@ -367,14 +489,23 @@ MEMORY_SCHEMA = {
         "notes (environment, conventions, tool quirks, lessons).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
-        "procedures belong in a skill, not memory."
+        "procedures belong in a skill, not memory.\n\n"
+        "ENHANCED (when memory.enhanced is enabled): 'search' and 'recall' query the local "
+        "structured memory store ('recall' adds rank fusion, graph expansion and temporal "
+        "windows); 'conflicts' lists contradicting memories; 'timeline' and 'topics' browse; "
+        "'health' reports store status; 'reinforce' bumps a memory's evidence count. These "
+        "return an error when the enhanced layer is disabled."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": [
+                    "add", "replace", "remove",
+                    "search", "recall", "conflicts", "timeline", "topics",
+                    "health", "reinforce",
+                ],
                 "description": "The action to perform (single-op shape). Omit when using 'operations'."
             },
             "target": {
@@ -393,6 +524,30 @@ MEMORY_SCHEMA = {
             "new_text": {
                 "type": "string",
                 "description": "Alias for 'content' (single-op shape): the COMPLETE new entry for 'replace', not a patch of old_text. If both are set, 'content' wins."
+            },
+            "query": {
+                "type": "string",
+                "description": "Search text for the enhanced 'search'/'recall' actions."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Max results for enhanced 'search'/'recall'/'timeline' (1-50, default 10)."
+            },
+            "memory_type": {
+                "type": "string",
+                "description": "Optional type filter for enhanced search (e.g. fact, preference, decision, procedure, episode)."
+            },
+            "graph_expand": {
+                "type": "boolean",
+                "description": "Enhanced 'search': also return memories linked to the top hits."
+            },
+            "temporal": {
+                "type": "boolean",
+                "description": "Enhanced 'search': interpret natural-language time windows (e.g. 'yesterday', 'last week') in the query."
+            },
+            "memory_id": {
+                "type": "string",
+                "description": "Memory id for the enhanced 'reinforce' action."
             },
             "operations": {
                 "type": "array",
@@ -450,8 +605,17 @@ registry.register(
     toolset="memory",
     schema=MEMORY_SCHEMA,
     handler=lambda args, **kw: memory_tool(
-        action=args.get("action", ""), target=args.get("target", "memory"), store=kw.get("store"),
-        **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")}),
+        action=args.get("action", ""),
+        target=args.get("target", "memory"),
+        store=kw.get("store"),
+        **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")},
+        backend=kw.get("backend"),
+        query=args.get("query"),
+        limit=args.get("limit"),
+        memory_type=args.get("memory_type"),
+        graph_expand=args.get("graph_expand"),
+        temporal=args.get("temporal"),
+        memory_id=args.get("memory_id")),
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides)

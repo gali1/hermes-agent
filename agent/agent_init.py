@@ -1342,28 +1342,37 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     elif not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-            if not is_core_memory_provider(_mem_provider_name):
+            _enhanced_cfg = {}
+            if isinstance(mem_config, dict):
+                _enhanced_cfg = mem_config.get("enhanced") or {}
+            _enhanced_on = bool(_enhanced_cfg.get("enabled"))
+
+            if (not is_core_memory_provider(_mem_provider_name)) or _enhanced_on:
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp is None:
-                    # The provider left core for the catalog (or was never installed): fetch it once.
-                    from hermes_cli.memory_provider_migration import recover_at_startup
-                    if recover_at_startup(_mem_provider_name, say=agent._emit_startup_warning):
-                        _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
-                elif _mp is not None and _unavailable_warning_key(_mem_provider_name) not in _warned_unavailable_providers:
-                    # unavailable_reason() reads config/probes importlib — skip it once warned.
-                    _unavailable_reason = ""
-                    with suppress(Exception):
-                        _unavailable_reason = _mp.unavailable_reason()
-                    _warn_memory_provider_unavailable(
-                        _mem_provider_name, _unavailable_reason, say=agent._emit_startup_warning)
-                if agent._memory_manager.providers:
+                agent._memory_manager = _MemoryManager(enhanced_config=_enhanced_cfg)
+                if not is_core_memory_provider(_mem_provider_name):
+                    _mp = _load_mem(_mem_provider_name)
+                    if _mp is None:
+                        # The provider left core for the catalog (or was never installed): fetch it once.
+                        from hermes_cli.memory_provider_migration import recover_at_startup
+                        if recover_at_startup(_mem_provider_name, say=agent._emit_startup_warning):
+                            _mp = _load_mem(_mem_provider_name)
+                    if _mp and _mp.is_available():
+                        agent._memory_manager.add_provider(_mp)
+                    elif _mp is not None and _unavailable_warning_key(_mem_provider_name) not in _warned_unavailable_providers:
+                        # unavailable_reason() reads config/probes importlib — skip it once warned.
+                        _unavailable_reason = ""
+                        with suppress(Exception):
+                            _unavailable_reason = _mp.unavailable_reason()
+                        _warn_memory_provider_unavailable(
+                            _mem_provider_name, _unavailable_reason, say=agent._emit_startup_warning)
+                if agent._memory_manager.providers or agent._memory_manager.enhanced_requested:
                     agent._memory_manager.initialize_all(**_memory_provider_init_kwargs(agent, platform))
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    if agent._memory_manager.providers:
+                        _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
+                    if agent._memory_manager.enhanced_enabled:
+                        _ra().logger.info("Enhanced memory layer activated")
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                     agent._memory_manager = None

@@ -284,6 +284,14 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
             getattr(agent, "_user_profile_enabled", True),
             skill_manage_available="skill_manage" in names,
         )
+    # Enhanced local memory protocol: static trust/retrieval rules injected
+    # only when the additive enhanced layer is active. Kept in the stable tier
+    # so it never changes mid-session (prefix-cache invariant).
+    enhanced_memory_guidance = None
+    _memory_manager = getattr(agent, "_memory_manager", None)
+    if _memory_manager is not None and getattr(_memory_manager, "enhanced_enabled", False):
+        from agent.memory.backend import SYSTEM_PROMPT_BLOCK as _ENHANCED_MEMORY_GUIDANCE
+        enhanced_memory_guidance = _ENHANCED_MEMORY_GUIDANCE
     # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
     # fallback paths must also limit task protocol guidance to dispatcher workers.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
@@ -291,6 +299,7 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
         _kanban_guidance = KANBAN_GUIDANCE
     tool_guidance = [
         memory_guidance,
+        enhanced_memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
         _kanban_guidance,

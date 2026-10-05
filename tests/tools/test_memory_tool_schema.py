@@ -17,6 +17,8 @@ These tests guard the schema against regressing back to a shape strict
 backends reject.
 """
 
+import json
+
 from tools.memory_tool import MEMORY_SCHEMA
 
 _FORBIDDEN_TOP_LEVEL_KEYS = ("allOf", "anyOf", "oneOf", "enum", "not")
@@ -30,3 +32,25 @@ def test_memory_schema_has_no_forbidden_top_level_combinators():
             "Codex backend (chatgpt.com/backend-api/codex). Per-action "
             "required-field checks belong in the runtime handler, not the schema."
         )
+
+
+def test_memory_schema_is_well_formed():
+    params = MEMORY_SCHEMA["parameters"]
+    assert params["type"] == "object"
+    # Only ``target`` is universally required: ``action`` belongs to the
+    # single-op shape and is omitted when the batch ``operations`` array is used.
+    assert params["required"] == ["target"]
+    # Nested ``enum`` on property values is fine — only top-level is forbidden.
+    assert params["properties"]["action"]["enum"] == [
+        "add", "replace", "remove",
+        "search", "recall", "conflicts", "timeline", "topics",
+        "health", "reinforce",
+    ]
+    assert params["properties"]["target"]["enum"] == ["memory", "user"]
+    # Batch shape is exposed and its items reuse the same actions.
+    assert params["properties"]["operations"]["type"] == "array"
+    assert params["properties"]["operations"]["items"]["properties"]["action"]["enum"] == ["add", "replace", "remove"]
+
+
+def test_memory_schema_is_json_serializable():
+    json.dumps(MEMORY_SCHEMA)

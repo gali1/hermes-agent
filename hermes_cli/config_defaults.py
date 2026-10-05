@@ -1323,6 +1323,20 @@ DEFAULT_CONFIG = {
         # "retaindb", "byterover", or a catalog-installed one ("honcho", "hindsight", "supermemory",
         # "mem0", "openviking").
         "provider": "",
+        # Additive enhanced local memory layer: structured SQLite store with
+        # hybrid retrieval (FTS5 + optional vector arm + RRF rank fusion +
+        # graph expansion + temporal windows), evidence accumulation, and
+        # automatic contradiction detection. Off by default — when disabled,
+        # behavior is identical to built-in + provider memory. Data lives under
+        # $HERMES_HOME/<data_dir>/ and respects profile isolation.
+        "enhanced": {
+            "enabled": False,
+            "data_dir": "memory_engine",
+            "auto_recall": True,
+            "auto_capture": True,
+            "max_recall": 6,
+            "recall_budget_chars": 2400,
+        },
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
