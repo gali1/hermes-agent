@@ -76,12 +76,15 @@ skills, and memory under `~/.hermes` are not touched — it is a code-only swap.
 
 ```bash
 # from a clone of this repo, using the environment that owns the current hermes
-pip install .        # add --force-reinstall for a guaranteed clean swap
+HERMES_ALLOW_WHEEL_BUILD=1 pip install .   # add --force-reinstall for a clean swap
 hermes --version     # verify
 ```
 
 Notes:
 
+- Upstream blocks wheel/sdist builds by default; this fork restores source
+  installs with `HERMES_ALLOW_WHEEL_BUILD=1` (the artifact is permitted but
+  remains an unsupported distribution method).
 - It only replaces the copy in **that** environment. The one-line installer keeps
   its managed copy in `~/.hermes/hermes-agent/venv`; installing elsewhere creates
   a second copy and whichever `hermes` comes first on `PATH` wins. For managed
@@ -102,7 +105,7 @@ and link the launcher into `PATH` — don't install into the system Python:
 ```bash
 # as an admin user
 sudo python3 -m venv /opt/hermes/venv
-sudo /opt/hermes/venv/bin/pip install /path/to/hermes-agent
+sudo env HERMES_ALLOW_WHEEL_BUILD=1 /opt/hermes/venv/bin/pip install /path/to/hermes-agent
 sudo ln -sf /opt/hermes/venv/bin/hermes /usr/local/bin/hermes
 ```
 

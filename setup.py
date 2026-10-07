@@ -32,6 +32,10 @@ from setuptools.command.sdist import sdist
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 _IN_NIX_BUILD = os.environ.get("HERMES_NIX_BUILD") == "1"
+# Local fork opt-in (additive): restore the pre-sync ability to build from
+# source without changing upstream's default policy. Set
+# HERMES_ALLOW_WHEEL_BUILD=1 to permit a wheel/sdist build.
+_ALLOW_WHEEL_BUILD = os.environ.get("HERMES_ALLOW_WHEEL_BUILD") == "1"
 
 _BLOCK_MESSAGE = (
     "Building wheels or sdists for hermes-agent is not supported.\n"
@@ -42,13 +46,16 @@ _BLOCK_MESSAGE = (
     "  source ./activate  # PowerShell: . .\\activate.ps1\n"
     "\n"
     "If you are building with Nix (uv2nix), this error should not fire —\n"
-    "the Hermes Nix derivation sets HERMES_NIX_BUILD=1. If it does, file a bug."
+    "the Hermes Nix derivation sets HERMES_NIX_BUILD=1. If it does, file a bug.\n"
+    "\n"
+    "For a local source build, set HERMES_ALLOW_WHEEL_BUILD=1 (the artifact\n"
+    "is permitted but remains an unsupported distribution method)."
 )
 
 
 class _GuardedSdist(sdist):
     def run(self, *args, **kwargs):
-        if not _IN_NIX_BUILD:
+        if not (_IN_NIX_BUILD or _ALLOW_WHEEL_BUILD):
             raise RuntimeError(_BLOCK_MESSAGE)
         return super().run(*args, **kwargs)
 
@@ -65,7 +72,7 @@ try:
 
     class _GuardedBdistWheel(bdist_wheel):
         def run(self, *args, **kwargs):
-            if not _IN_NIX_BUILD:
+            if not (_IN_NIX_BUILD or _ALLOW_WHEEL_BUILD):
                 raise RuntimeError(_BLOCK_MESSAGE)
             return super().run(*args, **kwargs)
 
