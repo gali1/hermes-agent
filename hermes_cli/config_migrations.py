@@ -702,6 +702,56 @@ def _migrate_to_50(results: Dict[str, Any], quiet: bool) -> None:
             "  ✓ Removed security.tirith_* — the tirith scanner is no longer bundled with Hermes.")
 
 
+def _migrate_to_51(results: Dict[str, Any], quiet: bool) -> None:
+    # 50 → 51: the fork restores the agent-callable ``send_message`` tool as the ``messaging``
+    # toolset. ``hermes tools`` persists an explicit per-platform list, and absence from that list
+    # reads as "unchecked" — so lists saved while the toolset did not exist leave it dormant.
+    # Append it to stale lists, preserve an explicit decline, and leave composites/empty lists
+    # alone (they already inherit it or name no configurable key). Skipped when
+    # ``agent.disabled_toolsets`` names it (the resolver subtracts that list last, so the append
+    # would have no effect).
+    from agent.skill_utils import parse_config_string_list
+    from hermes_cli.tools_config import _configurable_keys, _get_plugin_toolset_keys
+    from hermes_cli.toolset_scope import toolset_allowed_for_platform
+
+    config = read_raw_config()
+    saved = config.get("platform_toolsets")
+    if not isinstance(saved, dict):
+        return
+    if "messaging" in parse_config_string_list(_dict_at(config, "agent").get("disabled_toolsets")):
+        return
+    known = _dict_at(config, "known_builtin_toolsets")
+    # Same predicate the resolver uses to pick its explicit branch: any configurable or plugin key.
+    explicit_keys = _configurable_keys() | _get_plugin_toolset_keys()
+    enabled_for: List[str] = []
+    for platform, toolsets in saved.items():
+        if not isinstance(toolsets, list) or "messaging" in toolsets:
+            continue
+        if not toolset_allowed_for_platform("messaging", platform):
+            continue
+        # A composite like [hermes-cli] already inherits every core tool at read time.
+        if not any(str(ts) in explicit_keys for ts in toolsets):
+            continue
+        offered = known.get(platform)
+        if isinstance(offered, list) and "messaging" in offered:
+            continue
+        saved[platform] = sorted({*map(str, toolsets), "messaging"})
+        if isinstance(offered, list):
+            known[platform] = sorted({*map(str, offered), "messaging"})
+        enabled_for.append(str(platform))
+    if not enabled_for:
+        return
+    config["platform_toolsets"] = saved
+    if known:
+        config["known_builtin_toolsets"] = known
+    platforms = ", ".join(sorted(enabled_for))
+    _commit(
+        config, results, quiet,
+        f"enabled the messaging toolset for {platforms}",
+        f"  ✓ Enabled the Messaging toolset (agent-callable send_message) for {platforms}. "
+        "Uncheck Messaging in `hermes tools` to turn it off.")
+
+
 MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (12, _migrate_to_12),
     (13, _migrate_to_13),
@@ -835,6 +885,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (49, _migrate_to_49),
     # 49 → 50: security.tirith_* dropped; the bundled scanner is gone (see _migrate_to_50).
     (50, _migrate_to_50),
+    # 50 → 51: saved platform_toolsets lists gain the restored `messaging` toolset (see _migrate_to_51).
+    (51, _migrate_to_51),
 )
 
 #: Steps triggered by a legacy key or identifier (a renamed or retired key, a removed plugin or
