@@ -3387,7 +3387,26 @@ class ContextCompressor(SummaryDispatchMixin, PreLlmSkipMixin, MicroCompactionMi
         # is not room the round can keep) — the #61932 single-200KB-read case, which must still give way.
         spared = self._spared_pending_tool_round(result)
         prune_boundary = min(prune_boundary, spared.start) if spared else prune_boundary
-        pruned = self._dedupe_tool_results(result)
+        # Read lifecycle (Phase 3a, Headroom-derived): old reads whose file was
+        # later modified (stale) or read again (superseded) become a one-line
+        # marker before dedup/summarize, so the transcript stops carrying
+        # bytes the model must not trust. Opt-out via
+        # compression.content_aware.read_lifecycle; fail-open.
+        _lifecycle_pruned = 0
+        try:
+            from agent.content_compression.config import (
+                get_content_compression_config as _get_cc_config,
+            )
+
+            if _get_cc_config().get("read_lifecycle", True):
+                from agent.content_compression.read_lifecycle import (
+                    apply_read_lifecycle as _apply_read_lifecycle,
+                )
+
+                result, _lifecycle_pruned = _apply_read_lifecycle(result, prune_boundary)
+        except Exception:
+            pass
+        pruned = self._dedupe_tool_results(result) + _lifecycle_pruned
         # Just-loaded / tail-referenced skills keep full skill_view bodies through the ordinary passes.
         # Without this, a skill loaded moments before a compaction can be demoted to metadata while the
         # model still believes its instructions are in context. See #32106.
@@ -5702,6 +5721,46 @@ Write only the summary body. Do not include any preamble or prefix."""
                 f"window {compress_start}-{compress_end} holds only already-summarized handoffs",
             )
             return canonical_messages
+
+        # Phase 3 gate (opt-in, Headroom-derived): cache-aware net-cost policy.
+        # Mutating the transcript forces a cache write of the new suffix; when
+        # the expected savings over the remaining reads do not cover that
+        # penalty, skip the summary and preserve the cached transcript. No-op
+        # unless compression.content_aware.net_cost_gate is true; fail-open.
+        try:
+            from agent.content_compression.config import (
+                get_content_compression_config as _get_cc_config,
+            )
+
+            if _get_cc_config().get("net_cost_gate", False):
+                from agent.content_compression.net_cost import (
+                    should_compress as _should_compress_net_cost,
+                )
+                from agent.content_compression.tokens import (
+                    estimate_messages_tokens_structured as _estimate_structured,
+                )
+
+                _estimated_current = _estimate_structured(turns_to_summarize)
+                _summary_budget = int(self.max_summary_tokens or 0)
+                if not _should_compress_net_cost(
+                    delta_tokens=_estimated_current - _summary_budget,
+                    summary_tokens=_summary_budget,
+                ):
+                    self._last_summary_dropped_count = 0
+                    self._last_summary_fallback_used = False
+                    self._last_compress_aborted = True
+                    self._last_compression_savings_pct = 0.0
+                    if not self.quiet_mode:
+                        logger.info(
+                            "Net-cost gate: skipping compression "
+                            "(estimated %d tokens of middle vs %d-token summary budget)",
+                            _estimated_current,
+                            _summary_budget,
+                        )
+                    return messages
+        except Exception:
+            pass
+
         if not self.quiet_mode:
             self._log_compression_start(
                 display_tokens, compress_start, compress_end, len(turns_to_summarize), n_messages - scan.tail_start,

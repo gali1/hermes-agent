@@ -576,6 +576,38 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        # Headroom-derived content-aware compression of tool outputs (additive).
+        # Lossless folds and lossless type renders (json CSV-schema, config
+        # stanzas) are information-preserving (round-trip verified). The lossy
+        # stages -- dense-line elision and the json/log/search/diff drop tiers
+        # -- require a retrievable original: they only fire when the original
+        # can be persisted to the sandbox and the path embedded in the marker.
+        # No effect when compression.enabled is false.
+        "content_aware": {
+            "enabled": True,
+            "lossless_folds": True,
+            "dense_line_elision": False,
+            "min_savings_chars": 64,
+            # Route outputs through the per-type compressors (json/log/search/
+            # diff/config/tabular). Lossless renders are free; lossy drops stay
+            # gated on a retrieval path.
+            "type_compression": True,
+            # Lossy JSON: max items kept before the omission marker.
+            "json_max_items": 15,
+            # Lossy log: max lines kept before the omission marker.
+            "log_max_lines": 100,
+            # Lossy search: max matches kept (adaptive sizer may keep fewer).
+            "search_max_total": 30,
+            # Phase 3a (read lifecycle): replace old read_file results whose
+            # file was later modified (stale) or read again (superseded) with
+            # a one-line marker before the prune/dedup/summarize passes.
+            "read_lifecycle": True,
+            # Phase 3c (opt-in): cache-aware net-cost gate on compression.
+            # When true, a compression whose expected cache-write penalty
+            # exceeds its savings over the remaining reads is skipped.
+            # Default false, mirroring Headroom's opt-in net-cost policy.
+            "net_cost_gate": False,
+        },
         # checkpoint_required: fail closed before lossy compaction unless an active memory provider
         # confirms checkpoint API compatibility and completes the checkpoint.
         "checkpoint_required": False,

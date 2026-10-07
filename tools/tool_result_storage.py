@@ -282,6 +282,57 @@ def _build_persisted_message(preview: str, has_more: bool, original_size: int,
 _PERSISTED_PATH_RE = re.compile(r"^Full output saved to: (.+)$", re.MULTILINE)
 
 
+def _compress_for_context(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+    config: BudgetConfig,
+) -> str:
+    """Apply content-aware compression to a below-threshold tool result.
+
+    Lossless folds run by default. Dense-line elision and the lossy per-type
+    drop tiers run only when enabled in ``compression.content_aware`` AND the
+    original can be persisted for retrieval: the writer below stores the
+    ORIGINAL in the sandbox via the same helpers Layer 2 uses and returns the
+    path as the retrieval hint embedded in the marker. Any failure returns the
+    content unchanged (fail-open).
+
+    ``config`` is the caller's BudgetConfig, accepted for call-site symmetry;
+    compression thresholds live in ``compression.content_aware``.
+    """
+    try:
+        from agent.content_compression import compress_tool_output
+    except Exception as exc:
+        logger.debug("Content-aware compression unavailable: %s", exc)
+        return content
+
+    def _retrieval_writer(original_text: str):
+        if env is None:
+            return None
+        try:
+            storage_dir = _resolve_storage_dir(env)
+            remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
+            if _write_to_sandbox(original_text, remote_path, env):
+                return remote_path
+            logger.debug("Retrieval write failed for %s: %s", tool_use_id, remote_path)
+        except Exception as exc:
+            logger.debug("Retrieval write failed for %s: %s", tool_use_id, exc)
+        return None
+
+    try:
+        return compress_tool_output(
+            content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            env=env,
+            retrieval_writer=_retrieval_writer,
+        ).text
+    except Exception as exc:
+        logger.debug("Content-aware compression failed for %s: %s", tool_name, exc)
+        return content
+
+
 def extract_persisted_path(content: str) -> str | None:
     """File path from a <persisted-output> block, or None (lets the result-reference stubbing
     guard in agent/tool_guardrails.py carry the spillover path instead of leaving it dangling)."""
@@ -298,8 +349,14 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
     location succeeds."""
     if threshold is None:
         threshold = config.resolve_threshold(tool_name)
-    if threshold == float("inf") or len(content) <= threshold:
+    if threshold == float("inf"):
+        # read_file (infinite threshold) stays byte-exact.
         return content
+    if len(content) <= threshold:
+        # Content-aware compression is additive and fail-open: lossless folds
+        # shrink the result here; lossy stages stay off unless explicitly
+        # enabled with a retrieval path.
+        return _compress_for_context(content, tool_name, tool_use_id, env, config)
     # The size decision above stays on the raw inline result (that is what cost context); the file
     # and the preview carry the pageable text inside an MCP envelope (#90426).
     persisted_content = _pageable_text(content)
