@@ -80,6 +80,16 @@ def test_null_platform_toolsets_fall_back_to_platform_default():
     assert enabled == default_enabled
 
 
+def test_configurable_toolsets_include_messaging():
+    assert any(ts_key == "messaging" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+
+
+def test_get_platform_tools_default_telegram_includes_messaging():
+    enabled = _get_platform_tools({}, "telegram")
+
+    assert "messaging" in enabled
+
+
 def test_scalar_platform_toolsets_fall_back_to_platform_default():
     """A non-list platform value is ignored by the resolver."""
     config = {"platform_toolsets": {"cli": "bogus"}}

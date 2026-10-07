@@ -19,11 +19,15 @@ from tools.send_message_senders import (
     _adapter_media_method, _error, _live_adapter, _media_caption_split, _plugin_standalone_sender,
     _registry_standalone_send, _resolve_slack_user_target, _sanitize_error_text, _send_bluebubbles,
     _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
-# (the agent must not fire cross-platform messages on its own); cron delivery, the
-# ``hermes send`` CLI, the kanban notifier and the opt-in MCP server import the helpers.
+# Fork change vs upstream #47856: ``send_message`` IS registered as an
+# agent-callable model tool (see the registry block at the bottom of this
+# module), gated by ``_check_send_message`` so it only appears when a gateway
+# is running, the session is on a non-local messaging platform, or the agent
+# is a kanban worker. The send engine remains the shared transport for cron
+# delivery, the ``hermes send`` CLI, the gateway kanban notifier, and the
+# standalone MCP server.
 
 
 def prepare_send_message_platforms() -> None:
@@ -763,3 +767,79 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             and not last_result.get("media_delivered")):
         last_result["warnings"] = [*last_result.get("warnings", []), warning]
     return last_result
+# --- Registry (fork restoration) ---
+
+SEND_MESSAGE_SCHEMA = {
+    "name": "send_message",
+    "description": (
+        "Send a message to a connected messaging platform, or list available targets.\n\n"
+        "IMPORTANT: When the user asks to send to a specific channel or person "
+        "(not just a bare platform name), call send_message(action='list') FIRST to see "
+        "available targets, then send to the correct one.\n"
+        "If the user just says a platform name like 'send to telegram', send directly "
+        "to the home channel without listing first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["send", "list", "react", "unreact"],
+                "description": "Action to perform. 'send' (default) sends a message. 'list' returns all available channels/contacts across connected platforms. 'react' attaches an emoji reaction to a message (platforms that support it, e.g. photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+            },
+            "target": {
+                "type": "string",
+                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+            },
+            "message": {
+                "type": "string",
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
+            },
+            "emoji": {
+                "type": "string",
+                "description": "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, ❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji reactions."
+            },
+            "message_id": {
+                "type": "string",
+                "description": "For action='react'/'unreact': id of the message to react to. Omit to target the most recent message received in that chat (usually the one being replied to)."
+            }
+        },
+        "required": []
+    }
+}
+
+
+def _check_send_message():
+    """Gate send_message on gateway running (always available on messaging platforms).
+
+    Also passes for kanban workers — the dispatcher sets ``HERMES_KANBAN_TASK``
+    on every spawned worker, but those workers run with the assignee profile's
+    ``HERMES_HOME`` which has no ``gateway.pid``, so the gateway-running check
+    would fail even though the parent gateway is alive. Honoring the env var
+    lets workers call ``send_message`` to deliver rich content directly to the
+    originating chat (paired with ``kanban_complete`` for the short notifier
+    summary), which is the canonical pattern for any worker that needs to
+    reply with more than the ~200-char first-line truncation the kanban
+    notifier applies.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return True
+    from gateway.session_context import get_session_env
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    if platform and platform != "local":
+        return True
+    try:
+        from gateway.status import get_running_pid
+        return get_running_pid() is not None
+    except Exception:
+        return False
+
+
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="📨",
+)

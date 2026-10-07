@@ -26,6 +26,8 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     "execute_code", "delegate_task",
     "cronjob_manage",
+    # Cross-platform messaging (gated on gateway running via check_fn)
+    "send_message",
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_request_review",
     "kanban_request_changes",
@@ -64,7 +66,7 @@ def _core_without(*excluded, kanban=True):
 
 # Coding posture: everything you reach for while pairing on code; drops messaging,
 # tts, image_gen, cron, kanban and computer-use.
-_CODING_TOOLS = _core_without("image_generate", "text_to_speech", "cronjob_manage", "computer_use", kanban=False)
+_CODING_TOOLS = _core_without("image_generate", "text_to_speech", "cronjob_manage", "send_message", "computer_use", kanban=False)
 
 # Toolsets a CLIENT adds to its own sessions (tui_gateway/server.py::_gui_surface_toolsets), never
 # config: another surface lacking them made no configuration choice.
@@ -119,6 +121,7 @@ TOOLSETS = {
         "trigger scheduled tasks",
         ["cronjob_manage"],
     ),
+    "messaging": _ts("Cross-platform messaging: send messages to Telegram, Discord, Slack, SMS, etc.", ["send_message"]),
     "file": _ts(
         "File manipulation tools: read, write, patch (with fuzzy matching), and "
         "search (content + files)",
@@ -188,9 +191,10 @@ TOOLSETS = {
         posture=True,
     ),
 
-    # Full Hermes toolsets (CLI + messaging platforms). All share the core tools;
-    # there is deliberately no agent-callable send_message tool. hermes-acp is the
-    # coding posture minus the interactive clarify UI.
+    # Full Hermes toolsets (CLI + messaging platforms). All share the core tools,
+    # including send_message, which is gated by its check_fn (gateway running /
+    # non-local session platform / kanban worker). hermes-acp is the coding
+    # posture minus the interactive clarify UI.
     "hermes-acp": _ts(
         "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without "
         "messaging, audio, or clarify UI",
