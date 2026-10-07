@@ -503,8 +503,9 @@ class TestMaybePersistIntegration:
         assert "[elided" in result
         expected_path = f"{env.temp_dir}/hermes-results/tc_dense.txt"
         assert f"(retrieve: {expected_path})" in result
-        assert len(env.calls) == 1
-        assert env.calls[0]["stdin_data"] == self.DENSE
+        # The sandbox write may include a round-trip size probe (modern helper),
+        # so assert the original was written rather than counting exec calls.
+        assert any(call.get("stdin_data") == self.DENSE for call in env.calls)
 
     def test_lossy_write_failure_skips_elision(self, set_cc_config, tmp_path):
         set_cc_config(dense_line_elision=True)
