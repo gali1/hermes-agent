@@ -1285,6 +1285,26 @@ class ContextCompressor(ContextEngine):
         else:
             prune_boundary = len(result) - protect_tail_count
 
+        # Read lifecycle (Phase 3a, Headroom-derived): old reads whose file was
+        # later modified (stale) or read again (superseded) become a one-line
+        # marker before dedup/summarize, so the transcript stops carrying
+        # bytes the model must not trust. Opt-out via
+        # compression.content_aware.read_lifecycle; fail-open.
+        try:
+            from agent.content_compression.config import (
+                get_content_compression_config as _get_cc_config,
+            )
+
+            if _get_cc_config().get("read_lifecycle", True):
+                from agent.content_compression.read_lifecycle import (
+                    apply_read_lifecycle as _apply_read_lifecycle,
+                )
+
+                result, _lifecycle_pruned = _apply_read_lifecycle(result, prune_boundary)
+                pruned += _lifecycle_pruned
+        except Exception:
+            pass
+
         # Pass 1: Deduplicate identical tool results.
         # When the same file is read multiple times, keep only the most recent
         # full copy and replace older duplicates with a back-reference.
@@ -2821,6 +2841,45 @@ This compaction should PRIORITISE preserving all information related to the focu
             # it so _generate_summary() does not inject cross-session content
             # into the summarizer prompt via the iterative-update path.
             self._previous_summary = None
+
+        # Phase 3 gate (opt-in, Headroom-derived): cache-aware net-cost policy.
+        # Mutating the transcript forces a cache write of the new suffix; when
+        # the expected savings over the remaining reads do not cover that
+        # penalty, skip the summary and preserve the cached transcript. No-op
+        # unless compression.content_aware.net_cost_gate is true; fail-open.
+        try:
+            from agent.content_compression.config import (
+                get_content_compression_config as _get_cc_config,
+            )
+
+            if _get_cc_config().get("net_cost_gate", False):
+                from agent.content_compression.net_cost import (
+                    should_compress as _should_compress_net_cost,
+                )
+                from agent.content_compression.tokens import (
+                    estimate_messages_tokens_structured as _estimate_structured,
+                )
+
+                _estimated_current = _estimate_structured(turns_to_summarize)
+                _summary_budget = int(self.max_summary_tokens or 0)
+                if not _should_compress_net_cost(
+                    delta_tokens=_estimated_current - _summary_budget,
+                    summary_tokens=_summary_budget,
+                ):
+                    self._last_summary_dropped_count = 0
+                    self._last_summary_fallback_used = False
+                    self._last_compress_aborted = True
+                    self._last_compression_savings_pct = 0.0
+                    if not self.quiet_mode:
+                        logger.info(
+                            "Net-cost gate: skipping compression "
+                            "(estimated %d tokens of middle vs %d-token summary budget)",
+                            _estimated_current,
+                            _summary_budget,
+                        )
+                    return messages
+        except Exception:
+            pass
 
         if not self.quiet_mode:
             logger.info(

@@ -141,6 +141,57 @@ def _build_persisted_message(
     return msg
 
 
+def _compress_for_context(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env,
+    config: BudgetConfig,
+) -> str:
+    """Apply content-aware compression to a below-threshold tool result.
+
+    Lossless folds run by default. Dense-line elision (lossy) runs only when
+    enabled in ``compression.content_aware`` AND the original can be
+    persisted for retrieval: the writer below stores the ORIGINAL in the
+    sandbox via the same helpers Layer 2 uses and returns the path as the
+    retrieval hint embedded in the elision marker. Any failure returns the
+    content unchanged (fail-open).
+
+    ``config`` is the caller's BudgetConfig, accepted for call-site symmetry;
+    compression thresholds live in ``compression.content_aware``.
+    """
+    try:
+        from agent.content_compression import compress_tool_output
+    except Exception as exc:
+        logger.debug("Content-aware compression unavailable: %s", exc)
+        return content
+
+    def _retrieval_writer(original_text: str):
+        if env is None:
+            return None
+        try:
+            storage_dir = _resolve_storage_dir(env)
+            remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
+            if _write_to_sandbox(original_text, remote_path, env):
+                return remote_path
+            logger.debug("Retrieval write failed for %s: %s", tool_use_id, remote_path)
+        except Exception as exc:
+            logger.debug("Retrieval write failed for %s: %s", tool_use_id, exc)
+        return None
+
+    try:
+        return compress_tool_output(
+            content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+            env=env,
+            retrieval_writer=_retrieval_writer,
+        ).text
+    except Exception as exc:
+        logger.debug("Content-aware compression failed for %s: %s", tool_name, exc)
+        return content
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -172,7 +223,11 @@ def maybe_persist_tool_result(
         return content
 
     if len(content) <= effective_threshold:
-        return content
+        # Content-aware compression is additive and fail-open: lossless folds
+        # shrink the result here; lossy elision stays off unless explicitly
+        # enabled with a retrieval path. read_file (threshold=inf) is
+        # untouched above and stays byte-exact.
+        return _compress_for_context(content, tool_name, tool_use_id, env, config)
 
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
