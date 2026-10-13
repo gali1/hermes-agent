@@ -8,7 +8,12 @@ simple command: an unquoted ``;`` ``|`` ``&`` newline, or the ``)`` / backtick c
 """
 import pytest
 
-from tools.approval_detection import _quoted_grep_pattern_spans, _shell_tokens_with_spans, detect_hardline_command
+from tools.approval_detection import (
+    _quoted_grep_pattern_spans,
+    _shell_tokens_with_spans,
+    detect_dangerous_command,
+    detect_hardline_command,
+)
 
 
 @pytest.mark.parametrize("command", [
@@ -33,13 +38,16 @@ def test_genuinely_unbalanced_quoting_still_fails_closed():
 
 
 def test_hardline_patterns_unchanged():
-    for command in ("rm -rf /", 'echo "$(rm -rf /)"', "sudo shutdown -h now"):
+    for command in ("rm -rf /", 'echo "$(rm -rf /)"'):
         assert detect_hardline_command(command)[0] is True, command
+    # Power control was reclassified to the ask-approval tier.
+    assert detect_hardline_command("sudo shutdown -h now")[0] is False
+    assert detect_dangerous_command("sudo shutdown -h now")[0] is True
 
 
 class TestExecutableSubstitutionBodiesStayExecutable:
     """Bounding the grep lexer removed the old 'malformed' floor; the newline masker must then treat a
-    substitution body inside double quotes as CODE, or a newline-separated hardline command hides as an
+    substitution body inside double quotes as CODE, or a newline-separated power command hides as an
     operand (independent review witness: blocked on main as 'malformed', approved on the first fix)."""
 
     @pytest.mark.parametrize("cmd", [
@@ -50,17 +58,22 @@ class TestExecutableSubstitutionBodiesStayExecutable:
         'echo "$(echo $(grep x f)\nreboot)"',
         'echo "`grep x f\nreboot`"',
     ])
-    def test_hardline_command_inside_a_quoted_substitution_blocks_as_itself(self, cmd):
+    def test_power_command_inside_a_quoted_substitution_flags_dangerous(self, cmd):
         blocked, reason = detect_hardline_command(cmd)
-        assert blocked and reason == "system shutdown/reboot"
+        assert blocked is False
+        is_dangerous, _, desc = detect_dangerous_command(cmd)
+        assert is_dangerous and desc == "system shutdown/reboot"
 
-    def test_public_guard_blocks_without_offering_approval(self, tmp_path, monkeypatch):
+    def test_public_guard_offers_approval_instead_of_hardline_denying(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.approval import check_dangerous_command
         calls = []
         result = check_dangerous_command('echo "$(grep -P \'safe\' /dev/null\nreboot)"', "local",
-                                         approval_callback=lambda *a, **k: calls.append(a) or False)
-        assert result["approved"] is False and "hardline" in result["message"].lower() and calls == []
+                                         approval_callback=lambda *a, **k: calls.append(a) or "deny")
+        assert result["approved"] is False
+        assert result.get("hardline") is not True
+        assert calls, "the reclassified power command must reach the approval callback"
 
     @pytest.mark.parametrize("cmd", [
         "grep -e `echo needle` file",            # backtick OPERAND (opened after the grep) is not a closer

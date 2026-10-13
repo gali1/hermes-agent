@@ -71,13 +71,15 @@ _WRITE_TARGET_BOUNDARY = r'(?=[\s;&|<>"\']|$)'
 # Commands that NEVER run via the agent, regardless of --yolo, approvals.mode=off, or cron approve
 # mode — a floor below yolo. Applies only to environments that can damage the host (local, ssh,
 # container-host cron); containerized backends already bypass the dangerous-command layer.
-# Deliberately tiny: only things with no recovery path (root wipe, raw block device writes,
-# shutdown, DoS). Recoverable operations (git reset --hard, chmod -R 777, curl|sh) stay in
-# DANGEROUS_PATTERNS.
+# Deliberately tiny: only things with no recovery path (root wipe, raw block device writes, DoS).
+# Recoverable operations (git reset --hard, chmod -R 777, curl|sh) stay in DANGEROUS_PATTERNS, and
+# host power control (shutdown/reboot/halt/poweroff/init/telinit) lives there too: a legitimate,
+# user-authorized reboot must be able to proceed through the normal ask-approval path.
 
 # Start-of-command position: start of string, newline, subshell opener ($( or backtick), optionally consuming
-# sudo/env/exec/nohup/setsid/time wrappers. Keeps shutdown/reboot rules from firing on "echo reboot" / "grep
-# 'shutdown' log". Real ;/&/| separators are converted to newlines by the quote-aware _mark_command_starts pass;
+# sudo/env/exec/nohup/setsid/time wrappers. Anchors the command-name rules in BOTH tiers (the hardline floor
+# and the dangerous shutdown/reboot rules), so quoted prose like "echo reboot" / "grep 'shutdown' log" does
+# not match. Real ;/&/| separators are converted to newlines by the quote-aware _mark_command_starts pass;
 # keeping them here mistakes quoted data (grep '(safe|rm -rf /)') for commands.
 _CMDPOS = (
     r'(?:^|[\n`]|\$\()' r'\s*'  # start position, optional whitespace
@@ -112,11 +114,11 @@ HARDLINE_PATTERNS = [
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'/(?:(?:\.\.?)?/)*(?:\.\.?)?\**|/ \*'), "recursive delete of root filesystem"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(_HARDLINE_SYSTEM_DIRS), "recursive delete of system directory"),
     (_RM_FLAG_PREFIX + _hardline_rm_path(r'(?:~|\$\{?HOME\}?)(?:/?|/\*)?'), "recursive delete of home directory"),
-    # Command-name rules (mkfs, dd, kill, shutdown...) are _CMDPOS-anchored so quoted prose
+    # Command-name rules (mkfs, dd, kill...) are _CMDPOS-anchored so quoted prose
     # (`echo "does this use mkfs?"`) cannot trip the floor.
     # See #93392.
     (_CMDPOS + r'mkfs(\.[a-z0-9]+)?\b', "format filesystem (mkfs)"),
-    # `dd` is a command-name token, so anchor it to command position like mkfs/rm/shutdown (#93392): quoted
+    # `dd` is a command-name token, so anchor it to command position like mkfs/rm (#93392): quoted
     # prose such as `git commit -m "never dd of=/dev/sda"` is an argument, not a command. The argument tail
     # ([^\n]*of=/dev/...) is kept so flag order doesn't matter.
     (_CMDPOS + r'dd\b[^\n]*\bof=/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*', "dd to raw block device"),
@@ -133,10 +135,9 @@ HARDLINE_PATTERNS = [
     # Kill every process on the system — anchor the command-name token so `echo "kill -1 sends SIGHUP to
     # everything"` doesn't trip (#93392).
     (_CMDPOS + r'kill\s+(-[^\s]+\s+)*-1\b', "kill all processes"),
-    (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
-    (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
-    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
-    (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Host power control (shutdown/reboot/halt/poweroff, init 0/6, systemctl poweroff/reboot, telinit
+    # 0/6) was reclassified to DANGEROUS_PATTERNS: a user-authorized reboot is legitimate, so it takes
+    # the normal ask-approval path (still never silent) instead of the unconditional floor.
 ]
 
 # Pre-compiled at module load so the hot-path matcher never pays the cold re.compile fan-out
@@ -300,6 +301,14 @@ DANGEROUS_PATTERNS = [
     (r'\bTRUNCATE\s+(TABLE)?\s*\w', "SQL TRUNCATE"),
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
+    # Host power control: shutdown/reboot must never execute silently, but a user-authorized reboot is
+    # legitimate, so these ask for approval instead of hitting the hardline floor (which stays for the
+    # no-recovery destructive rules above). _CMDPOS-anchored so `echo reboot` / `grep 'shutdown' log`
+    # stay data.
+    (_CMDPOS + r'(shutdown|reboot|halt|poweroff)\b', "system shutdown/reboot"),
+    (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
+    (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
+    (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (-9 / -KILL / -s KILL / -SIGKILL) and `killall -r <regex>` broad sweeps
@@ -1216,8 +1225,8 @@ def _mark_command_starts(command: str, marker: str = "\n") -> str:
 def _mask_quoted_newlines(command: str) -> str:
     """Replace raw newlines inside single/double quotes with a space (detection-only).
     A quoted newline is DATA to the shell, yet the flat ``_CMDPOS`` class treats every raw ``\\n``
-    as a command start, so multi-line quoted arguments (commit messages, heredoc text) tripped the
-    hardline blocklist when a data line began with e.g. ``sudo reboot``. Quote tracking mirrors
+    as a command start, so multi-line quoted arguments (commit messages, heredoc text) tripped
+    command detection when a data line began with e.g. ``sudo reboot``. Quote tracking mirrors
     ``_iter_shell_command_starts``. Unquoted newlines pass through and ``_mark_command_starts``
     still re-inserts newlines at genuine starts; an unclosed quote absorbs following newlines
     exactly as the shell would, so masking them cannot hide a runnable command."""

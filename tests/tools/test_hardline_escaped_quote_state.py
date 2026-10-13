@@ -31,12 +31,21 @@ def test_escaped_quotes_in_a_valid_grep_pattern_are_not_malformed(command):
 
 @pytest.mark.parametrize(("command", "description"), [
     (r'cat "f\"n.txt"; rm -rf --no-preserve-root /', "recursive delete of root filesystem"),
-    (r'echo "a\"b"; reboot', "system shutdown/reboot"),
     (r'echo "a\"b" && rm -rf ~', "recursive delete of home directory"),
     (r'echo "a\"b"; rm${IFS}-rf${IFS}/', "recursive delete of root filesystem"),
-    (r'grep -n "prefix \"quoted\" suffix" input.txt; reboot', "system shutdown/reboot"),
-    ("printf \\\\\nreboot", "system shutdown/reboot"),
     ("grep 'unterminated", "command parser limit or malformed executable payload"),
 ])
 def test_escaped_quote_before_a_hardline_command_does_not_hide_it(command, description):
     assert detect_hardline_command(command) == (True, description)
+
+
+@pytest.mark.parametrize("command", [
+    r'echo "a\"b"; reboot',
+    r'grep -n "prefix \"quoted\" suffix" input.txt; reboot',
+    "printf \\\\\nreboot",
+])
+def test_escaped_quote_before_a_power_command_still_flags_dangerous(command):
+    """Power control moved off the hardline floor, but a real escaped-quote prefix
+    must not hide it from the ask-approval tier either."""
+    assert detect_hardline_command(command) == (False, None)
+    assert detect_dangerous_command(command)[0] is True

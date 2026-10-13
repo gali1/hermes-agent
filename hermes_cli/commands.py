@@ -182,6 +182,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]", argument_mode="mixed"),
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
+    CommandDef("continue-after-reboot", "Resume this session automatically at the next CLI login after a reboot",
+               "Session", cli_only=True, aliases=("reboot-continue",)),
+    CommandDef("cancel-continuation", "Cancel a pending continue-after-reboot continuation", "Session",
+               cli_only=True, aliases=("cancel-reboot-continue",)),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",

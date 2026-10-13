@@ -64,6 +64,21 @@ def _print_decision_message(decision: dict) -> bool:
     return bool(msg)
 
 
+def _cancel_reboot_continuation(session_id, reason: str) -> None:
+    """Revoke continuation intent when a session ends explicitly (exit/new); never raises.
+
+    Crash, terminal-close and disconnect paths deliberately never call this: only a
+    clean user-initiated session end cancels an armed marker.
+    """
+    if not session_id:
+        return
+    try:
+        from agent import session_continuation
+        session_continuation.cancel(session_id, reason=reason)
+    except Exception as exc:
+        logging.debug("Could not revoke session continuation: %s", exc)
+
+
 class CLILoopsMixin:
     """Simple slash-command wrappers plus goal/heartbeat/loop manager hooks for the interactive CLI"""
 
@@ -77,6 +92,7 @@ class CLILoopsMixin:
         elif _args:
             _cprint(f"  {_DIM}{t('cli.exit.unknown_argument', argument=_escape(_args))}{_RST}")
             return True
+        _cancel_reboot_continuation(getattr(self, "session_id", None), "explicit exit")
         return False
 
     def _cmd_help(self, cmd_original: str):
@@ -100,6 +116,7 @@ class CLILoopsMixin:
             cmd_original=cmd_original,
         ) is None:
             return True  # confirmation cancelled — command handled, keep REPL alive
+        _cancel_reboot_continuation(getattr(self, "session_id", None), "clear session")
         self.new_session(silent=True)
         _clear_output_history()
         if not self._app:
@@ -200,7 +217,43 @@ class CLILoopsMixin:
             cmd_original=cmd_original,
         ) is None:
             return True  # confirmation cancelled — command handled, keep REPL alive
+        _cancel_reboot_continuation(getattr(self, "session_id", None), "new session")
         self.new_session(title=title)
+
+    def _handle_continue_after_reboot_command(self, cmd_original: str):
+        """``/continue-after-reboot``: arm the current session to auto-resume after a reboot."""
+        from cli import _cprint
+        from agent import session_continuation
+        session_id = getattr(self, "session_id", None)
+        if not session_id:
+            _cprint(f"  {t('cli.continuation.no_session')}")
+            return
+        previous = session_continuation.read_state()
+        try:
+            session_continuation.arm(session_id, reason="armed via /continue-after-reboot")
+        except Exception as exc:
+            _cprint(f"  {t('cli.continuation.arm_failed', error=exc)}")
+            return
+        if previous and previous.get("session_id") != session_id:
+            _cprint(f"  {t('cli.continuation.replaced', session_id=previous['session_id'])}")
+        _cprint(f"  {t('cli.continuation.armed', session_id=session_id)}")
+
+    def _handle_cancel_continuation_command(self, cmd_original: str):
+        """``/cancel-continuation``: revoke a pending reboot continuation marker."""
+        from cli import _cprint
+        from agent import session_continuation
+        try:
+            state = session_continuation.read_state()
+            if not state:
+                _cprint(f"  {t('cli.continuation.none')}")
+                return
+            session_id = state.get("session_id", "")
+            if session_continuation.cancel(None, reason="cancelled via /cancel-continuation"):
+                _cprint(f"  {t('cli.continuation.cancelled', session_id=session_id)}")
+            else:
+                _cprint(f"  {t('cli.continuation.none')}")
+        except Exception as exc:
+            _cprint(f"  {t('cli.continuation.cancel_failed', error=exc)}")
 
     def _record_model_friction(self, signal: str, turns: int = 1) -> None:
         # The TUI slash worker's shadow CLI has no metrics surface: tui_gateway counts what it executes.

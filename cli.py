@@ -1500,6 +1500,65 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             relaunch(self._pending_relaunch, preserve_inherited=False)
 
 
+def _reboot_continuation_session_exists(session_id: str) -> bool:
+    """SessionDB-backed existence check for a continuation marker's session."""
+    from hermes_state_registry import acquire
+
+    return acquire().get_session(session_id) is not None
+
+
+def _reboot_continuation_mark_failed(module, marker, exc) -> None:
+    """Best-effort failed mark for a marker involved in a startup failure; never raises."""
+    session_id = (marker or {}).get("session_id")
+    if not session_id:
+        try:
+            session_id = (module.read_state() or {}).get("session_id")
+        except Exception:
+            return
+    if not session_id:
+        return
+    try:
+        module.mark_failed(session_id, f"{type(exc).__name__}: {exc}")
+    except Exception:
+        logger.debug("Could not mark reboot continuation failed", exc_info=True)
+
+
+def _reboot_continuation_resume() -> Optional[str]:
+    """Auto-resume a reboot-continuation marker at REPL startup; None when nothing applies.
+
+    The marker is consumed BEFORE the resume is handed to the normal ``--resume``
+    path (at-most-once). Never raises: any failure is logged, the involved
+    marker (if any) is marked failed, and normal startup continues.
+    """
+    from agent import session_continuation as _sc
+
+    marker = None
+    try:
+        marker = _sc.evaluate_at_startup(session_exists=_reboot_continuation_session_exists)
+        if not marker:
+            return None
+        _sc.consume(marker["session_id"])
+    except Exception as exc:
+        logger.warning("Reboot continuation startup check failed: %s", exc)
+        _reboot_continuation_mark_failed(_sc, marker, exc)
+        return None
+    session_id = marker["session_id"]
+    try:
+        _cprint(
+            f"  {_DIM}"
+            + _t(
+                "cli.continuation.auto_resuming",
+                session_id=session_id,
+                armed_at=str(marker.get("armed_at") or "?"),
+                reason=str(marker.get("reason") or "-"),
+            )
+            + f"{_RST}"
+        )
+    except Exception:
+        logger.debug("Could not print reboot-continuation notice", exc_info=True)
+    return session_id
+
+
 def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget, verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills):
     """Resolve the toolset list (explicit / coding posture / platform default), construct HermesCLI, and start the background skills preload."""
     toolsets_list = None
@@ -1736,6 +1795,10 @@ def main(
         if not query:
             raise ValueError("--format stream-json requires -q/--query")
         quiet = True
+    # Reboot-gated continuation: only the bare interactive REPL auto-resumes a
+    # marker armed by /continue-after-reboot; an explicit --resume always wins.
+    if not resume and not query and not image and not (list_tools or list_toolsets):
+        resume = _reboot_continuation_resume() or resume
     cli = _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url, max_turns, run_budget,
                                verbose, compact, resume, checkpoints, pass_session_id, ignore_rules, skills)
 

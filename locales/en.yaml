@@ -2464,6 +2464,15 @@ cli:
     usage_add: "Usage: /queue add <prompt>"
   reload:
     env_reloaded: "Reloaded .env ({count} var(s) updated)"
+  continuation:
+    auto_resuming: "Resuming session {session_id} automatically (armed {armed_at}; {reason})."
+    armed: "Session {session_id} will resume automatically on the next CLI login after a reboot."
+    replaced: "Replaced the previous reboot continuation for session {session_id}."
+    arm_failed: "Could not arm reboot continuation: {error}"
+    no_session: "No active session to arm."
+    none: "No reboot continuation is armed."
+    cancelled: "Cancelled reboot continuation for session {session_id}."
+    cancel_failed: "Could not cancel reboot continuation: {error}"
   steer:
     usage: "Usage: /steer <prompt>"
     failed: "Steer failed: {error}"
