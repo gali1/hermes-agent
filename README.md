@@ -34,6 +34,19 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 ## Quick Install
 
+### Supported platforms and prerequisites
+
+| Platform | Recommended install | Python | Required system tools |
+| --- | --- | --- | --- |
+| **Linux** (x86_64, aarch64) | `curl -fsSL https://hermes-agent.nousresearch.com/install.sh \| bash` | None from you — the installer provisions its own pinned interpreter | `git`, `curl`, `tar`, and `sha256sum` (or `shasum`); glibc hosts may need `libatomic.so.1`, musl hosts need the system `libstdc++` |
+| **macOS** (Apple Silicon; Intel x86_64 CLI installs supported) | Same `install.sh` one-liner | Same as Linux | Same as Linux |
+| **Windows 10/11** (x86_64, aarch64) | PowerShell one-liner below (MSIX desktop package requires Windows 11 22H2+) | Same — no system Python needed | Git (a verified portable Git is staged automatically if absent); Windows PowerShell 5.1+ or pwsh 7 |
+| **WSL2** | The Linux one-liner, run inside the distro | Same as Linux | Same as Linux; enable systemd for gateway services |
+
+**Distro notes:** the POSIX installer supports glibc and musl x86_64/aarch64 hosts and is tested on the latest Ubuntu and WSL2; any distro with glibc, systemd, and Filesystem Hierarchy Standard conventions is likely to work. Android/Termux uses its own signed APT package, not this script.
+
+> **Python version:** current first-party installations run on **Python 3.14**. `pyproject.toml` declares `requires-python = ">=3.11,<3.15"` only so a source install that predates the PM migration can run `hermes update` once on an older interpreter; every runtime dependency carries a `python_version >= '3.14'` marker, so an install on 3.11–3.13 resolves with **no dependencies** and does not import. The installer (and `hermes update`) provisions the managed 3.14 environment for you; only manual installs need to supply 3.14.
+
 ### Linux, macOS, WSL2
 
 ```bash
@@ -67,6 +80,81 @@ source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
 
+### Python below the required version (uv pathway)
+
+Check the interpreter your shell sees:
+
+```bash
+python3 --version
+```
+
+Hermes runs on **Python 3.14**. On 3.11–3.13 a manual install either fails `requires-python` or resolves with no dependencies at all, because every runtime dependency in `pyproject.toml` is gated behind `python_version >= '3.14'`. The supported fix is the one-line installer, which provisions its own pinned interpreter — no system Python upgrade needed. For a manual source checkout, [uv](https://docs.astral.sh/uv/) can install a managed 3.14 alongside your system Python without replacing it.
+
+Install uv:
+
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Provision 3.14 and create the environment:
+
+```bash
+uv python install 3.14          # managed interpreter; system Python untouched
+uv venv --python 3.14 .venv     # create .venv
+source .venv/bin/activate       # bash / zsh
+source .venv/bin/activate.fish  # fish
+```
+
+```powershell
+.venv\Scripts\Activate.ps1      # Windows PowerShell
+```
+
+Install from a clone. Editable installs go through `build_editable`, so the wheel/sdist guard described under [Reinstalling or upgrading](#reinstalling-or-upgrading-over-an-existing-install) does not apply:
+
+```bash
+git clone https://github.com/NousResearch/hermes-agent.git
+cd hermes-agent
+uv pip install -e .
+```
+
+For a non-editable install, opt in to the build the same way that section documents:
+
+```bash
+HERMES_ALLOW_WHEEL_BUILD=1 uv pip install .
+```
+
+Run it without activating anything — uv reuses or creates the project `.venv`:
+
+```bash
+uv run --python 3.14 hermes
+```
+
+Prepare config and secrets (the installer normally does this for you):
+
+```bash
+mkdir -p ~/.hermes
+cp .env.example ~/.hermes/.env          # secrets
+cp cli-config.yaml.example ~/.hermes/config.yaml
+chmod 600 ~/.hermes/.env
+hermes setup                            # optional guided configuration
+```
+
+Verify the install:
+
+```bash
+hermes --version                                # version + update status
+command -v hermes                               # Windows: where.exe hermes
+python -c "import sys; print(sys.executable)"   # should point inside .venv
+```
+
+> A bare `uv pip install` does not prepare PM's managed tool store. Run `hermes pm install` from the checkout to provision Node, ripgrep, FFmpeg, and the browser tools. PyPI installs (`pip install hermes-agent`, `uv tool install hermes-agent`, Homebrew) remain unsupported — see [platform support](https://hermes-agent.nousresearch.com/docs/getting-started/platform-support).
+
 ### Reinstalling or upgrading over an existing install
 
 `pip install .` installs into the Python environment you run it from. If
@@ -92,8 +180,7 @@ Notes:
 - Stop a running gateway (`hermes gateway stop`) before replacing files.
 - System Python often rejects installs with `externally-managed-environment`
   (PEP 668). Use a virtualenv rather than `--break-system-packages`.
-- pip/PyPI installs are **not an officially supported distribution method** and
-  show a deprecation notice on startup. See
+- pip/PyPI installs are **not an officially supported distribution method**. See
   [platform support](https://hermes-agent.nousresearch.com/docs/getting-started/platform-support)
   for the supported paths (installer, Docker, Nix).
 
@@ -118,8 +205,9 @@ Other system-wide options:
 - **Docker** (supported): `docker pull nousresearch/hermes-agent:latest`, with
   `$HERMES_HOME` bind-mounted from the host so state survives image upgrades.
 - **pipx / uv tool** (per-user global CLI): `pipx install .` or
-  `uv tool install .` — isolated and on `PATH`, but still detected as an
-  unsupported pip/PyPI install.
+  `uv tool install .` — isolated and on `PATH`, but still an unsupported pip/PyPI
+  distribution method. Both build a wheel; add `HERMES_ALLOW_WHEEL_BUILD=1` if you
+  accept the unsupported method.
 - **NixOS**: declarative module, see the
   [Nix setup guide](https://hermes-agent.nousresearch.com/docs/getting-started/nix-setup).
 
@@ -157,6 +245,30 @@ If attestation says "Verification succeeded" and the last line prints `True`, yo
 - Whitelist the **folder**, not the file hash — Hermes updates `uv` and the hash changes every version
 
 For more context, see the upstream Astral reports: [astral-sh/uv#13553](https://github.com/astral-sh/uv/issues/13553), [astral-sh/uv#15011](https://github.com/astral-sh/uv/issues/15011), [astral-sh/uv#10079](https://github.com/astral-sh/uv/issues/10079).
+
+#### `hermes` is not on PATH
+
+Reload your shell (or open a new terminal). POSIX installs link the launcher at `~/.local/bin/hermes`; the installer adds that directory to your shell rc files and prints the exact reload command when a running shell cannot see it. Native Windows installs add `%LOCALAPPDATA%\hermes\bin` to the user PATH. Check with `command -v hermes` (Windows: `where.exe hermes`) and run `hermes doctor`.
+
+#### Python is older than 3.14, or pip says `externally-managed-environment`
+
+The installer provisions its own pinned Python 3.14, so the system interpreter does not need upgrading to use Hermes. For manual source installs, provision 3.14 without replacing the system Python — see [Python below the required version](#python-below-the-required-version-uv-pathway). Never use `--break-system-packages` against the system Python; `externally-managed-environment` (PEP 668) means that interpreter belongs to your OS package manager.
+
+#### The wheel/sdist build is blocked
+
+`pip install .` / `uv pip install .` fail with "Building wheels or sdists for hermes-agent is not supported" unless `HERMES_ALLOW_WHEEL_BUILD=1` is set. Upstream blocks the artifact because it would ship without bundled assets; this fork keeps the opt-in: `HERMES_ALLOW_WHEEL_BUILD=1 pip install .`. Editable installs (`pip install -e .`, `uv pip install -e .`, `uv sync`) use `build_editable` and are unaffected.
+
+#### `git` or `curl` is missing
+
+The POSIX installer checks for `git` and `curl` up front and fails with the missing tool named — install them with your system package manager (for example `sudo apt install git curl`) and re-run. It also needs `tar` and `sha256sum` (or `shasum`) to stage its verified uv artifact. On native Windows, PowerShell handles the downloads and the installer stages a verified portable Git automatically when Git is absent.
+
+#### WSL notes
+
+Use **WSL2** — Hermes is not reliable on WSL1. Run the Linux installer inside the distro, not on the Windows side. Enable systemd in `/etc/wsl.conf` if you want the gateway to run as a service. Native Windows installs live under `%LOCALAPPDATA%\hermes`; WSL2 installs live under the Linux user's `~/.hermes`.
+
+#### Gateway service notes
+
+Install the service with `hermes gateway install` (or `hermes gateway setup`), then control it with `hermes gateway start|stop|restart|status`. The backend is a systemd unit on Linux, a LaunchAgent on macOS, and a Scheduled Task on Windows. `hermes doctor` reports installation provenance and common problems. Stop a running gateway (`hermes gateway stop`) before replacing files.
 
 ---
 
@@ -215,6 +327,64 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 | Platform-specific status       | `/platforms`                                  | `/status`, `/sethome`                                                            |
 
 For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
+
+---
+
+## Session Continuation After Reboot
+
+The interactive CLI can resume one session automatically across a reboot:
+
+| Action | Command |
+| --- | --- |
+| Arm the current session | `/continue-after-reboot` (alias `/reboot-continue`) |
+| Revoke a pending continuation | `/cancel-continuation` (alias `/cancel-reboot-continue`) |
+
+Arming persists intent in `$HERMES_HOME/session_continuation.json`. The marker fires only on the first bare interactive `hermes` login after the machine's boot token changes (Linux's `boot_id`, or the OS boot time elsewhere), within 72 hours of arming, and only if the recorded session still exists. It resumes through the normal `--resume` path and is consumed once; an explicit `--resume`, a `-q` query, or a `--tools` listing skips the automatic path.
+
+- An explicit exit/quit, `/new`, or `/clear` revokes the marker.
+- A crash, disconnect, or closed terminal neither arms nor revokes it.
+- Arming again replaces a previous marker — one marker at a time.
+- Corrupt or stale state files are quarantined and ignored.
+
+System shutdown/reboot commands (`shutdown`, `reboot`, `halt`, `poweroff`, `init 0/6`, `systemctl poweroff/reboot`, `telinit 0/6`) are no longer hard-blocked: they run through the normal ask-approval path, subject to your configured approval mode. The unconditional hardline block remains for unrecoverable destructive commands.
+
+---
+
+## Memory and Context
+
+Hermes has several distinct layers; only the first is on by default.
+
+### Built-in curated memory (default on)
+
+The agent maintains two bounded, human-readable files under `$HERMES_HOME/memories/`: `MEMORY.md` (facts about the environment) and `USER.md` (who you are). The `memory` tool reads and edits both, and their contents are injected into the system prompt at session start. Limits and toggles live under `memory:` in `config.yaml`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `memory_enabled` | `true` | Enable `MEMORY.md` |
+| `user_profile_enabled` | `true` | Enable `USER.md` |
+| `memory_char_limit` | `2200` | `MEMORY.md` budget (~800 tokens) |
+| `user_char_limit` | `1375` | `USER.md` budget (~500 tokens) |
+| `nudge_interval` | `10` | Turns between built-in memory review nudges |
+| `write_approval` | `false` | Require approval for memory writes (foreground inline; background staged) |
+
+### Enhanced local memory (opt-in)
+
+`memory.enhanced.enabled: true` adds a structured SQLite store on top of curated memory: typed memories with lifecycle (store/update/supersede/delete/link), FTS5 BM25 search, rank-fusion hybrid retrieval with graph expansion and temporal windows, evidence accumulation, and automatic contradiction detection. Data lives under `$HERMES_HOME/memory_engine/`. Off by default — when disabled, behavior is exactly the built-in layer plus any configured provider. Config keys: `enabled` (`false`), `data_dir` (`"memory_engine"`), `auto_recall`, `auto_capture`, `max_recall`, `recall_budget_chars`.
+
+### Memory provider plugins (opt-in)
+
+Set `memory.provider` in `config.yaml` to add an external memory engine — only one at a time; empty means built-in only:
+
+- In-tree plugins under `plugins/memory/`: `rekal`, `holographic`, `retaindb`, `byterover`.
+- Catalog-installed providers: Honcho, Hindsight, Supermemory, Mem0, OpenViking.
+
+`memory.provider: rekal` uses the bundled Rekal engine — SQLite with FTS5 hybrid search, rank fusion, graph expansion, temporal recall, evidence accumulation, contradiction detection, and session ingest, with automatic recall and capture. Its native drawer/knowledge-graph/diary operations additionally need the optional `mempalace` package (`pip install mempalace`); without it the zero-dependency engine keeps working and those operations return an install hint.
+
+### Content-aware tool-output compression (default on — not memory)
+
+`compression.content_aware.*` shrinks tool output that is re-sent every turn, cutting tokens; it is context management, not memory. It is enabled by default under `compression.enabled: true`: lossless folds and lossless per-type renders (JSON, CSV, config) are round-trip-verified, and lossy elision (dense lines, JSON/log/search/diff drops) fires only when the original can be persisted and retrieved through the marker. `read_lifecycle` replaces stale or superseded `read_file` results. Relevant keys: `enabled`, `lossless_folds`, `type_compression`, `read_lifecycle` (all `true`), `dense_line_elision` (`false`), `net_cost_gate` (`false`, cache-aware opt-in).
+
+Session continuation (above) is unrelated to memory: it reopens a session, it does not store facts.
 
 ---
 
