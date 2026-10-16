@@ -11,7 +11,9 @@ from typing import Any, Dict
 
 from agent.gemini_native_adapter import GeminiAPIError, GeminiNativeClient, gemini_http_error
 
-INFERENCE_BASE_URL = "https://generativelanguage.googleapis.com/v1alpha"
+# Re-exported for the profile: the value lives in the httpx-free ``constants`` module so importing
+# this transport (and its ``httpx`` dependency) stays off the plugin-registration path.
+from .constants import INFERENCE_BASE_URL  # noqa: F401  (re-export)
 
 
 class SolsticeClient(GeminiNativeClient):
