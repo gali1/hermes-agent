@@ -1,8 +1,9 @@
 """MemoryManager integration tests for the additive enhanced layer.
 
-These pin the contract that the enhanced layer is opt-in, coexists with
-external providers, and leaves the provider-only path byte-identical when
-disabled.
+These pin the contract that the enhanced layer is enabled by default
+(``memory.enhanced.enabled: true`` in DEFAULT_CONFIG) with an explicit
+opt-out, coexists with external providers, and leaves the provider-only path
+byte-identical when disabled.
 """
 
 from agent.memory_manager import MemoryManager

@@ -367,9 +367,9 @@ The agent maintains two bounded, human-readable files under `$HERMES_HOME/memori
 | `nudge_interval` | `10` | Turns between built-in memory review nudges |
 | `write_approval` | `false` | Require approval for memory writes (foreground inline; background staged) |
 
-### Enhanced local memory (opt-in)
+### Enhanced local memory (default on)
 
-`memory.enhanced.enabled: true` adds a structured SQLite store on top of curated memory: typed memories with lifecycle (store/update/supersede/delete/link), FTS5 BM25 search, rank-fusion hybrid retrieval with graph expansion and temporal windows, evidence accumulation, and automatic contradiction detection. Data lives under `$HERMES_HOME/memory_engine/`. Off by default — when disabled, behavior is exactly the built-in layer plus any configured provider. Config keys: `enabled` (`false`), `data_dir` (`"memory_engine"`), `auto_recall`, `auto_capture`, `max_recall`, `recall_budget_chars`.
+`memory.enhanced.enabled: true` adds a structured SQLite store on top of curated memory: typed memories with lifecycle (store/update/supersede/delete/link), FTS5 BM25 search, rank-fusion hybrid retrieval with graph expansion and temporal windows, evidence accumulation, and automatic contradiction detection. Data lives under `$HERMES_HOME/memory_engine/`. **On by default** — set `memory.enhanced.enabled: false` to opt out, in which case behavior is exactly the built-in layer plus any configured provider. Config keys: `enabled` (`true`), `data_dir` (`"memory_engine"`), `auto_recall`, `auto_capture`, `max_recall`, `recall_budget_chars`.
 
 ### Memory provider plugins (opt-in)
 
