@@ -1362,7 +1362,7 @@ DEFAULT_CONFIG = {
         # behavior is identical to built-in + provider memory. Data lives under
         # $HERMES_HOME/<data_dir>/ and respects profile isolation.
         "enhanced": {
-            "enabled": False,
+            "enabled": True,
             "data_dir": "memory_engine",
             "auto_recall": True,
             "auto_capture": True,
