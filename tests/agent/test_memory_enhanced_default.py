@@ -114,6 +114,22 @@ def test_compression_settings_independent_of_memory(tmp_path, monkeypatch):
     assert "enhanced" not in config
 
 
+def test_external_provider_stays_opt_in_and_rekal_is_available():
+    """The provider default stays empty; the rekal opt-in path is functional.
+
+    Defaulting a provider on would duplicate the enhanced layer's recall and
+    capture and (with mempalace installed) write to a shared palace, so the
+    external-provider path is opt-in only — but it must work when chosen.
+    """
+    from plugins.memory import load_memory_provider
+
+    assert DEFAULT_CONFIG["memory"]["provider"] == ""
+    provider = load_memory_provider("rekal")
+    assert provider is not None
+    assert provider.name == "rekal"
+    assert provider.is_available() is True
+
+
 def test_provider_plugin_path_coexists_with_enhanced(tmp_path):
     from agent.memory_manager import MemoryManager
 
