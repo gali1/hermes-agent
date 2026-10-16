@@ -4,6 +4,63 @@ All notable changes to this project are documented here. Entries follow
 GitHub release-note style: feature, change, test, documentation and
 installation categories with a compare link per release.
 
+## 2026-10-15 — Rebased onto `main`: upstream catch-up, content compression, messaging restore (`2026-10-05-fastembed`)
+
+The branch is rebased onto `main` (`c060d225`) so it carries the full upstream
+history and every fork commit instead of sitting five weeks behind on a
+2026-10-05 base. The vector memory work is preserved as the three carried
+commits on top.
+
+[Compare `0e2c33ec1...8f632a266f`](https://github.com/gali1/hermes-agent/compare/0e2c33ec1...8f632a266f)
+
+### ✨ Now inherited from `main` (previously absent on this branch)
+
+- **Content-aware tool-output compression** (`agent/content_compression/`,
+  `compression.content_aware.*`): lossless folds and lossless per-type renders
+  (JSON, CSV, config) that are round-trip-verified, lossy elision gated on the
+  original being persistable and retrievable, and `read_lifecycle` for stale or
+  superseded `read_file` results.
+- **Agent-callable `send_message`** (`tools/send_message_tool.py`) plus the
+  restored `messaging` / `connections` toolsets and the saved
+  `platform_toolsets` migration — this branch's older code could not resolve
+  those toolsets at all.
+- **Reboot continuation** (`agent/session_continuation.py`,
+  `$HERMES_HOME/session_continuation.json`) and the shutdown/reboot
+  ask-approval tier. The branch's own port of this feature is dropped as
+  redundant with main's adapted version.
+- **~5 weeks of upstream work**: newer CLI/TUI/gateway internals, config schema
+  v51, plugin catalog updates, and security pin bumps.
+- Opt-in source builds restored (`HERMES_ALLOW_WHEEL_BUILD=1`).
+
+### 🔧 Changed
+
+- Rebased onto `main`; the branch's 2026-10-05 duplicates of the enhanced
+  memory layer, Rekal plugin, reinstall docs and changelog entry are dropped in
+  favour of the rebased upstream equivalents already on `main`.
+- Dropped the accidental `build/` commit — 876 tracked build artifacts plus a
+  pasted README fragment committed as the subject line. `build/` is untracked,
+  as on `main`.
+- Vector defaults re-homed to `hermes_cli/config_defaults.py`, the single live
+  source of `DEFAULT_CONFIG`; `hermes_cli/config.py` only re-exports it, so the
+  keys added there by the branch were dead code.
+- `pyproject.toml`: the `fastembed` extra re-added on top of main's newer pins
+  (`messaging`/`slack`/`matrix` keep main's versions, not the branch's older
+  ones); the stale `hindsight` extra is dropped, matching `main`.
+- `hermes_cli/config_defaults.py`: added `vector_backend`, `vector_model`,
+  `vector_weight`, `vector_max_share`, `vector_index_batch` and `vector_remote`
+  to `memory.enhanced`.
+- README: the vector-retrieval section is re-homed under Memory and Context and
+  now documents the uv and venv/pip install paths, the enable steps, and the
+  eval harness.
+
+### 🧪 Tests
+
+- 377 tests pass: the memory matrix (vector, eval, ranking, store, backend,
+  enhanced tool surface), session continuation, the hardline blocklist, and
+  project metadata.
+- End-to-end vector smoke against a throwaway store: 4/4 embeddings indexed,
+  `missing: 0`, correct top-1 on all three semantic queries.
+
 ## 2026-10-05 — Retrieval calibration: query-aware boosts + lexical anchor (`2026-10-05-fastembed` branch)
 
 Follow-up to the branch's vector work, measured with `scripts/memory_eval.py`
