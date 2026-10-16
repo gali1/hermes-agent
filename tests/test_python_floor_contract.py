@@ -1,10 +1,9 @@
 """Contract: no dependency gate may exceed the runtime Python floor.
 
-Regression guard for the 3.14-gated core dependencies that made an install on
-3.12 resolve with no dependencies at all and then fail to import.
-``requires-python`` may declare a *lower* bridge floor (3.11, so a pre-PM
-install can run ``hermes update`` once); the gates must still admit the
-runtime floor the project actually supports.
+Guards the reverse of the earlier 3.12 regression: the project requires
+Python 3.14, so ``requires-python`` and every dependency gate must agree on
+that minimum — a gate above it (or a lower declared floor) would make an
+install on the supported interpreter resolve without the dependency set.
 """
 
 import re
@@ -13,7 +12,7 @@ from pathlib import Path
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 
 # Lowest interpreter the full dependency set must resolve on.
-RUNTIME_FLOOR = (3, 12)
+RUNTIME_FLOOR = (3, 14)
 
 
 def _requires_python_floor() -> tuple[int, int]:
