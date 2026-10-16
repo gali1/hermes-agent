@@ -481,6 +481,13 @@ class CLIInfoMixin:
         ``CommandDef`` entries declare ``busy_policy="dispatch"``; the classic CLI honours it here)."""
         return self._busy_inline_command(text, has_images, ("bg", "btw"))
 
+    def _should_handle_instant_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when /instant should be dispatched while the agent runs.
+
+        Queued raw, ``process_loop`` is blocked inside ``self.chat()`` for the whole run, so
+        the redirect would only be attempted after the very turn it was meant to redirect."""
+        return self._busy_inline_command(text, has_images, ("instant",))
+
     def handle_bang_shell(self, text: str) -> bool:
         """Run a ``!<command>`` submission. Returns True when it was handled.
 

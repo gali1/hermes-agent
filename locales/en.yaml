@@ -2321,6 +2321,8 @@ cli:
     processes_heading: "Processes · {summary}{controls}"
     more_processes: "+{count} more · Ctrl+T all processes"
     controls_collapse: " · Ctrl+R collapse"
+    controls_edit_collapse: " · Ctrl+E edit · Ctrl+R collapse"
+    controls_edit: " · Ctrl+E edit"
     queue_heading: "Queue · {count} queued · /queue list{controls}"
     more_queued: "+{count} more"
     transcript_unavailable: "Live transcript not available yet."
@@ -2462,6 +2464,10 @@ cli:
     move_out_of_range: "Queue move out of range. Current size: {size}"
     moved: "Moved queue item {source} to {destination}."
     usage_add: "Usage: /queue add <prompt>"
+    edit_empty: "Queue is empty — nothing to edit."
+    edit_hint: "Editing queued prompt {index} of {count} — Enter saves · Ctrl+E next · Ctrl+X deletes · Esc cancels."
+    edit_blank: "Edited prompt is empty — nothing saved (Esc cancels the edit)."
+    edit_cancelled: "Queue edit cancelled — the queued prompt is unchanged."
   reload:
     env_reloaded: "Reloaded .env ({count} var(s) updated)"
   continuation:
@@ -2479,6 +2485,11 @@ cli:
     queued: "⏩ Steer queued — arrives after the next tool call: {preview}"
     rejected_empty: "Steer rejected (empty payload)."
     no_agent_queued: "No agent running; queued as next turn: {preview}"
+  instant:
+    usage: "Usage: /instant \"<query>\" — redirect the in-flight turn (cancels the current model request; a running tool is not killed, the text steers after it finishes)."
+    redirected: "⚡ Redirected — the current model request is cancelled; your message becomes the next user turn: '{preview}'"
+    queued: "No live turn to redirect — queued as the next turn: {preview}"
+    failed: "⚠️ Redirect failed: {error}"
   title:
     session_id: "Session ID: {session_id}"
     current: "Title: {title}"
