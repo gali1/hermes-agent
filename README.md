@@ -45,7 +45,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 **Distro notes:** the POSIX installer supports glibc and musl x86_64/aarch64 hosts and is tested on the latest Ubuntu and WSL2; any distro with glibc, systemd, and Filesystem Hierarchy Standard conventions is likely to work. Android/Termux uses its own signed APT package, not this script.
 
-> **Python version:** Hermes runs on **Python 3.12–3.14**; every runtime dependency carries a `python_version >= '3.12'` marker, so a manual install on 3.12+ resolves the full dependency set. `pyproject.toml` declares `requires-python = ">=3.11,<3.15"` so a source install that predates the PM migration can still run `hermes update` once on 3.11 (3.11 itself resolves no dependencies). The installer (and `hermes update`) provisions its own managed interpreter — currently 3.14 — so managed installs need no system Python upgrade.
+> **Python version:** Hermes requires **Python 3.14** (`requires-python = ">=3.14,<3.15"`); every runtime dependency carries a `python_version >= '3.14'` marker. The installer (and `hermes update`) provisions the managed 3.14 interpreter for you; only a manual source checkout needs to supply 3.14.
 
 ### Linux, macOS, WSL2
 
@@ -63,7 +63,7 @@ Run this in PowerShell:
 iex (irm https://hermes-agent.nousresearch.com/install.ps1)
 ```
 
-The source installer delegates Python (3.12+), Node.js, npm, ripgrep, FFmpeg,
+The source installer delegates Python 3.14, Node.js, npm, ripgrep, FFmpeg,
 and Python dependencies to PM. If Git is absent, it stages the verified Git
 for Windows archive in Hermes' tool store. It does not replace your system Git.
 See [installation methods](https://hermes-agent.nousresearch.com/docs/getting-started/installation)
@@ -88,7 +88,7 @@ Check the interpreter your shell sees:
 python3 --version
 ```
 
-Hermes runs on **Python 3.12–3.14** and resolves the full dependency set on all of them. On 3.11 a manual install resolves no dependencies: `pyproject.toml` declares `requires-python = ">=3.11,<3.15"` so a source install that predates the PM migration can run `hermes update` once on 3.11, while every runtime dependency is gated behind `python_version >= '3.12'`. The one-line installer provisions its own pinned interpreter (currently 3.14) — no system Python upgrade needed. For a manual source checkout, [uv](https://docs.astral.sh/uv/) can install a managed 3.12 (or newer) alongside your system Python without replacing it.
+Hermes runs on **Python 3.14** (`requires-python = ">=3.14,<3.15"`). On older interpreters a manual install fails `requires-python`, because every runtime dependency in `pyproject.toml` is gated behind `python_version >= '3.14'`. The supported fix is the one-line installer, which provisions its own pinned 3.14 interpreter — no system Python upgrade needed. For a manual source checkout, [uv](https://docs.astral.sh/uv/) can install a managed 3.14 alongside your system Python without replacing it.
 
 Install uv:
 
@@ -102,11 +102,11 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Provision 3.12 (or newer) and create the environment:
+Provision 3.14 and create the environment:
 
 ```bash
-uv python install 3.12          # managed interpreter; system Python untouched
-uv venv --python 3.12 .venv     # create .venv
+uv python install 3.14          # managed interpreter; system Python untouched
+uv venv --python 3.14 .venv     # create .venv
 source .venv/bin/activate       # bash / zsh
 source .venv/bin/activate.fish  # fish
 ```
@@ -132,7 +132,7 @@ HERMES_ALLOW_WHEEL_BUILD=1 uv pip install .
 Run it without activating anything — uv reuses or creates the project `.venv`:
 
 ```bash
-uv run --python 3.12 hermes
+uv run --python 3.14 hermes
 ```
 
 Prepare config and secrets (the installer normally does this for you):
@@ -250,9 +250,9 @@ For more context, see the upstream Astral reports: [astral-sh/uv#13553](https://
 
 Reload your shell (or open a new terminal). POSIX installs link the launcher at `~/.local/bin/hermes`; the installer adds that directory to your shell rc files and prints the exact reload command when a running shell cannot see it. Native Windows installs add `%LOCALAPPDATA%\hermes\bin` to the user PATH. Check with `command -v hermes` (Windows: `where.exe hermes`) and run `hermes doctor`.
 
-#### Python is older than 3.12, or pip says `externally-managed-environment`
+#### Python is older than 3.14, or pip says `externally-managed-environment`
 
-The installer provisions its own pinned Python interpreter, so the system interpreter does not need upgrading to use Hermes. For manual source installs, provision 3.12 (or newer) without replacing the system Python — see [Python below the required version](#python-below-the-required-version-uv-pathway). Never use `--break-system-packages` against the system Python; `externally-managed-environment` (PEP 668) means that interpreter belongs to your OS package manager.
+The installer provisions its own pinned Python 3.14, so the system interpreter does not need upgrading to use Hermes. For manual source installs, provision 3.14 without replacing the system Python — see [Python below the required version](#python-below-the-required-version-uv-pathway). Never use `--break-system-packages` against the system Python; `externally-managed-environment` (PEP 668) means that interpreter belongs to your OS package manager.
 
 #### The wheel/sdist build is blocked
 
