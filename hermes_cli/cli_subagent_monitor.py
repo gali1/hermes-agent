@@ -226,7 +226,10 @@ class SubagentMonitor:
         if self.queued:
             # Last, so the next prompt to run sits right above the input it came from.
             shown = min(len(self.queued), session_rows.QUEUE_ROWS if rows >= 24 else 1)
-            controls = '' if self.entries or self.processes else t('cli.subagents.controls_collapse')
+            # The subagent/process headings already carry Ctrl+R when they render, so the queue
+            # heading drops the duplicate collapse hint and keeps only the Ctrl+E edit affordance.
+            controls = (t('cli.subagents.controls_edit') if self.entries or self.processes
+                        else t('cli.subagents.controls_edit_collapse'))
             lines.append(_clip(
                 ' ' + t('cli.subagents.queue_heading', count=len(self.queued), controls=controls), columns))
             for index, text in enumerate(self.queued[:shown], 1):

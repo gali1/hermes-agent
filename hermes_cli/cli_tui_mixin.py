@@ -39,6 +39,7 @@ from prompt_toolkit.widgets import TextArea
 from typing import Optional
 
 from hermes_cli.cli_footer_split import FooterSplit
+from hermes_cli.cli_tui_composer_edit import CLITuiComposerEditMixin
 
 # Rows below an overlay panel taken by spinner/tool-progress, status bar, input, separators and
 # prompt symbol (measured ~6 during live PTY approval prompts) — shared by every panel budget.
@@ -129,7 +130,7 @@ def _prefix_wrapped_rows(wrap, label, width, first_prefix, indent) -> list[str]:
     return [(first_prefix if i == 0 else indent) + row for i, row in enumerate(rows)]
 
 
-class CLITuiMixin:
+class CLITuiMixin(CLITuiComposerEditMixin):
     """prompt_toolkit TUI construction, key-binding handlers, and overlay display fragments."""
 
     def _tui_input_rule_height(self, position: str, width: Optional[int] = None) -> int:
@@ -1069,22 +1070,6 @@ class CLITuiMixin:
         else:
             buf.start_completion()
 
-    def _tui_handle_double_escape(self, event):
-        """Double ESC discards the draft and attached images (Claude Code / Gemini CLI gesture).
-
-        Works while the agent streams — the gap Ctrl+C leaves (it interrupts the turn and only
-        clears the draft when idle). The draft is appended to history first so Up recalls it,
-        which is what makes a reflex key safe. Single ESC is the Alt-sequence prefix
-        (escape+enter/g/v) so the escape-timeout keeps those distinct; modal prompts bind ESC
-        eagerly and are excluded so cancel still wins.
-        """
-        buf = event.app.current_buffer
-        if not (buf.text or self._attached_images):
-            return
-        buf.reset(append_to_history=bool(buf.text))
-        self._attached_images.clear()
-        event.app.invalidate()
-
     def _tui_handle_ignored_terminal_sequence(self, event):
         """Consume parser-level ignored terminal sequences before self-insert.
 
@@ -1450,6 +1435,10 @@ class CLITuiMixin:
         if time.monotonic() - getattr(self, "_tui_last_text_change", 0.0) < _RAPID_INPUT_ENTER_WINDOW_S:
             buf.insert_text("\n")
             return
+        # Editing a queued prompt (Ctrl+E): Enter SAVES it back into the queue, never
+        # submits it to the model.
+        if self._tui_handle_queue_edit_enter(event):
+            return
         text = raw_text.strip()
         has_images = bool(self._attached_images)
         if not (text or has_images):
@@ -1474,14 +1463,15 @@ class CLITuiMixin:
         buf.reset(append_to_history=True)
 
     def _tui_enter_inline_command(self, event, text: str, has_images: bool) -> bool:
-        """Run /model, /steer, /bg, /btw directly on the UI thread; True when handled.
+        """Run /model, /steer, /bg, /btw, /instant directly on the UI thread; True when handled.
 
         /model needs the prompt_toolkit terminal-handoff helpers of the interactive pickers.
-        /steer, /bg and /btw while the agent runs must not queue through _pending_input: the
-        process loop is blocked inside self.chat(), so they would only run after the foreground
-        turn — turning /steer into a next-turn message (defeating mid-run injection, #34569) and
-        starting the /bg side task after the turn it should run alongside (#75221). The
-        foreground turn is left alone: no interrupt, no steer. agent.steer() is thread-safe.
+        /steer, /bg, /btw and /instant while the agent runs must not queue through _pending_input:
+        the process loop is blocked inside self.chat(), so they would only run after the
+        foreground turn — turning /steer into a next-turn message (defeating mid-run injection,
+        #34569), starting the /bg side task after the turn it should run alongside (#75221), and
+        letting /instant miss the turn it was meant to redirect. The dispatcher leaves the
+        foreground turn alone: agent.steer() is thread-safe and /instant's handler decides.
 
         Every branch invalidates after reset: process_command() prints through patch_stdout
         and never invalidates the app, so the just-cleared input area would keep showing the
@@ -1494,7 +1484,8 @@ class CLITuiMixin:
                     event.app.exit()
         elif (
             self._should_handle_steer_command_inline(text, has_images=has_images)
-            or self._should_handle_background_command_inline(text, has_images=has_images)):
+            or self._should_handle_background_command_inline(text, has_images=has_images)
+            or self._should_handle_instant_command_inline(text, has_images=has_images)):
             self.process_command(text)
         else:
             return False
@@ -1891,6 +1882,8 @@ class CLITuiMixin:
 
         self._attached_images: list[Path] = []  # clipboard image attachments
         self._image_counter = 0
+        # Ctrl+E composer editor: 1-based index of the queued prompt being edited, None when off.
+        self._queue_edit_index: int | None = None
 
         # Voice mode state (protected by _voice_lock for cross-thread access).
         self._voice_lock = threading.Lock()
@@ -1976,6 +1969,9 @@ class CLITuiMixin:
             lambda event: toggle_dock(self))
         kb.add('f7', filter=Condition(lambda: not modal_prompt_active(self)))(
             lambda event: toggle_dock(self))
+        # Ctrl+E composer editor for queued prompts; registered last so the filtered
+        # bindings win over the generic Escape handlers above.
+        self._tui_bind_queue_edit_keys(kb)
         return kb
 
     def _tui_bind_editor_and_stash(self, kb) -> None:

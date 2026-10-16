@@ -42,6 +42,18 @@ def _parse_queue_index(token: str) -> int | None:
         return None
 
 
+def _parse_instant_payload(rest: str) -> str:
+    """``/instant`` argument text: one matching pair of surrounding quotes is stripped.
+
+    ``/instant "fix the bug"`` and ``/instant fix the bug`` are equivalent; unmatched or
+    unbalanced quoting (``/instant "fix``) is taken literally. Internal whitespace and
+    newlines survive.
+    """
+    text = (rest or "").strip()
+    if len(text) >= 2 and text[0] in ("'", '"') and text[-1] == text[0]:
+        return text[1:-1].strip()
+    return text
+
 # management verb -> (handler, takes a leading item index). Verbs without an index are
 # only management when they stand alone; index verbs when a number follows or when the
 # verb stands alone (the handler then prints its usage line).
@@ -525,6 +537,32 @@ class CLILoopsMixin:
         else:
             self._pending_input.put(payload)
             _cprint(f"  {t('cli.steer.no_agent_queued', preview=_preview(payload))}")
+
+    def _cmd_instant(self, cmd_original: str):
+        """``/instant <query>``: high-priority redirect of the in-flight turn.
+
+        While the agent runs this cancels ONLY the current model request through
+        ``agent.redirect()`` (completed messages kept, the correction becomes the next user
+        message); during tool execution it degrades to a steer delivered after the current
+        tool call. With no live turn (idle, no agent, or no redirect support) the text is
+        queued as the next turn, exactly like /queue.
+        """
+        from cli import _cprint, _slash_args
+        payload = _parse_instant_payload(_slash_args(cmd_original))
+        if not payload:
+            _cprint(f"  {t('cli.instant.usage')}")
+            return
+        if self._agent_running and self.agent is not None and hasattr(self.agent, "redirect"):
+            try:
+                accepted = bool(self.agent.redirect(payload))
+            except Exception as exc:  # health: allow BLE001 -- a failed redirect must fall back to the queue, never crash the REPL
+                _cprint(f"  {t('cli.instant.failed', error=exc)}")
+            else:
+                if accepted:
+                    _cprint(f"  {t('cli.instant.redirected', preview=_preview(payload))}")
+                    return
+        self._pending_input.put(payload)
+        _cprint(f"  {t('cli.instant.queued', preview=_preview(payload))}")
 
     # ────────────────────────────────────────────────────────────────
     # Session-bound managers: /goal (Ralph-style loop), /heartbeat, /loop
