@@ -270,6 +270,20 @@ Use **WSL2** — Hermes is not reliable on WSL1. Run the Linux installer inside 
 
 Install the service with `hermes gateway install` (or `hermes gateway setup`), then control it with `hermes gateway start|stop|restart|status`. The backend is a systemd unit on Linux, a LaunchAgent on macOS, and a Scheduled Task on Windows. `hermes doctor` reports installation provenance and common problems. Stop a running gateway (`hermes gateway stop`) before replacing files.
 
+#### A tool is hidden ("system dependency not met") — install its extra
+
+Optional toolsets become available once their dependency is installed into the Hermes-managed environment. Use the PM — never raw pip against a Hermes environment:
+
+```bash
+hermes pm install chromium                            # Playwright Chromium → browser, browser-cdp, browser-use
+hermes pm install cua-driver                          # → computer_use
+hermes pm install ripgrep                             # faster file search
+hermes pm install --extra feishu                      # lark-oapi + qrcode → feishu_doc, feishu_drive
+hermes pm install --extra telegram --extra discord    # messaging platform extras
+```
+
+`--extra NAME` enables any declared `pyproject.toml` extra (`feishu`, `telegram`, `discord`, `slack`, `matrix`, `google`, …) in the managed venv; restart Hermes afterwards so the new packages load. Runtime-gated toolsets (`messaging`, `yuanbao`) and credential-gated ones (`discord`, `x_search`) still need their gateway session or token — `hermes doctor` names the exact requirement.
+
 ---
 
 ## Getting Started
