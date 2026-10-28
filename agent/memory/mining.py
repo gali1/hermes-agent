@@ -67,9 +67,11 @@ SECRET_PATTERNS = [
 # user's world, and storing them is what used to flood recall.
 _INJECTED_MARKERS = (
     "[important:",
+    "[system note",
     "[out-of-band user message",
     "[/out-of-band user message]",
     "[cron_failure]",
+    "recalled memory (background evidence",
     "you are running as a scheduled cron job",
     "agent instructions were loaded from",
     "consolidated prompt",
@@ -175,8 +177,136 @@ def _is_transient(text) -> bool:
     return bool(words) and len(core) < 60 and all(word in _TRANSIENT_WORDS for word in words)
 
 
-def classify_candidate(text) -> str | None:
-    """Classify candidate text into a memory type, or None when not worth storing."""
+# -- Requests and status lines: the classes heuristics used to miss -----------
+# A turn is either *knowledge* ("the gateway owns the websocket transport") or a
+# *move in the conversation* ("all features working?").  Only the first belongs
+# in a memory, but mining sees both and stored the second, which then matched
+# every later query through FTS prefix expansion.  Both filters below are pure
+# regex and run in microseconds — no model call, no tokens.
+MAX_REQUEST_CHARS = 200
+# A one-line question is a request.  A long paragraph that happens to end in
+# "?" is a note with a question appended, so length alone (not the "?") decides
+# unless the paragraph opens by interrogating.
+MAX_SHORT_QUESTION_CHARS = 120
+# Without a "?" an interrogative opener is much weaker evidence — "When the user
+# selects vtcode_wsl … it only shows one model" is a bug report, not a question.
+MAX_UNMARKED_QUESTION_CHARS = 80
+
+# Interrogative openers only count as a question when the apostrophe is absent:
+# "Can't reproduce…" leads with "can" but is a claim, not a question.
+_LEADING_INTERROGATIVE = re.compile(
+    r"(?i)^\s*(?:what|which|who|whom|whose|where|when|why|how|whether|"
+    r"(?:is|are|was|were|am|do|does|did|can|could|should|would|will|shall|"
+    r"have|has|had)\b(?!['\u2019]))"
+)
+
+# Imperatives addressed to the agent are the user asking for work, not telling
+# us a fact.  Kept to the verbs that open a request in practice; "remember",
+# "prefer", "use" are deliberately absent because they open durable statements.
+_LEADING_IMPERATIVE = re.compile(
+    r"(?i)^\s*(?:list|show|display|print|dump|enumerate|count|give|tell|"
+    r"fetch|search|find|check|run|rerun|re-?run|open|read|scan|inspect|"
+    r"explain|summari[sz]e|recap|remind|retry|continue|proceed|"
+    r"fix|debug|install|deploy|upgrade|restart)\b"
+)
+
+# Assistant status lines and canned failure text: re-derivable from the run that
+# produced them, and actively harmful in recall ("your request was not
+# processed" answers nothing).  Marker list is short on purpose — match only
+# when the whole message is short enough to be mostly that sentence.
+_FALLBACK_MARKERS = (
+    "request was not processed",
+    "was not processed",
+    "please try again",
+    "please resend",
+    "something went wrong",
+    "an error occurred",
+    "operation interrupted",
+    "operation was interrupted",
+    "no results found",
+    "could not complete",
+    "couldn't complete",
+    "cannot complete",
+    "can't complete",
+    "not able to complete",
+    "i don't have access to",
+    "i do not have access to",
+    "not sure what you mean",
+    "could you clarify",
+    "could you confirm",
+    "would you like me to",
+    "let me know if you'd like",
+    "let me know if you want",
+    "as an ai",
+    "as a language model",
+)
+MAX_FALLBACK_CHARS = 400
+
+_STATUS_LINE_RE = re.compile(
+    r"(?i)^\s*(?:re-?running|retrying|retry|attempting|trying again|"
+    r"working on|processing|executing|loading|waiting|checking)\b"
+)
+
+# Gerund openers ("Running the migration…") carry facts as often as status
+# ("Running the retention pass archives rather than deletes"), so they only
+# count as narration alongside an explicit "now"/"this will take" marker.
+_PROGRESS_OPENER_RE = re.compile(
+    r"(?i)^\s*(?:running|starting|building|compiling|testing|deploying|"
+    r"installing|downloading|uploading|fetching|generating)\b"
+)
+_NOW_MARKER_RE = re.compile(
+    r"(?i)\b(?:now|moment|hold on|hang on|this will take|please wait|one sec|a second)\b"
+)
+MAX_PROGRESS_CHARS = 160
+
+
+def is_request(text) -> bool:
+    """True when `text` asks for something instead of stating something.
+
+    Short by design: a long message is a document, and a trailing "?" inside
+    one is not enough evidence that the writer was only asking.  Length also
+    protects root-cause notes that happen to open with "Can" or cite a question
+    ("Can't reproduce: the path resolves from node_modules").
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) > MAX_REQUEST_CHARS:
+        return False
+    core = stripped.rstrip(" \t\n\"'`)\u201d]}")
+    body = core.rstrip(".!")
+    if core.endswith("?"):
+        return len(core) <= MAX_SHORT_QUESTION_CHARS or bool(_LEADING_INTERROGATIVE.match(body))
+    if _LEADING_IMPERATIVE.match(body):
+        return True
+    return len(body) <= MAX_UNMARKED_QUESTION_CHARS and bool(_LEADING_INTERROGATIVE.match(body))
+
+
+def looks_like_fallback(text) -> bool:
+    """True for assistant status narration and canned failure boilerplate."""
+    if not isinstance(text, str) or not text:
+        return False
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if len(stripped) <= MAX_FALLBACK_CHARS and any(m in lowered for m in _FALLBACK_MARKERS):
+        return True
+    if len(stripped) < MAX_REQUEST_CHARS and _STATUS_LINE_RE.match(stripped):
+        return True
+    return bool(
+        len(stripped) <= MAX_PROGRESS_CHARS
+        and _PROGRESS_OPENER_RE.match(stripped)
+        and _NOW_MARKER_RE.search(stripped)
+    )
+
+
+def classify_candidate(text, role=None) -> str | None:
+    """Classify candidate text into a memory type, or None when not worth storing.
+
+    `role` is the author of the turn (`user`/`assistant`) when known.  It only
+    sharpens two calls that content alone cannot make: an assistant turn must
+    not be recorded as a *preference* (preferences are what the user wants), and
+    assistant boilerplate is only boilerplate from the assistant.
+    """
     if not isinstance(text, str):
         return None
     stripped = text.strip()
@@ -190,10 +320,16 @@ def classify_candidate(text) -> str | None:
         return None
     if looks_injected(stripped):
         return None
+    if is_request(stripped):
+        return None
+    if role == "assistant" and looks_like_fallback(stripped):
+        return None
     if _is_transient(stripped):
         return None
     for memory_type, pattern in _CATEGORY_PATTERNS:
         if pattern.search(stripped):
+            if memory_type == "preference" and role == "assistant":
+                return "fact"
             return memory_type
     return "fact"
 
@@ -237,7 +373,7 @@ def mine_turns(messages, *, min_length=20, limit=20) -> list[dict]:
             continue
         if is_secret(text):
             continue
-        memory_type = classify_candidate(text)
+        memory_type = classify_candidate(text, role=role)
         if memory_type is None:
             continue
         normalized = normalize_content(text)

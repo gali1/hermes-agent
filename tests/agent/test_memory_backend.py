@@ -227,3 +227,33 @@ def test_backfill_origin_tiers_rows_written_by_old_code(tmp_path):
     curated_row = store.get(curated, track_access=False)
     assert curated_row["tags"] == ["origin:curated"]
     backend.shutdown()
+
+
+def test_session_end_purges_stored_junk(tmp_path):
+    """The sweep is automatic: capture filters re-run over the file at session end."""
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True})
+    backend.initialize("s1")
+    store = backend._store
+    assert store is not None
+    junk = store.store("All enhanced memory features working?", tags=["origin:user"])["memory_id"]
+    keep = store.store(
+        "Root cause: the ACP client sends its own cwd, which overrides the CLI argument.",
+        tags=["origin:assistant"],
+    )["memory_id"]
+
+    backend.on_session_end([])
+
+    assert store.get(junk, track_access=False)["status"] == "archived"
+    assert store.get(keep, track_access=False)["status"] == "active"
+    backend.shutdown()
+
+
+def test_junk_purge_can_be_disabled(tmp_path):
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True, "junk_purge_enabled": False})
+    backend.initialize("s1")
+    store = backend._store
+    assert store is not None
+    junk = store.store("Is the gateway on port 8080?", tags=["origin:user"])["memory_id"]
+    assert backend.purge_junk() == {"skipped": "disabled"}
+    assert store.get(junk, track_access=False)["status"] == "active"
+    backend.shutdown()

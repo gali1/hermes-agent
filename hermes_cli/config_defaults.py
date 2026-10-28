@@ -1377,6 +1377,14 @@ DEFAULT_CONFIG = {
             # graph expansion.  Without it, recency/access boosts let an
             # unrelated row outrank every real match and pad the block.
             "topical_only": True,
+            # Junk purge: re-run the capture filters over what is already
+            # stored and archive the rows they would now refuse (requests,
+            # assistant status lines, degenerate text). Capture-side filtering
+            # only protects new turns; an already-stored request keeps matching
+            # every query through FTS prefix expansion. Pure Python, no model
+            # call, archiving with a cold export first.
+            "junk_purge_enabled": True,
+            "junk_purge_limit": 500,
             # Retention: archive (never delete) memories that are low-value and
             # unused.  Nothing is destroyed — an archived row keeps its content
             # and returns with status='active' — so this bounds growth without

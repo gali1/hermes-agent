@@ -1046,10 +1046,17 @@ class MemoryStore:
             archived = 0
             with self._write_lock:
                 for row in rows:
-                    try:
-                        meta = json.loads(row.get("metadata") or "{}")
-                    except (TypeError, ValueError):
-                        meta = {}
+                    # Same trap as purge_junk: _row_to_dict hands back a parsed
+                    # dict, and json.loads on a dict raises TypeError, which
+                    # used to discard the retire reason.
+                    raw_meta = row.get("metadata")
+                    if isinstance(raw_meta, dict):
+                        meta = dict(raw_meta)
+                    else:
+                        try:
+                            meta = json.loads(raw_meta or "{}")
+                        except (TypeError, ValueError):
+                            meta = {}
                     meta["retire_reason"] = reason
                     meta["retired_at"] = _now()
                     meta["cold_export"] = export_path
@@ -1069,6 +1076,125 @@ class MemoryStore:
     def archive_dir(self) -> str:
         """Directory holding cold exports written before any retirement."""
         return os.path.join(os.path.dirname(os.path.abspath(self._db_path)), "archive")
+
+    def purge_junk(self, *, dry_run: bool = False,
+                   limit: int = 500) -> Dict[str, Any]:
+        """Archive rows that today's capture filters would refuse to store.
+
+        Capture-side filtering (``agent.memory.mining``) only protects new
+        turns.  A store that already holds requests ("all features working?") or
+        assistant status lines keeps serving them: a degenerate row matches
+        every future query weakly through FTS prefix expansion, so the junk is
+        not merely wasted space.  The same pure-Python heuristics therefore run
+        over what is already stored, on the retention schedule.
+
+        Archiving, not deleting — every row is written to the cold export first
+        and comes back with ``status='active'``.  Protected rows are never
+        considered: ``scope='user'``, ``origin:curated`` tags (explicit memory
+        writes), and anything longer than the capture cap (a long note is a
+        document that predates the current limits, not a rejected candidate).
+        """
+        import json as _json
+
+        from agent.memory.mining import (
+            MAX_CANDIDATE_CHARS,
+            classify_candidate,
+            is_request,
+            looks_like_fallback,
+        )
+
+        try:
+            limit = max(0, int(limit))
+        except (TypeError, ValueError):
+            return {"error": "limit must be numeric"}
+        if limit == 0:
+            return {"success": True, "archived": 0, "candidates": [], "dry_run": bool(dry_run)}
+
+        reason = (
+            f"purged {_now()}: capture filters reject this class "
+            "(request, status line, or degenerate text). "
+            "Revert with status='active'."
+        )
+        try:
+            rows: List[Dict[str, Any]] = []
+            checked = 0
+            for row in self._execute(
+                "SELECT * FROM memories WHERE status = 'active' "
+                "ORDER BY created_at ASC"
+            ):
+                record = self._row_to_dict(row)
+                checked += 1
+                tags_raw = record.get("tags")
+                tags: List[str] = [t for t in tags_raw if isinstance(t, str)] if isinstance(tags_raw, list) else []
+                if record.get("scope") == "user" or "origin:curated" in tags:
+                    continue
+                content = record.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                # Long rows predate the cap; they are documents, not candidates.
+                if len(content) > MAX_CANDIDATE_CHARS:
+                    continue
+                role = None
+                if "origin:user" in tags:
+                    role = "user"
+                elif "origin:assistant" in tags:
+                    role = "assistant"
+                rejected = classify_candidate(content, role=role) is None
+                # Role-blind rejections are the only class safe to act on when
+                # authorship is unknown: a status line from the user's side is
+                # still a status line.
+                if not rejected:
+                    rejected = is_request(content) or (
+                        role == "assistant" and looks_like_fallback(content)
+                    )
+                if rejected:
+                    rows.append(record)
+                    if len(rows) >= limit:
+                        break
+
+            ids = [row["id"] for row in rows]
+            if dry_run or not ids:
+                return {"success": True, "archived": 0, "candidates": ids,
+                        "checked": checked, "dry_run": bool(dry_run)}
+
+            try:
+                export_path, exported = self._export_cold_rows(rows, reason)
+            except Exception as exc:
+                logger.warning("cold export failed; junk purge skipped: %s", exc)
+                return {"success": False, "archived": 0, "candidates": ids,
+                        "error": f"cold export failed, nothing archived: {exc}"}
+
+            archived = 0
+            with self._write_lock:
+                for row in rows:
+                    # _row_to_dict already parses JSON columns, so metadata is
+                    # usually a dict here; json.loads on a dict raises
+                    # TypeError and silently dropped the reason.
+                    raw_meta = row.get("metadata")
+                    if isinstance(raw_meta, dict):
+                        meta = dict(raw_meta)
+                    else:
+                        try:
+                            meta = _json.loads(raw_meta or "{}")
+                        except (TypeError, ValueError):
+                            meta = {}
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    meta["purge_reason"] = reason
+                    meta["purged_at"] = _now()
+                    meta["cold_export"] = export_path
+                    cursor = self._execute(
+                        "UPDATE memories SET status = 'archived', metadata = ?, "
+                        "updated_at = ? WHERE id = ? AND status = 'active'",
+                        (_json.dumps(meta, ensure_ascii=False), _now(), row["id"]),
+                    )
+                    archived += max(0, cursor.rowcount)
+                self._commit()
+            return {"success": True, "archived": archived, "candidates": ids,
+                    "checked": checked, "dry_run": False,
+                    "cold_export": export_path, "exported": exported}
+        except Exception as exc:
+            return {"error": str(exc)}
 
     def backup_to(self, dest_path: str) -> Dict[str, Any]:
         """Consistent snapshot of the database using SQLite's backup API.

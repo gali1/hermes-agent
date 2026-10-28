@@ -251,6 +251,13 @@ class EnhancedMemoryBackend:
             )), session_id=self._session_id, skip_existing=True)
         except Exception:
             logger.debug("enhanced memory session-end mining failed (non-fatal)", exc_info=True)
+        # Junk purge runs every session end, not on the retention interval: it
+        # is one SELECT plus a regex per row, and a request captured by an older
+        # build keeps being served until something notices it.
+        try:
+            self.purge_junk()
+        except Exception:
+            logger.debug("enhanced memory junk purge failed (non-fatal)", exc_info=True)
         # Session end is a natural retention boundary: it is rare, it is not in
         # the middle of a turn, and a once-per-interval marker keeps it cheap.
         try:
@@ -261,6 +268,22 @@ class EnhancedMemoryBackend:
             self.maybe_backup()
         except Exception:
             logger.debug("enhanced memory backup failed (non-fatal)", exc_info=True)
+
+    def purge_junk(self) -> Dict[str, Any]:
+        """Archive stored rows the current capture filters would refuse.
+
+        Capture hardens only the future; a request already stored keeps matching
+        every later query, so the same heuristics have to run over the file.
+        Pure Python, no model call, archiving with a cold export first.
+        """
+        if not self.available or not _as_bool(self._config.get("junk_purge_enabled"), True):
+            return {"skipped": "disabled"}
+        store = self._store
+        if store is None:
+            return {"skipped": "unavailable"}
+        return store.purge_junk(
+            limit=_as_int(self._config.get("junk_purge_limit"), 500, 0, 100000)
+        )
 
     def maybe_backup(self, *, force: bool = False) -> Dict[str, Any]:
         """Snapshot the store into `HERMES_HOME/backups/memory`, keeping last N.
@@ -395,6 +418,12 @@ class EnhancedMemoryBackend:
             backfilled = self.backfill_origin()
         except Exception:
             backfilled = {"error": "backfill failed"}
+        # Junk purge first: capture-side filters only protect new turns, so the
+        # store keeps replaying requests and status lines already in it.
+        try:
+            purged = self.purge_junk()
+        except Exception as exc:
+            purged = {"error": str(exc)}
         result = store.retire_stale(
             days=_as_int(self._config.get("retention_days"), 45, 1, 3650),
             importance_below=_as_float(
@@ -409,6 +438,7 @@ class EnhancedMemoryBackend:
             ),
         )
         result["backfill"] = backfilled
+        result["junk_purge"] = purged
         try:
             with open(marker, "a", encoding="utf-8") as handle:
                 handle.write("")
