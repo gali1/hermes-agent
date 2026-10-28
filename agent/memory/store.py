@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from agent.memory.contradiction import detect_contradiction
+from agent.memory.contradiction import classify_pair, detect_contradiction
 from agent.memory.dedup import is_degenerate
 from agent.memory.graph import expand_links
 from agent.memory.ranking import (
@@ -655,17 +655,19 @@ class MemoryStore:
                 ).fetchall()
             found: List[Dict[str, Any]] = []
             for row in rows:
-                hit, confidence = detect_contradiction(content, row["content"])
-                if not hit:
+                verdict, confidence = classify_pair(content, row["content"])
+                if verdict == "unrelated":
                     continue
+                relation = "contradicts" if verdict == "contradiction" else "candidate"
                 self._execute(
                     "INSERT OR IGNORE INTO memory_links "
                     "(from_id, to_id, relation, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (memory_id, row["id"], "contradicts",
-                     json.dumps({"confidence": confidence}), _now()),
+                    (memory_id, row["id"], relation,
+                     json.dumps({"confidence": confidence, "verdict": verdict}), _now()),
                 )
                 found.append({
                     "memory_id": row["id"],
+                    "relation": relation,
                     "confidence": confidence,
                     "content": (row["content"] or "")[:160],
                 })
@@ -1543,7 +1545,7 @@ class MemoryStore:
                 "FROM memory_links ml "
                 "JOIN memories m1 ON m1.id = ml.from_id "
                 "JOIN memories m2 ON m2.id = ml.to_id "
-                "WHERE ml.relation = 'contradicts'"
+                "WHERE ml.relation IN ('contradicts', 'candidate')"
             )
             params: list = []
             if project:
@@ -1683,6 +1685,11 @@ class MemoryStore:
                 "total_links": _count("SELECT COUNT(*) FROM memory_links"),
                 "total_conflicts": _count(
                     "SELECT COUNT(*) FROM memory_links WHERE relation = 'contradicts'"
+                ),
+                # Unprovable-but-suspicious pairs awaiting adjudication. Separate
+                # from conflicts on purpose: one is a fact, one is a question.
+                "total_candidates": _count(
+                    "SELECT COUNT(*) FROM memory_links WHERE relation = 'candidate'"
                 ),
                 "total_superseded": superseded_rows,
                 "total_supersedes_links": _count(

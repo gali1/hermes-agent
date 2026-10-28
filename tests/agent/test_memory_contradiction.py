@@ -4,7 +4,11 @@ Pure-function tests: no database, no network, no embedding backend.  Ported
 from the upstream ``tests/plugins/memory/test_rekal_hindsight.py`` checks.
 """
 
-from agent.memory.contradiction import CONTRADICTION_MAX_CHARS, detect_contradiction
+from agent.memory.contradiction import (
+    CONTRADICTION_MAX_CHARS,
+    classify_pair,
+    detect_contradiction,
+)
 
 
 def test_contradiction():
@@ -150,3 +154,51 @@ def test_a_changed_noun_is_still_not_a_contradiction():
         "Caching is not enabled for the analytics pipeline",
     )
     assert not hit, conf
+
+
+def test_state_lexicon_catches_off_versus_on():
+    """Adjective choice must not hide a flipped state."""
+    hit, conf = detect_contradiction("The cache is on for the session store",
+                                     "The cache is off for the session store")
+    assert hit, conf
+
+    hit, conf = detect_contradiction("The worker is inactive after the deploy",
+                                     "The worker is active after the deploy")
+    assert hit, conf
+
+
+def test_stemming_unifies_inflection_without_inventing_conflicts():
+    """caching/cache/caches are one word; agreement is not disagreement."""
+    verdict, _ = classify_pair("Caching is off for the session store",
+                               "The cache is disabled for the session store")
+    assert verdict == "unrelated", verdict
+
+    hit, _ = detect_contradiction("Caching is off for the session store",
+                                  "Caching is on for the session store")
+    assert hit
+
+
+def test_unprovable_paraphrase_becomes_a_candidate_not_a_link():
+    """The class lexical rules cannot prove is queued, never guessed or dropped."""
+    verdict, conf = classify_pair(
+        "Caching is off for the session store",
+        "The session store caches every request",
+    )
+    assert verdict == "candidate", verdict
+    assert 0.3 <= conf <= 0.6
+
+    # A candidate is not a contradiction: the boolean wrapper stays honest.
+    hit, _ = detect_contradiction(
+        "Caching is off for the session store",
+        "The session store caches every request",
+    )
+    assert hit is False
+
+
+def test_candidate_queue_ignores_the_timestamp_revision():
+    """The review queue must not fill with the noise we just eliminated."""
+    verdict, _ = classify_pair(
+        "Armed. Fires 20:45, entry 45 20 27 10, backup taken.",
+        "Re-armed. Fires 19:04, entry 04 19 27 10, backup taken.",
+    )
+    assert verdict == "unrelated", verdict

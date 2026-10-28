@@ -19,6 +19,7 @@ from agent.memory.contradiction import (
     CONTRADICTION_MIN_SIMILARITY,
     NEGATION_MARKERS,
     POLARITY_PAIRS,
+    classify_pair,
     detect_contradiction,
 )
 from agent.memory.context import format_recall_block, select_with_budget
@@ -90,6 +91,7 @@ from agent.memory.temporal import (
 __all__ = [
     "BOOST_LEVELS",
     "CONTRADICTION_MAX_SIMILARITY",
+    "classify_pair",
     "CONTRADICTION_MIN_SIMILARITY",
     "DEFAULT_RRF_K",
     "ENTITY_PATTERNS",

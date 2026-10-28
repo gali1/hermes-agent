@@ -56,6 +56,13 @@ for _left, _right in POLARITY_PAIRS:
 CONTRADICTION_MIN_SIMILARITY = 0.35
 CONTRADICTION_MAX_SIMILARITY = 0.97
 
+# Candidates are queued for adjudication rather than linked, so the bar is a
+# shared *subject* rather than shared surface: paraphrase is defined by lower
+# word overlap, so a similarity floor would exclude exactly the class this is
+# for. Two shared content tokens is the cheapest faithful proxy for "same
+# subject".
+CONTRADICTION_CANDIDATE_MIN_SHARED_TOKENS = 2
+
 # Contradiction is a property of atomic propositions.  Whole-turn captures (a
 # 56 KB prompt dump, a skill inventory, a build log) share vocabulary and
 # negation words with unrelated notes, which is how long documents used to
@@ -133,6 +140,63 @@ _AUXILIARIES = frozenset({
     "be", "been", "being", "is", "are", "was", "were", "am",
 })
 
+# State predicates collapse to one canonical token per polarity. This is what
+# lets "caching is off" match "caching is disabled" without a model: adjectives
+# that mean off/on are mapped, then the rest of the sentence is stemmed, so
+# inflection and word choice stop hiding the same claim.
+_STATE_NEG = frozenset({
+    "off", "disabled", "disable", "inactive", "closed", "absent", "missing",
+    "unavailable", "unsupported", "none", "empty", "unset", "broken", "dead",
+})
+_STATE_POS = frozenset({
+    "on", "enabled", "enable", "active", "open", "present", "available",
+    "supported", "set", "configured", "working", "alive", "up",
+})
+
+NEG_STATE_TOKEN = "__neg_state__"
+POS_STATE_TOKEN = "__pos_state__"
+
+
+def _stem(token):
+    """Fold common English inflection so caching/cache/caches compare equal."""
+    if len(token) <= 3:
+        return token
+    for suffix in ("ing", "ed", "es", "s"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= 3:
+            token = token[: -len(suffix)]
+            break
+    if len(token) > 3 and token.endswith("e"):
+        token = token[:-1]
+    return token
+
+
+def _canonical_tokens(text):
+    """Comparison tokens: state words collapsed, inflections folded, aux dropped."""
+    canonical = []
+    for raw in _tokens(text):
+        if raw in _STATE_NEG:
+            canonical.append(NEG_STATE_TOKEN)
+            continue
+        if raw in _STATE_POS:
+            canonical.append(POS_STATE_TOKEN)
+            continue
+        key = _normalise_token(raw)
+        if not key:
+            continue
+        canonical.append(_stem(key))
+    return canonical
+
+
+def _is_state_token(token):
+    return token in (NEG_STATE_TOKEN, POS_STATE_TOKEN)
+
+
+def _state_polarity_conflict(a_tokens, b_tokens):
+    return (NEG_STATE_TOKEN in a_tokens and POS_STATE_TOKEN in b_tokens) or (
+        POS_STATE_TOKEN in a_tokens and NEG_STATE_TOKEN in b_tokens
+    )
+
+
 # Intensifiers and hedges that cannot change what is being claimed. Permitting
 # them in the difference recovers contradictions that add a word ("not enabled
 # at all") without letting a noun, number or filename sneak through.
@@ -176,8 +240,8 @@ def _best_sentence_pair(a_text, b_text):
 
 def _differing_tokens(a_sentence, b_sentence):
     """Tokens present on one side but not the other, as a multiset difference."""
-    a_tokens = Counter(_compare_tokens(a_sentence))
-    b_tokens = Counter(_compare_tokens(b_sentence))
+    a_tokens = Counter(_canonical_tokens(a_sentence))
+    b_tokens = Counter(_canonical_tokens(b_sentence))
     differing = set()
     differing |= set((a_tokens - b_tokens))
     differing |= set((b_tokens - a_tokens))
@@ -185,79 +249,91 @@ def _differing_tokens(a_sentence, b_sentence):
 
 
 def _residue(sentence, drop):
-    return " ".join(key for key in _compare_tokens(sentence) if key not in drop)
+    return " ".join(key for key in _canonical_tokens(sentence) if key not in drop)
 
 
-def detect_contradiction(new_content, existing_content,
-                         min_similarity=CONTRADICTION_MIN_SIMILARITY,
-                         max_similarity=CONTRADICTION_MAX_SIMILARITY):
-    """Decide whether two statements about the same subject disagree.
+def classify_pair(new_content, existing_content,
+                  min_similarity=CONTRADICTION_MIN_SIMILARITY,
+                  max_similarity=CONTRADICTION_MAX_SIMILARITY):
+    """Three-way verdict: 'contradiction', 'candidate' or 'unrelated'.
 
-    Returns `(is_contradiction, confidence)`.
-
-    Four gates, in order, each of which can only *reduce* false positives:
-
-    1. Neither side may be a document rather than a statement.
-    2. The most similar sentence pair must sit inside the similarity band --
-       similar enough to be the same claim, not so similar it is a duplicate
-       (that is content hashing, not contradiction).
-    3. The polarity difference must be *in the tokens that actually differ*.
-       A negation word elsewhere in the text is not evidence about this claim;
-       this is the rule the original whole-document scan was missing.
-    4. The residue -- both sentences with the polarity tokens removed -- must
-       still be the same sentence.  Otherwise the two sides are about different
-       subjects that merely share a negation.
+    `candidate` is the important one. Lexical rules can prove a flipped bit;
+    they cannot prove that "caching is off" and "the store caches every request"
+    disagree, because the two sentences share no structure. Rather than
+    guess (and flood the review queue with noise) or drop it (and miss the
+    contradiction), an unprovable-but-suspicious pair is recorded as a candidate
+    for adjudication. That is the division of labour: rules decide what they can
+    prove, the model decides the rest, and nothing is silently ignored.
     """
     if not new_content or not existing_content:
-        return False, 0.0
+        return "unrelated", 0.0
 
     new_content = _expand_contractions(new_content)
     existing_content = _expand_contractions(existing_content)
 
     if len(new_content) > CONTRADICTION_MAX_CHARS or len(existing_content) > CONTRADICTION_MAX_CHARS:
-        return False, 0.0
+        return "unrelated", 0.0
 
     similarity, a_sentence, b_sentence = _best_sentence_pair(new_content, existing_content)
     if similarity < min_similarity or similarity > max_similarity:
-        return False, 0.0
+        return "unrelated", 0.0
 
     a_low = a_sentence.lower()
     b_low = b_sentence.lower()
+    a_canonical = _canonical_tokens(a_sentence)
+    b_canonical = _canonical_tokens(b_sentence)
 
-    # Gate 3: the *only* differences allowed are polarity ones.
-    #
-    # A contradiction is the same claim with a flipped bit. If the two sentences
-    # differ in any other word -- a timestamp, a filename, a noun -- they are
-    # different claims, and pairing them produces the review noise this module
-    # used to be famous for. Requiring the difference to be entirely negation or
-    # antonym tokens makes that structural instead of probabilistic.
     drop = set(_NEGATION_TOKENS)
     for left, right in POLARITY_PAIRS:
         drop.add(left)
         drop.add(right)
+    drop.add(NEG_STATE_TOKEN)
+    drop.add(POS_STATE_TOKEN)
     allowed = drop | _NON_CLAIM_TOKENS
 
     differing = _differing_tokens(a_sentence, b_sentence)
-    if not differing or not differing.issubset(allowed):
-        return False, 0.0
+    polarity_in_diff = _state_polarity_conflict(a_canonical, b_canonical) or any(
+        token in _NEGATION_TOKENS or _is_state_token(token) for token in differing
+    )
 
-    negation_differs = any(token in _NEGATION_TOKENS for token in differing)
-    polarity_differs = _polarity_conflict(a_low, b_low)
-    if not negation_differs and not polarity_differs:
-        return False, 0.0
+    if differing and differing.issubset(allowed) and polarity_in_diff:
+        negation_differs = any(token in _NEGATION_TOKENS for token in differing)
+        polarity_differs = _polarity_conflict(a_low, b_low) or _state_polarity_conflict(
+            a_canonical, b_canonical
+        )
+        residue_a = _residue(a_sentence, allowed)
+        residue_b = _residue(b_sentence, allowed)
+        if residue_a and residue_b and trigram_similarity(
+            residue_a, residue_b
+        ) >= CONTRADICTION_RESIDUE_SIMILARITY:
+            confidence = 0.5 + 0.3 * similarity
+            if negation_differs and polarity_differs:
+                confidence += 0.15
+            return "contradiction", round(min(0.95, confidence), 3)
 
-    # Gate 4: belt and braces. With the subset rule above the residues are
-    # normally identical, so this only fires on odd tokenisation.
-    residue_a = _residue(a_sentence, allowed)
-    residue_b = _residue(b_sentence, allowed)
-    if not residue_a or not residue_b:
-        return False, 0.0
-    if trigram_similarity(residue_a, residue_b) < CONTRADICTION_RESIDUE_SIMILARITY:
-        return False, 0.0
+    # Unprovable, but is there a polarity hint at all? One side carrying a
+    # negation or a negative state while the other carries neither is exactly
+    # the shape of a paraphrase disagreement.
+    #
+    # Every candidate costs a review, so require a shared subject: at least two
+    # content tokens in common (polarity/filler tokens do not count). A
+    # similarity floor would be wrong here -- paraphrase is exactly the case
+    # with low surface overlap.
+    a_has_neg = any(tok in _NEGATION_TOKENS for tok in a_canonical) or NEG_STATE_TOKEN in a_canonical
+    b_has_neg = any(tok in _NEGATION_TOKENS for tok in b_canonical) or NEG_STATE_TOKEN in b_canonical
+    if a_has_neg != b_has_neg:
+        shared_content = (set(a_canonical) & set(b_canonical)) - set(allowed)
+        if len(shared_content) >= CONTRADICTION_CANDIDATE_MIN_SHARED_TOKENS:
+            return "candidate", round(0.3 + 0.2 * similarity, 3)
+    return "unrelated", 0.0
 
-    # Confidence rises with topical overlap and with agreement between the two
-    # independent detectors.
-    confidence = 0.5 + 0.3 * similarity
-    if negation_differs and polarity_differs:
-        confidence += 0.15
-    return True, round(min(0.95, confidence), 3)
+
+def detect_contradiction(new_content, existing_content,
+                         min_similarity=CONTRADICTION_MIN_SIMILARITY,
+                         max_similarity=CONTRADICTION_MAX_SIMILARITY):
+    """Backwards-compatible wrapper: True only for a provable contradiction."""
+    verdict, confidence = classify_pair(
+        new_content, existing_content,
+        min_similarity=min_similarity, max_similarity=max_similarity,
+    )
+    return verdict == "contradiction", confidence
