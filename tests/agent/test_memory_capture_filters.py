@@ -10,6 +10,7 @@ from agent.memory.mining import (
     classify_candidate,
     is_request,
     looks_injected,
+    looks_like_announcement,
     looks_like_fallback,
     mine_turns,
 )
@@ -138,6 +139,24 @@ def test_mine_turns_drops_requests_and_boilerplate():
         "Root cause: the ACP client sends its own cwd, which overrides the CLI argument at session start.",
     ]
     assert {m["memory_type"] for m in mined} == {"preference", "fact"}
+
+
+def test_announcement_needs_no_specifics():
+    """A completion verb alone is not enough; naming an artifact makes it a finding."""
+    assert looks_like_announcement("Delivered. message id 5188")
+    assert looks_like_announcement("All done — shipped.")
+    assert looks_like_announcement("Done.")
+    assert not looks_like_announcement(
+        "Verified. Only `settings.json` was changed — 19 `favorite_models` for the opencode provider."
+    )
+    assert not looks_like_announcement(
+        "Verified — settings.json has 5 available_models and clean bare-model names everywhere"
+    )
+    assert not looks_like_announcement("Fixed and verified the deploy, port 8080 answers again")
+
+    kept = "Verified. Only `settings.json` was changed — 19 `favorite_models` for the opencode provider."
+    assert classify_candidate(kept, role="assistant") is not None
+    assert classify_candidate("Delivered. message id 5188", role="assistant") is None
 
 
 def test_injected_wrappers_are_rejected():

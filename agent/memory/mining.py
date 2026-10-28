@@ -335,13 +335,23 @@ _TASK_BRIEF_RE = re.compile(
     r"(?i)^\s*(?:-{2,}\s*)?(?:\*\*)?#*\s*(?:task|mission|objective|assignment|goal)\s*:"
 )
 
-# Announcements are length-capped on purpose: "Done - and the log you pasted
-# exposed a second, live attack" opens like a status line yet carries a real
-# finding, and length is what separates the two.
+# Announcements are capped by length, but length alone is not the discriminator:
+# "Verified — `settings.json` has 5 `available_models` …" is 110 chars and is a
+# finding, while "Delivered. message id 5188" is junk with a number in it.  What
+# separates them is *specifics*: an announcement that names an artifact is
+# reporting state, so it is stored.
 MAX_ANNOUNCE_CHARS = 600
 _ANNOUNCE_RE = re.compile(
     r"(?i)^\s*(?:\*\*)?\s*(?:delivered|fixed and verified|verified|done|stopped|stopping|"
     r"complete|completed|finished|all set|all done|ready|shipped|reverted|rolled back)\b"
+)
+
+_ANNOUNCE_SPECIFICS_RE = re.compile(
+    r"`[^`]+`"                                  # backticked identifier
+    r"|\b[\w./-]+\.(?:tsx?|jsx?|py|json|ya?ml|toml|md|db|sh|sql|rs|go|java)\b"
+    r"|\b[a-z][a-z0-9]*_[a-z0-9_]+\b"           # snake_case symbol
+    r"|\b[a-z]+[A-Z][A-Za-z0-9]+\b"             # camelCase symbol
+    r"|\bport\s+\d{2,5}\b"
 )
 
 
@@ -356,13 +366,20 @@ def looks_like_brief(text) -> bool:
 
 
 def looks_like_announcement(text) -> bool:
-    """True when `text` is a short completion/abort announcement."""
+    """True when `text` is a short completion/abort announcement.
+
+    Names no artifact: "Verified — `settings.json` has 5 `available_models`"
+    is a state report about a named thing, so it is knowledge, not an
+    announcement, even at 110 characters.
+    """
     if not isinstance(text, str) or not text.strip():
         return False
     stripped = text.strip()
     if len(stripped) > MAX_ANNOUNCE_CHARS:
         return False
-    return bool(_ANNOUNCE_RE.match(stripped))
+    if not _ANNOUNCE_RE.match(stripped):
+        return False
+    return not _ANNOUNCE_SPECIFICS_RE.search(stripped)
 
 
 # -- Drop telemetry ----------------------------------------------------------
