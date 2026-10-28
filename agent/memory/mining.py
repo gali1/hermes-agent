@@ -9,6 +9,7 @@ type.
 from __future__ import annotations
 
 import re
+from collections import deque
 
 from agent.memory.dedup import is_degenerate, normalize_content
 
@@ -88,9 +89,12 @@ _INJECTED_RES = (
 
 # An atomic memory is short. Whole-turn captures (prompt dumps, build logs, full
 # skill inventories) are not, and multi-KB blobs are what made contradiction
-# detection produce noise.  Set above the longest genuinely useful note seen
-# (a 2.8 KB config write-up) so it clips dumps without clipping real notes.
-MAX_CANDIDATE_CHARS = 3000
+# detection produce noise.  Raised from 3 KB after a shadow run over this store
+# showed genuine findings being clipped as if they were dumps (a 4 KB PID/
+# PostgreSQL root-cause analysis, a multi-KB library-convention note).  Prompt
+# dumps are now caught by shape - task-brief and announcement openers - so
+# length no longer has to carry that weight.
+MAX_CANDIDATE_CHARS = 8000
 
 PRIVATE_BLOCK_RE = re.compile(r"<private>.*?</private>", re.IGNORECASE | re.DOTALL)
 
@@ -191,6 +195,13 @@ MAX_SHORT_QUESTION_CHARS = 120
 # Without a "?" an interrogative opener is much weaker evidence — "When the user
 # selects vtcode_wsl … it only shows one model" is a bug report, not a question.
 MAX_UNMARKED_QUESTION_CHARS = 80
+# Reply openers: "Yes, finish …" / "Ok, run it" are the same request with a
+# conversational prefix. Without this, a reply-shaped imperative is stored as a
+# fact and user turns (importance 0.6) are the tier retention never retires.
+_REPLY_FILLER_RE = re.compile(
+    r"(?i)^\s*(?:yes|yeah|yep|no|nope|ok|okay|sure|alright|right|cool|perfect|"
+    r"great|thanks|and|so|but|now|then|please|also|just)[,!.:\s]+\s*"
+)
 
 # Interrogative openers only count as a question when the apostrophe is absent:
 # "Can't reproduce…" leads with "can" but is a claim, not a question.
@@ -204,10 +215,11 @@ _LEADING_INTERROGATIVE = re.compile(
 # us a fact.  Kept to the verbs that open a request in practice; "remember",
 # "prefer", "use" are deliberately absent because they open durable statements.
 _LEADING_IMPERATIVE = re.compile(
-    r"(?i)^\s*(?:list|show|display|print|dump|enumerate|count|give|tell|"
+    r"(?i)^\s*(?:let\s+me|list|show|display|print|dump|enumerate|count|give|tell|"
     r"fetch|search|find|check|run|rerun|re-?run|open|read|scan|inspect|"
     r"explain|summari[sz]e|recap|remind|retry|continue|proceed|"
-    r"fix|debug|install|deploy|upgrade|restart)\b"
+    r"finish|add|remove|delete|make|enable|disable|commit|push|merge|revert|"
+    r"switch|change|fix|debug|install|deploy|upgrade|restart)\b"
 )
 
 # Assistant status lines and canned failure text: re-derivable from the run that
@@ -259,6 +271,16 @@ _NOW_MARKER_RE = re.compile(
 )
 MAX_PROGRESS_CHARS = 160
 
+# First-person work narration: "Now adding the algorithmic purge pass to the
+# store:" is a move being narrated, not a finding, and it survived every other
+# filter (it passed the 20-char floor and matched no category).
+_MAX_NARRATION_CHARS = 200
+_NARRATION_RE = re.compile(
+    r"(?i)^\s*now\s+(?:adding|updating|writing|patching|editing|wiring|hooking|"
+    r"extending|fixing|refactoring|rewriting|moving|tweaking|implementing|"
+    r"checking|running|reading|searching)\b"
+)
+
 
 def is_request(text) -> bool:
     """True when `text` asks for something instead of stating something.
@@ -277,6 +299,8 @@ def is_request(text) -> bool:
     body = core.rstrip(".!")
     if core.endswith("?"):
         return len(core) <= MAX_SHORT_QUESTION_CHARS or bool(_LEADING_INTERROGATIVE.match(body))
+    # A conversational prefix does not change what the sentence is doing.
+    body = _REPLY_FILLER_RE.sub("", body) or body
     if _LEADING_IMPERATIVE.match(body):
         return True
     return len(body) <= MAX_UNMARKED_QUESTION_CHARS and bool(_LEADING_INTERROGATIVE.match(body))
@@ -292,11 +316,70 @@ def looks_like_fallback(text) -> bool:
         return True
     if len(stripped) < MAX_REQUEST_CHARS and _STATUS_LINE_RE.match(stripped):
         return True
+    if len(stripped) <= _MAX_NARRATION_CHARS and _NARRATION_RE.match(stripped):
+        return True
     return bool(
         len(stripped) <= MAX_PROGRESS_CHARS
         and _PROGRESS_OPENER_RE.match(stripped)
         and _NOW_MARKER_RE.search(stripped)
     )
+
+
+# -- Task briefs and completion announcements --------------------------------
+# Both are shaped like findings but are not: a brief is the prompt that started
+# a run, an announcement is that run reporting it finished.  Session history
+# holds both, so storing them adds recall noise that later reads as established
+# fact ("Delivered. message id 5188" answers nothing a month later).
+MAX_BRIEF_CHARS = 8000
+_TASK_BRIEF_RE = re.compile(
+    r"(?i)^\s*(?:-{2,}\s*)?(?:\*\*)?#*\s*(?:task|mission|objective|assignment|goal)\s*:"
+)
+
+# Announcements are length-capped on purpose: "Done - and the log you pasted
+# exposed a second, live attack" opens like a status line yet carries a real
+# finding, and length is what separates the two.
+MAX_ANNOUNCE_CHARS = 600
+_ANNOUNCE_RE = re.compile(
+    r"(?i)^\s*(?:\*\*)?\s*(?:delivered|fixed and verified|verified|done|stopped|stopping|"
+    r"complete|completed|finished|all set|all done|ready|shipped|reverted|rolled back)\b"
+)
+
+
+def looks_like_brief(text) -> bool:
+    """True when `text` is the brief that started a run, not knowledge."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    stripped = text.strip()
+    if len(stripped) > MAX_BRIEF_CHARS:
+        return False
+    return bool(_TASK_BRIEF_RE.match(stripped))
+
+
+def looks_like_announcement(text) -> bool:
+    """True when `text` is a short completion/abort announcement."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    stripped = text.strip()
+    if len(stripped) > MAX_ANNOUNCE_CHARS:
+        return False
+    return bool(_ANNOUNCE_RE.match(stripped))
+
+
+# -- Drop telemetry ----------------------------------------------------------
+# Every rejection is recorded in a bounded in-memory ring - no I/O, no tokens.
+# Silent filtering is how a good rule quietly starts eating real memories; this
+# makes the drop set inspectable without changing any caller's signature.
+_DROP_LOG: deque = deque(maxlen=200)
+
+
+def _drop(reason: str, text: str):
+    _DROP_LOG.append({"reason": reason, "chars": len(text), "preview": text[:120]})
+    return None
+
+
+def recent_drops(limit: int = 20) -> list[dict]:
+    """Most recent rejections, newest last - for audit and shadow runs."""
+    return list(_DROP_LOG)[-limit:]
 
 
 def classify_candidate(text, role=None) -> str | None:
@@ -311,21 +394,25 @@ def classify_candidate(text, role=None) -> str | None:
         return None
     stripped = text.strip()
     if len(stripped) < 20:
-        return None
+        return _drop("too_short", stripped)
     if len(stripped) > MAX_CANDIDATE_CHARS:
-        return None
+        return _drop("too_long", stripped)
     if is_degenerate(stripped):
-        return None
+        return _drop("degenerate", stripped)
     if is_secret(stripped):
-        return None
+        return _drop("secret", stripped)
     if looks_injected(stripped):
-        return None
+        return _drop("injected", stripped)
+    if looks_like_brief(stripped):
+        return _drop("task_brief", stripped)
     if is_request(stripped):
-        return None
+        return _drop("request", stripped)
+    if looks_like_announcement(stripped):
+        return _drop("announcement", stripped)
     if role == "assistant" and looks_like_fallback(stripped):
-        return None
+        return _drop("fallback", stripped)
     if _is_transient(stripped):
-        return None
+        return _drop("transient", stripped)
     for memory_type, pattern in _CATEGORY_PATTERNS:
         if pattern.search(stripped):
             if memory_type == "preference" and role == "assistant":

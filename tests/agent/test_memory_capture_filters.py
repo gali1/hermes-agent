@@ -23,6 +23,11 @@ JUNK_USER = [
     "Show me the contents of the memory database file",
     "Can you restart the gateway for me please?",
     "Hello! How can I help you today?",
+    "Let me check the current store size before changing anything.",
+    "Yes finish and make it automated using the algorithmic approach.",
+    "Ok, add the retention note to the skill and commit.",
+    "Let me verify the final state of the settings after all changes.",
+    "Now let me check it compiles, then build and deploy.",
 ]
 
 JUNK_ASSISTANT = [
@@ -34,6 +39,9 @@ JUNK_ASSISTANT = [
     "Could you confirm which provider you want to use before I continue?",
     "I don't have access to that directory from this session.",
     "Running the migration now, this will take a moment.",
+    # Work narration that survived every earlier filter (passed the 20-char
+    # floor, matched no category) and reached the live store as a fact.
+    "Now adding the algorithmic purge pass to the store:",
 ]
 
 SIGNAL_USER = [
@@ -49,6 +57,10 @@ SIGNAL_ASSISTANT = [
     "The esbuild failure came from NODE_OPTIONS exported twice by an old bashrc line.",
     "Root cause: the ACP client sends its own cwd, which overrides the --cwd flag.",
     "Fixed by normalizing the Windows path to the home directory before the session opens.",
+    # "Now" + a plain clause is a claim, not narration.
+    "Now the store archives rather than deletes, so retention stays reversible.",
+    # A reply opener does not turn a fact into a request.
+    "Yes, the gateway is behind nginx and owns the websocket transport.",
 ]
 
 
