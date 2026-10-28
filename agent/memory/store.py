@@ -30,7 +30,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory.contradiction import detect_contradiction
@@ -267,6 +267,115 @@ def _json_or_none(value: Any) -> Optional[str]:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _topical_tier(row: Any) -> int:
+    """How much retrieval evidence a row actually has.
+
+    2 = matched the query through FTS or the vector arm, 1 = reached through
+    graph expansion, 0 = no evidence at all (present only because of recency,
+    access or importance boosts).
+    """
+    if _arm_value(row, "fts_score") > 0.0 or _arm_value(row, "vec_score") > 0.0:
+        return 2
+    if _arm_value(row, "graph_score") > 0.0:
+        return 1
+    return 0
+
+
+def _apply_topical_ranking(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """Order by topical evidence first, fused score second.
+
+    `score` is additive across FTS, vector, recency and access, so a row that
+    matched nothing can outrank a row that matched the query outright: its
+    recency and access boosts alone clear a weak-but-real hit.  Tiering the sort
+    key fixes the order without touching the score arithmetic or the public
+    shape of the result, and it composes with `topical_only` (which drops the
+    bottom tier outright) rather than replacing it.
+    """
+    if not isinstance(envelope, dict):
+        return envelope
+    results = envelope.get("results")
+    if not isinstance(results, list) or len(results) < 2:
+        return envelope
+    ordered = sorted(
+        results,
+        key=lambda row: (_topical_tier(row), _score_of(row)),
+        reverse=True,
+    )
+    out = dict(envelope)
+    out["results"] = ordered
+    return out
+
+
+def _apply_score_floor(envelope: Dict[str, Any], min_score: float) -> Dict[str, Any]:
+    """Drop hits below ``min_score`` so recall stops padding with off-topic rows.
+
+    Without a floor a query always returns ``limit`` results, because the fused
+    score of an unrelated note is still positive.  Off-topic rows then ride into
+    the prompt as if they were relevant.  0.0 (the default) is a no-op, so
+    callers that never set the knob keep the previous behavior exactly.
+    """
+    try:
+        floor = float(min_score or 0.0)
+    except (TypeError, ValueError):
+        floor = 0.0
+    if floor <= 0.0 or not isinstance(envelope, dict):
+        return envelope
+    results = envelope.get("results")
+    if not isinstance(results, list):
+        return envelope
+    kept = [r for r in results if _score_of(r) >= floor]
+    out = dict(envelope)
+    out["results"] = kept
+    out["score_floor"] = floor
+    out["filtered_by_floor"] = len(results) - len(kept)
+    return out
+
+
+def _score_of(row: Any) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    try:
+        return float(row.get("score") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _arm_value(row: Any, key: str) -> float:
+    if not isinstance(row, dict):
+        return 0.0
+    try:
+        return float(row.get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _apply_topical_gate(envelope: Dict[str, Any], topical_only: bool) -> Dict[str, Any]:
+    """Keep only hits that matched the query through a retrieval arm.
+
+    Recency and access boosts are additive, so with no gate a memory that shares
+    nothing with the query outranks one that matches: `score` is dominated by
+    boosts while `fts_score`/`vec_score` stay 0.  A row is topical when FTS, the
+    vector arm, or graph expansion produced evidence for it; otherwise it is
+    filler and must not be injected into the prompt.
+    """
+    if not topical_only or not isinstance(envelope, dict):
+        return envelope
+    results = envelope.get("results")
+    if not isinstance(results, list):
+        return envelope
+    kept = [
+        r for r in results
+        if _arm_value(r, "fts_score") > 0.0
+        or _arm_value(r, "vec_score") > 0.0
+        or _arm_value(r, "graph_score") > 0.0
+    ]
+    out = dict(envelope)
+    out["results"] = kept
+    out["topical_only"] = True
+    out["filtered_untopical"] = len(results) - len(kept)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -790,6 +899,229 @@ class MemoryStore:
         except Exception as exc:
             return {"error": str(exc)}
 
+    # -- Retention ----------------------------------------------------------
+
+    def retire_stale(self, *, days: int = 45, importance_below: float = 0.5,
+                     max_access: int = 1, project: Optional[str] = None,
+                     dry_run: bool = False,
+                     narration_days: Optional[int] = None,
+                     max_active: Optional[int] = None) -> Dict[str, Any]:
+        """Archive — never delete — memories that are old, low-value and unused.
+
+        Retention has to be reversible or it is just forgetting.  Archiving keeps
+        the row, its content and its links; it leaves recall (`status='active'`
+        is the filter every read path uses) and a single UPDATE restores it.
+
+        A row is eligible only when *all* of these hold, so a valuable memory
+        cannot decay by accident:
+
+        * `status='active'` (already-retired rows are left alone)
+        * `scope` is not ``user`` (the user's own curated writes never decay)
+        * `origin:curated` is not among its tags (explicit memory writes)
+        * `importance < importance_below`
+        * `access_count <= max_access` — anything recall has actually used keeps
+          its place, which is why search() bumps those counters
+        * untouched for `days`, measured from the newer of `last_accessed_at`
+          and `created_at`
+        """
+        try:
+            days = max(0, int(days))
+            max_access = max(0, int(max_access))
+            importance_below = float(importance_below)
+        except (TypeError, ValueError):
+            return {"error": "days, importance_below and max_access must be numeric"}
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        conditions = [
+            "status = 'active'",
+            "COALESCE(scope, 'global') != 'user'",
+            "importance < ?",
+            "COALESCE(access_count, 0) <= ?",
+            "COALESCE(last_accessed_at, created_at) < ?",
+            "NOT EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'origin:curated')",
+        ]
+        params: list = [importance_below, max_access, cutoff]
+        if project:
+            conditions.append("project = ?")
+            params.append(project)
+
+        try:
+            rows_by_id: Dict[str, Dict[str, Any]] = {}
+            for row in self._execute(
+                "SELECT * FROM memories WHERE " + " AND ".join(conditions)
+                + " ORDER BY COALESCE(last_accessed_at, created_at) ASC",
+                tuple(params),
+            ):
+                record = self._row_to_dict(row)
+                rows_by_id[record["id"]] = record
+
+            # Assistant narration gets a shorter fuse than everything else. It is
+            # the bulk of the growth and the least likely to be needed later,
+            # while user-stated facts and curated writes stay on the long window.
+            #
+            # Deliberately NOT gated on `access_count`: search() bumps that
+            # counter for anything in the top-K, so a single prefetch pass or a
+            # debugging query marks a row "used" and nothing would ever retire.
+            # Age plus tier is a signal that actually fires.
+            if narration_days is not None:
+                narration_cutoff = (
+                    datetime.now(timezone.utc) - timedelta(days=max(0, int(narration_days)))
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                narration_conditions = [
+                    "status = 'active'",
+                    "importance < ?",
+                    # created_at for the age, not last_accessed_at: injection
+                    # renews that timestamp for every row prefetch touches, so
+                    # an access-based clock never ages at all.
+                    "created_at < ?",
+                    # ...but "never surfaced by recall" is still required. A
+                    # root-cause note is also assistant-authored, and retiring it
+                    # just because it is old would lose exactly the memories
+                    # worth keeping. Something actually served is value.
+                    "COALESCE(access_count, 0) = 0",
+                    "EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'origin:assistant')",
+                ]
+                narration_params: list = [importance_below, narration_cutoff]
+                if project:
+                    narration_conditions.append("project = ?")
+                    narration_params.append(project)
+                for row in self._execute(
+                    "SELECT * FROM memories WHERE " + " AND ".join(narration_conditions),
+                    tuple(narration_params),
+                ):
+                    record = self._row_to_dict(row)
+                    rows_by_id.setdefault(record["id"], record)
+
+            # Hard ceiling on active rows. Age windows can never bound growth on
+            # their own: a store that captures every turn outruns them. This
+            # retires the least valuable surplus — lowest importance, then least
+            # used, then oldest — so the store has a size, not just a policy.
+            if max_active is not None:
+                budget = max(0, int(max_active))
+                active_count = self._execute(
+                    "SELECT COUNT(*) FROM memories WHERE status = 'active'"
+                ).fetchone()[0]
+                surplus = active_count - budget
+                if surplus > 0:
+                    spare_sql = (
+                        "SELECT * FROM memories WHERE status = 'active' "
+                        "AND COALESCE(scope, 'global') != 'user' "
+                        "AND NOT EXISTS (SELECT 1 FROM json_each(memories.tags) "
+                        "WHERE value = 'origin:curated') "
+                        "ORDER BY importance ASC, COALESCE(access_count, 0) ASC, "
+                        "COALESCE(last_accessed_at, created_at) ASC LIMIT ?"
+                    )
+                    for row in self._execute(spare_sql, (surplus,)):
+                        record = self._row_to_dict(row)
+                        rows_by_id.setdefault(record["id"], record)
+
+            rows = sorted(
+                rows_by_id.values(),
+                key=lambda record: record.get("last_accessed_at") or record.get("created_at") or "",
+            )
+            ids = [row["id"] for row in rows]
+            if dry_run or not ids:
+                return {"success": True, "archived": 0, "candidates": ids,
+                        "dry_run": bool(dry_run), "cutoff": cutoff}
+
+            reason = (
+                f"retired {_now()}: unused for {days}d, importance "
+                f"< {importance_below}, access_count <= {max_access}. "
+                "Revert with status='active'."
+            )
+            # Cold export first, and fail closed: retiring a row without a copy
+            # would turn retention into forgetting, which is the one thing it
+            # must never be. If the export cannot be written, archive nothing.
+            try:
+                export_path, exported = self._export_cold_rows(rows, reason)
+            except Exception as exc:
+                logger.warning("cold export failed; retention skipped: %s", exc)
+                return {"success": False, "archived": 0, "candidates": ids,
+                        "error": f"cold export failed, nothing archived: {exc}"}
+
+            archived = 0
+            with self._write_lock:
+                for row in rows:
+                    try:
+                        meta = json.loads(row.get("metadata") or "{}")
+                    except (TypeError, ValueError):
+                        meta = {}
+                    meta["retire_reason"] = reason
+                    meta["retired_at"] = _now()
+                    meta["cold_export"] = export_path
+                    cursor = self._execute(
+                        "UPDATE memories SET status = 'archived', metadata = ?, "
+                        "updated_at = ? WHERE id = ? AND status = 'active'",
+                        (json.dumps(meta, ensure_ascii=False), _now(), row["id"]),
+                    )
+                    archived += max(0, cursor.rowcount)
+                self._commit()
+            return {"success": True, "archived": archived, "candidates": ids,
+                    "dry_run": False, "cutoff": cutoff,
+                    "cold_export": export_path, "exported": exported}
+        except Exception as exc:
+            return {"error": str(exc)}
+
+    def archive_dir(self) -> str:
+        """Directory holding cold exports written before any retirement."""
+        return os.path.join(os.path.dirname(os.path.abspath(self._db_path)), "archive")
+
+    def backup_to(self, dest_path: str) -> Dict[str, Any]:
+        """Consistent snapshot of the database using SQLite's backup API.
+
+        A plain file copy of a WAL database can catch a torn write; the backup
+        API checkpoints a coherent image while we hold the write lock.
+        """
+        try:
+            directory = os.path.dirname(os.path.abspath(dest_path))
+            os.makedirs(directory, exist_ok=True)
+            destination = sqlite3.connect(dest_path)
+            try:
+                with self._write_lock:
+                    self.db.backup(destination)
+            finally:
+                destination.close()
+            try:
+                os.chmod(dest_path, 0o600)
+            except OSError:
+                pass
+            return {"success": True, "path": dest_path,
+                    "bytes": os.path.getsize(dest_path)}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    def _export_cold_rows(self, rows: List[Dict[str, Any]], reason: str) -> Tuple[str, int]:
+        """Append full rows (and their links) to a dated JSONL cold copy."""
+        directory = self.archive_dir()
+        os.makedirs(directory, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        path = os.path.join(directory, f"cold-{stamp}.jsonl")
+        written = 0
+        with open(path, "a", encoding="utf-8") as handle:
+            for row in rows:
+                links = [
+                    {"from_id": link["from_id"], "to_id": link["to_id"],
+                     "relation": link["relation"], "metadata": link["metadata"]}
+                    for link in self._execute(
+                        "SELECT from_id, to_id, relation, metadata FROM memory_links "
+                        "WHERE from_id = ? OR to_id = ?",
+                        (row["id"], row["id"]),
+                    )
+                ]
+                record = {"_type": "retired_memory", "retired_at": _now(),
+                          "reason": reason, "memory": row, "links": links}
+                handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+                written += 1
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path, written
+
     # -- Retrieval ----------------------------------------------------------
 
     def search(self, query: str, limit: int = _DEFAULT_SEARCH_LIMIT, *,
@@ -797,7 +1129,8 @@ class MemoryStore:
                min_importance: float = 0.0, fusion=None, graph_expand=False,
                temporal=False, strategy_boosts=None, vector_search_fn=None,
                now=None, w_fts=None, w_vec=None, w_recency=None,
-               w_access=None, half_life=None) -> Dict[str, Any]:
+               w_access=None, half_life=None, min_score: float = 0.0,
+               topical_only: bool = False) -> Dict[str, Any]:
         try:
             limit = max(1, min(_DEFAULT_MAX_SEARCH, int(limit or _DEFAULT_SEARCH_LIMIT)))
         except (TypeError, ValueError):
@@ -827,7 +1160,7 @@ class MemoryStore:
                 temporal_window, lexical_query = None, query
 
         try:
-            return self._search_inner(
+            envelope = self._search_inner(
                 query=query, lexical_query=lexical_query, temporal_window=temporal_window,
                 limit=limit, project=project, memory_type=memory_type, scope=scope,
                 tags=tags, min_importance=min_importance, fusion=fusion,
@@ -835,6 +1168,9 @@ class MemoryStore:
                 strategy_boosts=strategy_boosts, vector_search_fn=vector_search_fn,
                 now=now, weights=weights,
             )
+            envelope = _apply_topical_gate(envelope, topical_only)
+            envelope = _apply_topical_ranking(envelope)
+            return _apply_score_floor(envelope, min_score)
         except Exception as exc:
             logger.debug("memory search failed; returning recent rows", exc_info=True)
             results = self._list_recent(
@@ -1326,6 +1662,15 @@ class MemoryStore:
                 fts_ok = False
             total = _count("SELECT COUNT(*) FROM memories")
             superseded = _count("SELECT COUNT(*) FROM memories WHERE status != 'active'")
+            # `total_superseded` used to count `supersedes` *links*, which is not
+            # the same thing and read as 0 while the store held superseded rows.
+            # Report the row-level truth and keep the link count separate.
+            superseded_rows = _count(
+                "SELECT COUNT(*) FROM memories WHERE superseded_by IS NOT NULL"
+            )
+            archived_rows = _count(
+                "SELECT COUNT(*) FROM memories WHERE status = 'archived'"
+            )
             db_size = os.path.getsize(self._db_path) if os.path.exists(self._db_path) else 0
             wal_size = 0
             if os.path.exists(self._db_path + "-wal"):
@@ -1339,9 +1684,11 @@ class MemoryStore:
                 "total_conflicts": _count(
                     "SELECT COUNT(*) FROM memory_links WHERE relation = 'contradicts'"
                 ),
-                "total_superseded": _count(
+                "total_superseded": superseded_rows,
+                "total_supersedes_links": _count(
                     "SELECT COUNT(*) FROM memory_links WHERE relation = 'supersedes'"
                 ),
+                "total_archived": archived_rows,
                 "duplicate_content_groups": _count(
                     "SELECT COUNT(*) FROM (SELECT content_hash FROM memories "
                     "WHERE content_hash IS NOT NULL GROUP BY content_hash HAVING COUNT(*) > 1)"

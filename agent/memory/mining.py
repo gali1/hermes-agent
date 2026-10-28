@@ -34,11 +34,61 @@ _TRANSIENT_WORDS = frozenset({
 })
 
 SECRET_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9]{16,}"),
-    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+    # OpenAI-style and prefixed keys.  `sk-` alone only matched bare alnum
+    # tokens, so `sk-proj-…`, `sk-ant-…` and `sk_live_…` slipped through; the
+    # character class now covers the separators those families use.
+    re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"sk_live_[A-Za-z0-9]{16,}"),
+    re.compile(r"(?i)sk-ant-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"glpat-[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"(?i)hf_[A-Za-z0-9]{30,}"),
+    re.compile(r"(?i)nvapi-[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"(?i)(?:pcsk|whsec|shpat|dop_v1|rnd)_[A-Za-z0-9_\-]{16,}"),
+    # OpenCode / provider-scoped keys: `oc_sk_<id>_<id>_<secret>`.
+    re.compile(r"oc_sk_[A-Za-z0-9_\-]{16,}"),
+    # Bare JWT (three base64url segments) — access tokens are routinely pasted.
+    re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{16,}"),
     re.compile(r"(?i)(api[_-]?key|password|secret|token)\s*[:=]\s*\S{8,}"),
+    # Prose form: "update the opencode key with 'oc_…'" / "the token is …".
+    re.compile(
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|secret|password|credential)s?\b"
+        r"[^\n]{0,32}?\b(?:is|was|with|to|as|=|:)\b[^\n]{0,8}?['\"]?[A-Za-z0-9_\-]{20,}"
+    ),
 ]
+
+# Auto-capture sees whole chat turns, including injected system/agent prompts and
+# pasted transcripts.  Those are instruction text, not durable facts about the
+# user's world, and storing them is what used to flood recall.
+_INJECTED_MARKERS = (
+    "[important:",
+    "[out-of-band user message",
+    "[/out-of-band user message]",
+    "[cron_failure]",
+    "you are running as a scheduled cron job",
+    "agent instructions were loaded from",
+    "consolidated prompt",
+    "do not use send_message",
+    "reply with only the word",
+)
+
+_INJECTED_RES = (
+    # Prompt-shaped openers: "You are <role>, …" for a system/agent preamble.
+    re.compile(r"(?i)^\s*(?:you are|act as)\b.{0,240}?\b(?:assistant|agent|chief of staff|orchestrator)\b"),
+    # Leftover injected-context fences from a broken/truncated block.
+    re.compile(r"(?i)</?(?:memory-context|mempalace_context|rekal-context)\b"),
+)
+
+# An atomic memory is short. Whole-turn captures (prompt dumps, build logs, full
+# skill inventories) are not, and multi-KB blobs are what made contradiction
+# detection produce noise.  Set above the longest genuinely useful note seen
+# (a 2.8 KB config write-up) so it clips dumps without clipping real notes.
+MAX_CANDIDATE_CHARS = 3000
 
 PRIVATE_BLOCK_RE = re.compile(r"<private>.*?</private>", re.IGNORECASE | re.DOTALL)
 
@@ -99,6 +149,21 @@ def strip_private(text) -> str:
     return PRIVATE_BLOCK_RE.sub(" ", text)
 
 
+def looks_injected(text) -> bool:
+    """True when `text` is injected instruction text rather than user knowledge.
+
+    Auto-capture receives whole turns, so system preambles, cron wrappers and
+    agent role prompts reach the miner looking like ordinary prose.  Storing
+    them pollutes recall with instructions that were never facts.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in _INJECTED_MARKERS):
+        return True
+    return any(pattern.search(text) for pattern in _INJECTED_RES)
+
+
 def _is_transient(text) -> bool:
     normalized = normalize_content(text)
     if not normalized:
@@ -117,9 +182,13 @@ def classify_candidate(text) -> str | None:
     stripped = text.strip()
     if len(stripped) < 20:
         return None
+    if len(stripped) > MAX_CANDIDATE_CHARS:
+        return None
     if is_degenerate(stripped):
         return None
     if is_secret(stripped):
+        return None
+    if looks_injected(stripped):
         return None
     if _is_transient(stripped):
         return None

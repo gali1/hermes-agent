@@ -139,3 +139,91 @@ def test_session_end_does_not_inflate_evidence(tmp_path):
     after = backend.store.get(memory_id)["proof_count"]
     assert after == before
     backend.shutdown()
+
+
+def test_maybe_backup_snapshots_the_database(tmp_path):
+    """Archiving never leaves the file, so the file itself needs a copy."""
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True, "backup_keep": 3})
+    backend.initialize("s1", platform="cli")
+    backend.remember("The gateway owns the websocket transport layer")
+
+    first = backend.maybe_backup(force=True)
+    assert first["success"] is True
+    assert first["bytes"] > 0
+    assert first["path"].startswith(str(tmp_path / "backups" / "memory"))
+
+    import sqlite3
+    snapshot = sqlite3.connect(first["path"])
+    try:
+        assert snapshot.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 1
+    finally:
+        snapshot.close()
+
+    # The interval marker makes a second unforced pass a no-op.
+    second = backend.maybe_backup()
+    assert second["skipped"] == "interval"
+    backend.shutdown()
+
+
+def test_maybe_backup_prunes_to_keep(tmp_path):
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True, "backup_keep": 2})
+    backend.initialize("s1", platform="cli")
+    backend.remember("Retention bookkeeping lives in a sidecar marker file")
+
+    backup_dir = tmp_path / "backups" / "memory"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(5):
+        (backup_dir / f"memories-2020010{index}-000000.db").write_bytes(b"stale")
+
+    result = backend.maybe_backup(force=True)
+    assert result["success"] is True
+    remaining = sorted(name for name in __import__("os").listdir(backup_dir)
+                       if name.startswith("memories-"))
+    assert len(remaining) == 2, remaining
+    # The newest snapshot survives pruning.
+    assert remaining[-1] == __import__("os").path.basename(result["path"])
+    backend.shutdown()
+
+
+def test_backfill_origin_tiers_rows_written_by_old_code(tmp_path):
+    """A process running pre-tiering code leaves rows retention cannot classify."""
+    import sqlite3
+
+    state_db = tmp_path / "state.db"
+    connection = sqlite3.connect(state_db)
+    connection.execute("CREATE TABLE messages (role TEXT, content TEXT)")
+    connection.executemany(
+        "INSERT INTO messages (role, content) VALUES (?, ?)",
+        [
+            ("user", "The cache is disabled for the session store"),
+            ("assistant", "Fixed and verified, the cache setting now sticks"),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True})
+    backend.initialize("s1", platform="cli")
+    store = backend.store
+    untagged_user = store.store("The cache is disabled for the session store",
+                                importance=0.5, source={"type": "conversation"})["memory_id"]
+    untagged_reply = store.store("Fixed and verified, the cache setting now sticks",
+                                importance=0.5, source={"type": "conversation"})["memory_id"]
+    curated = store.store("A note written through the memory tool",
+                          importance=0.7, tags=["origin:curated"])["memory_id"]
+
+    counts = backend.backfill_origin()
+    assert counts["tagged"] == 2, counts
+    assert counts["user"] == 1 and counts["assistant"] == 1
+
+    user_row = store.get(untagged_user, track_access=False)
+    reply_row = store.get(untagged_reply, track_access=False)
+    assert user_row["importance"] == 0.6
+    assert "origin:user" in user_row["tags"]
+    assert reply_row["importance"] == 0.4
+    assert "origin:assistant" in reply_row["tags"]
+
+    # Curated rows were already tagged and must not be rewritten.
+    curated_row = store.get(curated, track_access=False)
+    assert curated_row["tags"] == ["origin:curated"]
+    backend.shutdown()

@@ -4,14 +4,25 @@ Adapted from the OpenCode/MemPalace Rekal integration checks plus core-layer
 extensions (scope/session filters, FTS self-heal, concurrency smoke).
 """
 
+import json
+import os
 import sqlite3
 import threading
+from datetime import datetime, timedelta, timezone
 
-from agent.memory.store import MemoryStore, _quote_fts
+from agent.memory.store import MemoryStore, _apply_topical_ranking, _quote_fts
 
 
 def make_store(tmp_path):
     return MemoryStore(str(tmp_path / "memories.db"))
+
+
+def status_of(store, memory_id):
+    # track_access=False: inspecting a row must not count as a recall, or the
+    # inspection itself would reset its retention clock.
+    row = store.get(memory_id, track_access=False)
+    assert row is not None, f"memory {memory_id} missing"
+    return row["status"]
 
 
 # ── Baseline contract ─────────────────────────────────────────────────────
@@ -334,6 +345,205 @@ def test_health_fields(tmp_path):
         assert field in health
     assert health["total_superseded"] >= 1
     assert health["fts_ok"] is True
+    # Row-level truth: `supersede()` sets superseded_by, and archived rows are
+    # reported separately instead of being conflated with supersedes links.
+    assert health["total_superseded"] == 1
+    assert health["total_archived"] == 0
+    assert "total_supersedes_links" in health
+
+
+def test_score_floor_default_is_a_noop(tmp_path):
+    store = make_store(tmp_path)
+    store.store("Session storage uses SQLite WAL", project="p")
+    baseline = store.search("storage", limit=5, project="p")
+    floored = store.search("storage", limit=5, project="p", min_score=0.0)
+    assert sorted(floored.keys()) == sorted(baseline.keys())
+    assert [r["id"] for r in floored["results"]] == [r["id"] for r in baseline["results"]]
+
+
+def test_score_floor_drops_off_topic_hits(tmp_path):
+    store = make_store(tmp_path)
+    store.store("Session storage uses SQLite WAL for durability", project="p")
+    store.store("The garden needs watering on Sundays", project="p")
+
+    loose = store.search("sqlite wal durability", limit=5, project="p")
+    assert len(loose["results"]) >= 1
+
+    top = max(r["score"] for r in loose["results"])
+    floored = store.search("sqlite wal durability", limit=5, project="p", min_score=top)
+    assert floored["score_floor"] == top
+    assert all(r["score"] >= top for r in floored["results"])
+    assert floored["filtered_by_floor"] == len(loose["results"]) - len(floored["results"])
+
+
+def test_topical_gate_drops_boost_only_rows(tmp_path):
+    """Boosts alone must not put a memory into recall.
+
+    `score` is additive across FTS, vector, recency and access, so a row that
+    matches nothing can still outrank a real match on recency.  The topical gate
+    keeps only rows an actual retrieval arm returned evidence for.
+    """
+    store = make_store(tmp_path)
+    store.store("Session storage uses SQLite WAL for durability", project="p")
+    store.store("The garden needs watering on Sundays", project="p")
+
+    loose = store.search("sqlite wal durability", limit=10, project="p",
+                         fusion="rrf", graph_expand=True, temporal=True)
+    gated = store.search("sqlite wal durability", limit=10, project="p",
+                         fusion="rrf", graph_expand=True, temporal=True, topical_only=True)
+
+    assert len(gated["results"]) <= len(loose["results"])
+    assert gated["topical_only"] is True
+    assert gated["filtered_untopical"] == len(loose["results"]) - len(gated["results"])
+    assert gated["results"], "the matching memory must survive the gate"
+    assert all("SQLite WAL" in r["content"] for r in gated["results"])
+
+
+def test_archived_rows_leave_recall(tmp_path):
+    store = make_store(tmp_path)
+    mid = store.store("Obsolete note about the legacy gateway transport", project="p")["memory_id"]
+    assert store.search("legacy gateway transport", limit=5, project="p")["results"]
+    store.update(mid, status="archived")
+    assert store.search("legacy gateway transport", limit=5, project="p")["results"] == []
+    # Data is retained, not destroyed, so archiving stays reversible.
+    kept = store.get(mid)
+    assert kept is not None and kept["content"].startswith("Obsolete note")
+    assert store.health()["total_archived"] == 1
+
+
+def test_retire_stale_archives_only_eligible_rows(tmp_path):
+    """Retention must be reversible, so it archives rather than deletes.
+
+    Only rows that are simultaneously old, low-importance, unused and not
+    user-authored are eligible; everything else keeps its place so a valuable
+    memory cannot decay by accident.
+    """
+    store = make_store(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+
+    def seed(text, **kwargs):
+        mem_id = store.store(text, project="p", **kwargs)["memory_id"]
+        store._execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?", (old, mem_id)
+        )
+        store._commit()
+        return mem_id
+
+    stale = seed("Narration about a build that nobody asked about again", importance=0.4)
+    hot = seed("Critical convention the team relies on every single day", importance=0.8)
+    curated = seed("A fact the user stated explicitly and meant to keep",
+                   importance=0.4, tags=["origin:curated"])
+    user_scope = seed("User profile detail written through the memory tool",
+                      importance=0.4, scope="user")
+    used = seed("Fact that recall actually served at some point recently", importance=0.4)
+    store._execute("UPDATE memories SET access_count = 5 WHERE id = ?", (used,))
+    store._commit()
+
+    dry = store.retire_stale(days=45, importance_below=0.5, max_access=1, dry_run=True)
+    assert dry["dry_run"] is True and dry["archived"] == 0
+    assert dry["candidates"] == [stale]
+    assert status_of(store, stale) == "active"
+
+    done = store.retire_stale(days=45, importance_below=0.5, max_access=1)
+    assert done["archived"] == 1
+
+    assert status_of(store, stale) == "archived"
+    for kept in (hot, curated, user_scope, used):
+        assert status_of(store, kept) == "active"
+
+    # Retired rows leave recall but keep their content, so restore is one update.
+    assert stale not in [r["id"] for r in store.search("narration build", limit=10, project="p")["results"]]
+    retired = store.get(stale, track_access=False)
+    assert retired is not None and "Narration" in retired["content"]
+    store.update(stale, status="active")
+    assert stale in [r["id"] for r in store.search("narration build", limit=10, project="p")["results"]]
+
+
+def test_retire_stale_leaves_recent_rows_alone(tmp_path):
+    store = make_store(tmp_path)
+    fresh = store.store("Fresh narration from today about a routine build",
+                        project="p", importance=0.4)["memory_id"]
+    result = store.retire_stale(days=45)
+    assert result["archived"] == 0
+    assert status_of(store, fresh) == "active"
+
+
+def test_retire_stale_is_idempotent(tmp_path):
+    store = make_store(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+    mem_id = store.store("Old low value narration about a build run", project="p",
+                         importance=0.4)["memory_id"]
+    store._execute("UPDATE memories SET created_at = ? WHERE id = ?", (old, mem_id))
+    store._commit()
+    assert store.retire_stale(days=45)["archived"] == 1
+    assert store.retire_stale(days=45)["archived"] == 0
+
+
+def test_retire_stale_writes_cold_export_first(tmp_path):
+    """Retirement must leave an offline copy, or it is just deletion."""
+    store = make_store(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+    mem_id = store.store("Old narration about a build nobody revisits", project="p",
+                         importance=0.4)["memory_id"]
+    other = store.store("Linked context for the same build note", project="p")["memory_id"]
+    store.link(mem_id, other, "related_to")
+    store._execute("UPDATE memories SET created_at = ? WHERE id = ?", (old, mem_id))
+    store._commit()
+
+    result = store.retire_stale(days=45)
+    assert result["archived"] == 1
+    assert result["exported"] == 1
+
+    export_path = result["cold_export"]
+    assert export_path.startswith(store.archive_dir())
+    lines = [json.loads(line) for line in open(export_path, encoding="utf-8") if line.strip()]
+    assert len(lines) == 1
+    record = lines[0]
+    assert record["_type"] == "retired_memory"
+    assert record["memory"]["id"] == mem_id
+    assert "Old narration" in record["memory"]["content"]
+    # Links travel with the row, so the cold copy keeps its graph shape.
+    assert record["links"] and record["links"][0]["relation"] == "related_to"
+
+    # The archived row points at its own offline copy.
+    row = store.get(mem_id, track_access=False)
+    assert row is not None
+    metadata = row["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    assert metadata["cold_export"] == export_path
+
+
+def test_retire_stale_dry_run_writes_no_export(tmp_path):
+    store = make_store(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S")
+    mem_id = store.store("Old narration that a dry run should not touch", project="p",
+                         importance=0.4)["memory_id"]
+    store._execute("UPDATE memories SET created_at = ? WHERE id = ?", (old, mem_id))
+    store._commit()
+
+    assert store.retire_stale(days=45, dry_run=True)["archived"] == 0
+    assert not os.path.exists(store.archive_dir()) or not os.listdir(store.archive_dir())
+
+
+def test_backup_to_produces_a_readable_snapshot(tmp_path):
+    store = make_store(tmp_path)
+    store.store("Session storage uses SQLite WAL for durability", project="p")
+    dest = str(tmp_path / "backups" / "memory" / "memories-test.db")
+
+    result = store.backup_to(dest)
+    assert result["success"] is True
+    assert result["bytes"] > 0
+
+    snapshot = sqlite3.connect(dest)
+    try:
+        count = snapshot.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        assert count == 1
+        assert snapshot.execute(
+            "SELECT COUNT(*) FROM memories_fts_docsize"
+        ).fetchone()[0] == 1
+    finally:
+        snapshot.close()
 
 
 def test_unlink(tmp_path):
@@ -365,3 +575,98 @@ def test_concurrent_store_and_search(tmp_path):
 
     assert not errors
     assert store.health()["total_memories"] == 10
+
+
+def test_topical_ranking_puts_evidence_first():
+    """A row that matched nothing must not outrank one that matched."""
+    envelope = {
+        "results": [
+            {"id": "boost-only", "score": 0.90, "fts_score": 0.0, "vec_score": 0.0, "graph_score": 0.0},
+            {"id": "graph", "score": 0.10, "fts_score": 0.0, "vec_score": 0.0, "graph_score": 0.4},
+            {"id": "matched", "score": 0.02, "fts_score": 1.0, "vec_score": 0.0, "graph_score": 0.0},
+            {"id": "matched-weak", "score": 0.01, "fts_score": 0.2, "vec_score": 0.0, "graph_score": 0.0},
+        ]
+    }
+    ordered = [row["id"] for row in _apply_topical_ranking(envelope)["results"]]
+    assert ordered == ["matched", "matched-weak", "graph", "boost-only"]
+
+
+def test_topical_ranking_is_stable_within_a_tier():
+    envelope = {
+        "results": [
+            {"id": "a", "score": 0.4, "fts_score": 1.0},
+            {"id": "b", "score": 0.6, "fts_score": 0.5},
+        ]
+    }
+    ordered = [row["id"] for row in _apply_topical_ranking(envelope)["results"]]
+    assert ordered == ["b", "a"]
+    assert [row["id"] for row in envelope["results"]] == ["a", "b"], "input must not be mutated"
+
+
+def test_retire_stale_narration_window(tmp_path):
+    """Never-used assistant narration retires sooner than user-stated facts."""
+    store = make_store(tmp_path)
+    twenty = (datetime.now(timezone.utc) - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S")
+    narration = store.store("Assistant narration about a routine build", project="p",
+                            importance=0.4, tags=["origin:assistant"])["memory_id"]
+    fact = store.store("User stated that the cache is disabled forever", project="p",
+                       importance=0.6, tags=["origin:user"])["memory_id"]
+    store._execute("UPDATE memories SET created_at = ? WHERE id IN (?, ?)", (twenty, narration, fact))
+    store._commit()
+
+    result = store.retire_stale(days=45, narration_days=14)
+    assert result["archived"] == 1
+    assert status_of(store, narration) == "archived"
+    assert status_of(store, fact) == "active"
+
+    # The long window alone would have spared it.
+    assert store.retire_stale(days=45, narration_days=None)["archived"] == 0
+
+
+def test_narration_retirement_spares_what_recall_actually_served(tmp_path):
+    """A root-cause note is assistant-authored too, so age alone must not retire it.
+
+    The narration window needs both an age clock on created_at (last_accessed_at
+    is renewed by injection and would never age) and "never surfaced by recall"
+    (access_count == 0), or it would archive exactly the notes worth keeping.
+    """
+    store = make_store(tmp_path)
+    twenty = (datetime.now(timezone.utc) - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S")
+    never_surfaced = store.store("Assistant narration nobody ever recalled", project="p",
+                                 importance=0.4, tags=["origin:assistant"])["memory_id"]
+    served = store.store("Root cause survived because recall served it", project="p",
+                         importance=0.4, tags=["origin:assistant"])["memory_id"]
+    store._execute("UPDATE memories SET created_at = ? WHERE id IN (?, ?)",
+                   (twenty, never_surfaced, served))
+    store._execute("UPDATE memories SET access_count = 7, last_accessed_at = ? WHERE id = ?",
+                   (twenty, served))
+    store._commit()
+
+    result = store.retire_stale(days=45, narration_days=14)
+    assert result["archived"] == 1
+    assert status_of(store, never_surfaced) == "archived"
+    assert status_of(store, served) == "active"
+
+
+def test_retire_stale_enforces_a_size_budget(tmp_path):
+    """Age windows cannot bound growth, so there is also a ceiling."""
+    store = make_store(tmp_path)
+    ids = [store.store(f"Low value narration number {index} about a build",
+                       project="p", importance=0.4,
+                       tags=["origin:assistant"])["memory_id"] for index in range(5)]
+    kept_high = store.store("Critical convention the team depends on", project="p",
+                            importance=0.9)["memory_id"]
+    kept_user = store.store("User stated fact that must survive", project="p",
+                            importance=0.6, tags=["origin:user"])["memory_id"]
+
+    dry = store.retire_stale(max_active=4, dry_run=True)
+    assert len(dry["candidates"]) == 3
+    assert kept_high not in dry["candidates"]
+    assert kept_user not in dry["candidates"]
+
+    result = store.retire_stale(max_active=4)
+    assert result["archived"] == 3
+    active = store._execute("SELECT COUNT(*) FROM memories WHERE status = 'active'").fetchone()[0]
+    assert active == 4
+    assert status_of(store, kept_high) == "active"
+    assert status_of(store, kept_user) == "active"
