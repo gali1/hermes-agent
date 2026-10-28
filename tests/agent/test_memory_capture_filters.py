@@ -26,7 +26,6 @@ JUNK_USER = [
     "Hello! How can I help you today?",
     "Let me check the current store size before changing anything.",
     "Yes finish and make it automated using the algorithmic approach.",
-    "Ok, add the retention note to the skill and commit.",
     "Let me verify the final state of the settings after all changes.",
     "Now let me check it compiles, then build and deploy.",
 ]
@@ -49,6 +48,10 @@ SIGNAL_USER = [
     "I prefer using uv for Python environments and never pip install globally",
     "We decided to use SQLite for the local memory engine store",
     "The gateway runs on port 8080 behind the nginx proxy in production",
+    # Standing directives: "add/remove/delete" are no longer request verbs, so a
+    # policy change recorded as an instruction survives.
+    "Remove 50MB limit for telegram bot uploads/downloads",
+    "Delete backup and regenerate the backup once changes have been made",
     # Bug report, not a question: opens with "When" but is a claim about state.
     "When the user select vtcode_wsl and moves to the model list it only shows deepseek-v4-flash-free add the model",
 ]
@@ -141,22 +144,41 @@ def test_mine_turns_drops_requests_and_boilerplate():
     assert {m["memory_type"] for m in mined} == {"preference", "fact"}
 
 
-def test_announcement_needs_no_specifics():
-    """A completion verb alone is not enough; naming an artifact makes it a finding."""
-    assert looks_like_announcement("Delivered. message id 5188")
-    assert looks_like_announcement("All done — shipped.")
-    assert looks_like_announcement("Done.")
-    assert not looks_like_announcement(
-        "Verified. Only `settings.json` was changed — 19 `favorite_models` for the opencode provider."
-    )
-    assert not looks_like_announcement(
-        "Verified — settings.json has 5 available_models and clean bare-model names everywhere"
-    )
-    assert not looks_like_announcement("Fixed and verified the deploy, port 8080 answers again")
+DROPPED_ANNOUNCEMENTS = [
+    # Formula followed by a report about the delivery: ids, sizes, durations,
+    # destination, or "nothing pending". Density of detail is what a delivery
+    # report is made of, so detail cannot be the discriminator.
+    "Delivered. message id 5188",
+    "Delivered. The digest went out to both chats, message id 5188, 108 MB, 46.8s.",
+    "Delivered. Updated `~/.hermes/config.yaml` and restarted; message id 5188.",
+    "Fixed and verified. The two messages are in the group now.",
+    "Done. The report is in the channel.",
+    "All done — shipped.",
+    "Completed the run; nothing else pending.",
+    "Done.",
+]
 
-    kept = "Verified. Only `settings.json` was changed — 19 `favorite_models` for the opencode provider."
-    assert classify_candidate(kept, role="assistant") is not None
-    assert classify_candidate("Delivered. message id 5188", role="assistant") is None
+KEPT_ANNOUNCEMENTS = [
+    # "Verified." opens onto evidence, so it is not a completion formula at all.
+    "Verified. Only `settings.json` was changed — 19 `favorite_models` for the opencode provider.",
+    "Verified — `settings.json` has 5 `available_models`, 19 `favorite_models`, and clean bare-model names",
+    "Verified. The ACP session crash came from a Windows cwd sent by Zed overriding --cwd.",
+    # Formula plus a payload: a cause, a continued clause, a named state.
+    "Fixed and verified. Root cause was NODE_OPTIONS exported twice by an old bashrc line.",
+    "Done in a way that matters: `retire_stale` now writes a cold export before archiving.",
+    "Shipped the retention fix; rows archive with a cold_export path in metadata.",
+    "Done — and the log you pasted exposed a second, live attack.",
+    "Fixed and verified the deploy, port 8080 answers again",
+]
+
+
+def test_announcement_is_a_formula_without_payload():
+    for text in DROPPED_ANNOUNCEMENTS:
+        assert looks_like_announcement(text), text
+        assert classify_candidate(text, role="assistant") is None, text
+    for text in KEPT_ANNOUNCEMENTS:
+        assert not looks_like_announcement(text), text
+        assert classify_candidate(text, role="assistant") is not None, text
 
 
 def test_injected_wrappers_are_rejected():

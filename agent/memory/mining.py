@@ -217,10 +217,16 @@ _LEADING_INTERROGATIVE = re.compile(
 _LEADING_IMPERATIVE = re.compile(
     r"(?i)^\s*(?:let\s+me|list|show|display|print|dump|enumerate|count|give|tell|"
     r"fetch|search|find|check|run|rerun|re-?run|open|read|scan|inspect|"
-    r"explain|summari[sz]e|recap|remind|retry|continue|proceed|"
-    r"finish|add|remove|delete|make|enable|disable|commit|push|merge|revert|"
-    r"switch|change|fix|debug|install|deploy|upgrade|restart)\b"
+    r"explain|summari[sz]e|recap|remind|retry|continue|proceed|finish|"
+    r"fix|debug|install|deploy|upgrade|restart)\b"
 )
+
+# "add / remove / delete / make / enable / change" are deliberately absent from
+# the list above: as request verbs they also swallow standing directives that
+# encode a durable decision ("Remove 50MB limit for telegram bot uploads/downloads",
+# "Delete backup and regenerate the backup once changes have been made").
+# They are caught at the other end instead — an action narrated while it happens
+# opens with "Now", which is the shape the narration rule below handles.
 
 # Assistant status lines and canned failure text: re-derivable from the run that
 # produced them, and actively harmful in recall ("your request was not
@@ -278,7 +284,13 @@ _MAX_NARRATION_CHARS = 200
 _NARRATION_RE = re.compile(
     r"(?i)^\s*now\s+(?:adding|updating|writing|patching|editing|wiring|hooking|"
     r"extending|fixing|refactoring|rewriting|moving|tweaking|implementing|"
-    r"checking|running|reading|searching)\b"
+    r"checking|running|reading|searching"
+    # "Now <imperative>" is the same move narrated in the present tense; the
+    # request verbs that are too broad to ban outright (add/remove/delete) are
+    # safe here because "Now" pins them to an action in progress.
+    r"|add|remove|delete|rename|replace|insert|drop|update|edit|patch|wire|hook"
+    r"|extend|fix|refactor|rewrite|tweak|implement|check|run|read|search|verify"
+    r"|test|build|deploy|commit|push)\b"
 )
 
 
@@ -335,23 +347,39 @@ _TASK_BRIEF_RE = re.compile(
     r"(?i)^\s*(?:-{2,}\s*)?(?:\*\*)?#*\s*(?:task|mission|objective|assignment|goal)\s*:"
 )
 
-# Announcements are capped by length, but length alone is not the discriminator:
-# "Verified — `settings.json` has 5 `available_models` …" is 110 chars and is a
-# finding, while "Delivered. message id 5188" is junk with a number in it.  What
-# separates them is *specifics*: an announcement that names an artifact is
-# reporting state, so it is stored.
+# Announcements are completion *formulas*; the payload decides.  A formula with
+# nothing after it, or followed by a report about the delivery itself ("message
+# id 5188", "108 MB, 46.8s", "in the group", "nothing else pending"), is noise.
+# A formula followed by a cause or a continued clause is a finding wearing a
+# completion opener: "Fixed and verified. Root cause was NODE_OPTIONS…" and
+# "Done — and the log you pasted exposed a second, live attack" both say
+# something about the world.  Bare "verified" is deliberately NOT a completion
+# formula: "Verified." introduces evidence ("Verified. Only `settings.json` was
+# changed — 19 `favorite_models`…"), while "Fixed and verified." reports that
+# work finished.  That distinction is lexical, not statistical — delivery
+# reports are dense with ids, sizes and durations, so density cannot separate
+# them from findings; both are specific.
 MAX_ANNOUNCE_CHARS = 600
 _ANNOUNCE_RE = re.compile(
-    r"(?i)^\s*(?:\*\*)?\s*(?:delivered|fixed and verified|verified|done|stopped|stopping|"
+    r"(?i)^\s*(?:\*\*)?\s*(?:delivered|fixed and verified|done|stopped|stopping|"
     r"complete|completed|finished|all set|all done|ready|shipped|reverted|rolled back)\b"
 )
 
-_ANNOUNCE_SPECIFICS_RE = re.compile(
-    r"`[^`]+`"                                  # backticked identifier
-    r"|\b[\w./-]+\.(?:tsx?|jsx?|py|json|ya?ml|toml|md|db|sh|sql|rs|go|java)\b"
-    r"|\b[a-z][a-z0-9]*_[a-z0-9_]+\b"           # snake_case symbol
-    r"|\b[a-z]+[A-Z][A-Za-z0-9]+\b"             # camelCase symbol
+# Report about the delivery rather than about the world.
+_ANNOUNCE_REPORT_RE = re.compile(
+    r"(?i)\b(?:message[ _]?ids?|msg[ _]?ids?|chat[ _]?ids?|in the (?:channel|group|chat)|"
+    r"both chats?|nothing else pending|no further action|as requested)\b"
+    r"|\b\d+(?:\.\d+)?\s*(?:MB|KB|GB|ms)\b|\b\d+(?:\.\d+)?\s*s\b"
+)
+
+# The clause that turns a completion formula into a finding.
+_ANNOUNCE_PAYLOAD_RE = re.compile(
+    r"(?i)\b(?:because|since|so that|root cause|due to|came from|turned out|"
+    r"which (?:means|is why))\b"
+    r"|(?:[\u2014\u2013-]\s*and|,\s*and(?!\s*(?:nothing|no)\b)|,?\s*which\b|,\s*but\b)"
+    r"|;\s*(?!nothing\b|no\b)"
     r"|\bport\s+\d{2,5}\b"
+    r"|:"
 )
 
 
@@ -366,11 +394,12 @@ def looks_like_brief(text) -> bool:
 
 
 def looks_like_announcement(text) -> bool:
-    """True when `text` is a short completion/abort announcement.
+    """True when `text` is a completion formula with no finding behind it.
 
-    Names no artifact: "Verified — `settings.json` has 5 `available_models`"
-    is a state report about a named thing, so it is knowledge, not an
-    announcement, even at 110 characters.
+    The formula alone is not enough: "Verified. Only `settings.json` was
+    changed — 19 `favorite_models`…" is evidence, so it is knowledge. So is
+    "Fixed and verified. Root cause was NODE_OPTIONS…". Only a formula followed
+    by a delivery report, or by nothing, is noise.
     """
     if not isinstance(text, str) or not text.strip():
         return False
@@ -379,7 +408,9 @@ def looks_like_announcement(text) -> bool:
         return False
     if not _ANNOUNCE_RE.match(stripped):
         return False
-    return not _ANNOUNCE_SPECIFICS_RE.search(stripped)
+    if _ANNOUNCE_REPORT_RE.search(stripped):
+        return True
+    return not _ANNOUNCE_PAYLOAD_RE.search(stripped)
 
 
 # -- Drop telemetry ----------------------------------------------------------
