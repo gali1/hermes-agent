@@ -461,11 +461,21 @@ class EnhancedMemoryBackend:
     def _store_candidates(self, candidates: List[Dict[str, Any]], *,
                           session_id: str = "", skip_existing: bool = False) -> int:
         stored = 0
+        store = self._store
         for candidate in candidates or []:
             content = (candidate.get("content") or "").strip()
             if not content or is_secret(content):
                 continue
-            if skip_existing and self._store.has_content(content):
+            if store is None:
+                return stored
+            if skip_existing and store.has_content(content):
+                continue
+            # Archiving is a decision, not an accident. Session-end mining
+            # replays the whole conversation, so without this check the purge
+            # archives a row and the next session end inserts the same content
+            # as a fresh active row — forever. An explicit `memory` write still
+            # goes through the tool and is unaffected.
+            if store.content_status(content) == "archived":
                 continue
             role = str(candidate.get("role") or "").strip().lower()
             # Importance is the retention signal, not a relevance guess. The
@@ -474,7 +484,7 @@ class EnhancedMemoryBackend:
             # eligible once it goes unused. Nothing is deleted either way.
             importance = _ROLE_IMPORTANCE.get(role, _ROLE_IMPORTANCE["assistant"])
             tags = [f"origin:{role}"] if role in _ROLE_IMPORTANCE else []
-            result = self._store.store(
+            result = store.store(
                 content,
                 memory_type=candidate.get("memory_type") or "fact",
                 scope="global",

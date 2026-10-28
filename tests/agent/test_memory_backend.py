@@ -248,6 +248,31 @@ def test_session_end_purges_stored_junk(tmp_path):
     backend.shutdown()
 
 
+def test_archived_junk_is_not_resurrected(tmp_path):
+    """Session-end mining replays history; it must not un-archive a decision."""
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True})
+    backend.initialize("s1")
+    store = backend._store
+    assert store is not None
+    text = "All enhanced memory features working?"
+    mid = store.store(text, tags=["origin:user"])["memory_id"]
+
+    assert backend.purge_junk()["archived"] == 1
+    assert store.get(mid, track_access=False)["status"] == "archived"
+
+    # The same turn arrives again at session end, and per-turn capture sees it too.
+    backend.on_session_end([{"role": "user", "content": text}])
+    backend.observe_turn(text, "yes", session_id="s1")
+
+    assert store.get(mid, track_access=False)["status"] == "archived"
+    active = store._execute(
+        "SELECT COUNT(*) FROM memories WHERE status = 'active' AND content_hash = "
+        "(SELECT content_hash FROM memories WHERE id = ?)", (mid,),
+    ).fetchone()[0]
+    assert active == 0
+    backend.shutdown()
+
+
 def test_junk_purge_can_be_disabled(tmp_path):
     backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True, "junk_purge_enabled": False})
     backend.initialize("s1")

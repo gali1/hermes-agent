@@ -638,6 +638,27 @@ class MemoryStore:
             logger.debug("has_content check failed", exc_info=True)
             return False
 
+    def content_status(self, content: str) -> Optional[str]:
+        """Return the status of a memory holding this exact content, if any.
+
+        Auto-capture needs the difference between "not stored" and "stored, then
+        archived": purge and retention archive a row because it should not be in
+        recall, and re-mining the same conversation at session end must not
+        resurrect it as a new active row.  `store.store()` only dedupes against
+        active rows, so without this the sweep and the miner fight forever.
+        """
+        try:
+            chash = _content_hash((content or "").strip())
+            row = self._execute(
+                "SELECT status FROM memories WHERE content_hash = ? "
+                "ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END LIMIT 1",
+                (chash,),
+            ).fetchone()
+            return row["status"] if row else None
+        except Exception:
+            logger.debug("content_status check failed", exc_info=True)
+            return None
+
     def _detect_conflicts_locked(self, memory_id: str, content: str,
                                  project: Optional[str]) -> List[Dict[str, Any]]:
         try:
