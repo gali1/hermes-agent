@@ -18,6 +18,14 @@ Design constraints (see task spec TASK_1, parts III/V/IX/X):
   treated as UNKNOWN and merely penalised, per spec §9.2.
 * **Stable.** A marginally better score does not replace the current model;
   a switch needs ``stability_threshold`` of improvement or a hard constraint.
+* **One scoring path.** Every consumer — the per-turn hook, ``hermes model
+  routing explain`` and ``hermes model routing status --json`` — goes through
+  :func:`rank_candidates`.  A report can therefore never disagree with what a
+  turn would actually do for the same inputs.
+* **Shared config contract.** ``smart_model_routing.models`` is the canonical
+  candidate list (see :class:`ModelSpec`); the pre-contract flat
+  ``candidates`` string list is still read, deprecated, and translated into the
+  same specs.  Both shapes end up in the identical scoring path.
 * **Off by default.** ``smart_model_routing.enabled`` is ``False``.  Callers
   must consult :func:`is_enabled` before doing anything else, so an untouched
   install behaves exactly as it did before this module existed.
@@ -31,25 +39,39 @@ import os
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
+from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
     "CapabilityState",
+    "CandidateReport",
     "Complexity",
     "Decision",
     "ModelCandidate",
+    "ModelSpec",
     "RoutingConfig",
+    "SKIP_REASONS",
+    "SPEC_FIELDS",
+    "Selection",
     "TaskProfile",
+    "candidates_from_specs",
+    "charge_for",
     "classify_request",
     "configured_models",
+    "declared_model_list",
     "estimate_cost",
     "explain",
     "filter_eligible",
     "is_enabled",
+    "pricing_for",
+    "rank_candidates",
+    "resolve_candidates",
     "route_turn",
     "routing_pool",
+    "routing_report",
     "score_candidate",
     "select_model",
+    "specs_from_config",
     "widen_pool",
 ]
 
@@ -307,6 +329,189 @@ def _needs_tools(text: str, level: Complexity) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Declared model metadata (the shared ``smart_model_routing.models`` contract)
+# ---------------------------------------------------------------------------
+
+#: The metadata a ``smart_model_routing.models`` entry may declare.  Every
+#: field is an OVERRIDE over the models.dev catalog entry for the same model;
+#: ``None`` means "not declared", which is what makes a capability UNKNOWN
+#: rather than unsupported.
+SPEC_FIELDS = (
+    "name",
+    "provider",
+    "context_window",
+    "max_output",
+    "cost_in",
+    "cost_out",
+    "tier_rank",
+    "supports_tools",
+    "supports_vision",
+    "supports_audio",
+    "supports_structured",
+    "supports_text_output",
+    "deprecated",
+)
+
+_BOOL_SPEC_FIELDS = (
+    "supports_tools",
+    "supports_vision",
+    "supports_audio",
+    "supports_structured",
+    "supports_text_output",
+    "deprecated",
+)
+_INT_SPEC_FIELDS = ("context_window", "max_output", "tier_rank")
+_COST_SPEC_FIELDS = ("cost_in", "cost_out")
+
+
+def _as_bool(value: Any) -> Optional[bool]:
+    """Coerce a declared flag; anything unparseable is "not declared"."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _as_positive_int(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _as_rate(value: Any) -> Optional[float]:
+    """A USD-per-million price.  Zero/negative is treated as "unpriced" so an
+    unpriced model can never look free (it is charged the median instead)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _as_tier(value: Any) -> Optional[int]:
+    """A capability tier rank.  Accepts an int or a tier name."""
+    if isinstance(value, str):
+        named = {"simple": 1, "routine": 2, "moderate": 3, "complex": 3, "advanced": 4}
+        text = value.strip().lower()
+        if text in named:
+            return named[text]
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 1 <= number <= 4 else None
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """One ``smart_model_routing.models`` entry: declared metadata overrides.
+
+    ``name`` is the model id (may be ``"provider/model"`` when the entry does
+    not repeat the provider).  Everything else is optional: an undeclared field
+    stays whatever models.dev says, and stays UNKNOWN when the catalog has no
+    entry — never "unsupported".
+    """
+
+    name: str
+    provider: Optional[str] = None
+    context_window: Optional[int] = None
+    max_output: Optional[int] = None
+    cost_in: Optional[float] = None
+    cost_out: Optional[float] = None
+    tier_rank: Optional[int] = None
+    supports_tools: Optional[bool] = None
+    supports_vision: Optional[bool] = None
+    supports_audio: Optional[bool] = None
+    supports_structured: Optional[bool] = None
+    supports_text_output: Optional[bool] = None
+    deprecated: Optional[bool] = None
+
+    @classmethod
+    def from_entry(cls, entry: Any) -> Optional["ModelSpec"]:
+        """Parse one entry; ``None`` when it names no model."""
+        if isinstance(entry, str):
+            name = entry.strip()
+            return cls(name=name) if name else None
+        if not isinstance(entry, dict):
+            return None
+        name = str(entry.get("name") or entry.get("model") or entry.get("id") or "").strip()
+        if not name:
+            return None
+        kwargs: Dict[str, Any] = {"name": name}
+
+        provider = entry.get("provider")
+        if isinstance(provider, str) and provider.strip():
+            kwargs["provider"] = provider.strip()
+
+        for key in _INT_SPEC_FIELDS:
+            if key in entry:
+                parsed = _as_positive_int(entry.get(key))
+                if parsed is not None:
+                    kwargs[key] = parsed
+        if "tier_rank" in entry:
+            tier = _as_tier(entry.get("tier_rank"))
+            if tier is not None:
+                kwargs["tier_rank"] = tier
+        for key in _COST_SPEC_FIELDS:
+            if key in entry:
+                rate = _as_rate(entry.get(key))
+                if rate is not None:
+                    kwargs[key] = rate
+        for key in _BOOL_SPEC_FIELDS:
+            if key in entry:
+                flag = _as_bool(entry.get(key))
+                if flag is not None:
+                    kwargs[key] = flag
+        return cls(**kwargs)
+
+    def describe(self) -> str:
+        return self.name
+
+
+def specs_from_config(config: Any) -> Tuple[List[ModelSpec], str]:
+    """The declared candidate specs and where they came from.
+
+    ``smart_model_routing.models`` is canonical.  The pre-contract flat
+    ``smart_model_routing.candidates`` list is still honoured — deprecated, and
+    only when ``models`` is absent — by translating each ``model`` /
+    ``provider/model`` string into the same :class:`ModelSpec` the canonical key
+    produces, so both shapes share one scoring path.
+
+    Returns ``([], "")`` when neither key is usable; callers then fall back to
+    the provider's configured model list.
+    """
+    if not isinstance(config, dict):
+        return [], ""
+    section = config.get("smart_model_routing")
+    if not isinstance(section, dict):
+        return [], ""
+
+    declared = section.get("models")
+    if isinstance(declared, (list, tuple)):
+        specs = [spec for spec in (ModelSpec.from_entry(e) for e in declared) if spec]
+        if specs:
+            return specs, "models"
+
+    legacy = section.get("candidates")
+    if isinstance(legacy, (list, tuple)):
+        specs = [spec for spec in (ModelSpec.from_entry(e) for e in legacy) if spec]
+        if specs:
+            return specs, "candidates"
+
+    return [], ""
+
+
+# ---------------------------------------------------------------------------
 # Candidates
 # ---------------------------------------------------------------------------
 
@@ -316,7 +521,9 @@ class ModelCandidate:
 
     ``info`` may be ``None`` when models.dev has no entry (a local/custom
     model, or an offline catalog miss).  ``tool_support`` lets a caller pass a
-    runtime-verified answer that overrides catalog metadata.
+    runtime-verified answer that overrides catalog metadata.  ``spec`` carries
+    the operator's declared overrides and wins over both — see
+    :class:`ModelSpec`.
     """
 
     provider: str
@@ -329,6 +536,9 @@ class ModelCandidate:
     latency_ms: Optional[float] = None
     #: Optional historical success rate 0..1; None means unknown.
     reliability: Optional[float] = None
+    #: Declared overrides from ``smart_model_routing.models[]`` (or its
+    #: translated legacy equivalent).  ``None`` fields are "not declared".
+    spec: Optional["ModelSpec"] = None
 
     @property
     def key(self) -> str:
@@ -339,9 +549,21 @@ class ModelCandidate:
         mods = getattr(self.info, attr, ()) if self.info is not None else ()
         return tuple(mods or ())
 
+    def _declared(self, name: str) -> Optional[bool]:
+        if self.spec is None:
+            return None
+        return getattr(self.spec, name, None)
+
     def supports_input(self, modality: str) -> CapabilityState:
         if modality == "text":
             return CapabilityState.SUPPORTED
+        declared = None
+        if modality == "image":
+            declared = self._declared("supports_vision")
+        elif modality == "audio":
+            declared = self._declared("supports_audio")
+        if declared is not None:
+            return CapabilityState.SUPPORTED if declared else CapabilityState.UNSUPPORTED
         if self.info is None:
             return CapabilityState.UNKNOWN
         mods = self._mods("input_modalities")
@@ -356,7 +578,9 @@ class ModelCandidate:
 
     def supports_output(self, modality: str) -> CapabilityState:
         if modality == "text":
-            return CapabilityState.SUPPORTED
+            declared_text = self._declared("supports_text_output")
+            if declared_text is not None:
+                return CapabilityState.SUPPORTED if declared_text else CapabilityState.UNSUPPORTED
         if self.info is None:
             return CapabilityState.UNKNOWN
         mods = self._mods("output_modalities")
@@ -365,6 +589,9 @@ class ModelCandidate:
         return CapabilityState.SUPPORTED if modality in mods else CapabilityState.UNSUPPORTED
 
     def supports_tools(self) -> CapabilityState:
+        declared = self._declared("supports_tools")
+        if declared is not None:
+            return CapabilityState.SUPPORTED if declared else CapabilityState.UNSUPPORTED
         if self.tool_support is not None:
             return self.tool_support
         if self.info is None:
@@ -373,30 +600,63 @@ class ModelCandidate:
         # False here means "not confirmed", never "confirmed unsupported".
         return CapabilityState.SUPPORTED if getattr(self.info, "tool_call", False) else CapabilityState.UNKNOWN
 
+    def supports_structured_output(self) -> CapabilityState:
+        declared = self._declared("supports_structured")
+        if declared is not None:
+            return CapabilityState.SUPPORTED if declared else CapabilityState.UNSUPPORTED
+        if self.info is None:
+            return CapabilityState.UNKNOWN
+        # Same reasoning as ``tool_call``: an absent flag is not a refusal.
+        return (
+            CapabilityState.SUPPORTED
+            if getattr(self.info, "structured_output", False)
+            else CapabilityState.UNKNOWN
+        )
+
     def supports_reasoning(self) -> CapabilityState:
         if self.info is None:
             return CapabilityState.UNKNOWN
         return CapabilityState.SUPPORTED if getattr(self.info, "reasoning", False) else CapabilityState.UNKNOWN
 
     def context_window(self) -> Optional[int]:
+        if self.spec is not None and self.spec.context_window:
+            return int(self.spec.context_window)
         ctx = getattr(self.info, "context_window", 0) if self.info is not None else 0
         return int(ctx) if ctx and ctx > 0 else None
 
     def max_output(self) -> Optional[int]:
+        if self.spec is not None and self.spec.max_output:
+            return int(self.spec.max_output)
         out = getattr(self.info, "max_output", 0) if self.info is not None else 0
         return int(out) if out and out > 0 else None
 
     def is_deprecated(self) -> bool:
+        declared = self._declared("deprecated")
+        if declared is not None:
+            return bool(declared)
         return str(getattr(self.info, "status", "") or "").lower() == "deprecated"
 
+    def tier_rank(self) -> Optional[int]:
+        """Declared capability tier (1..4), or ``None`` when undeclared."""
+        if self.spec is not None and self.spec.tier_rank:
+            return int(self.spec.tier_rank)
+        return None
+
     def costs(self) -> Tuple[Optional[float], Optional[float]]:
-        if self.info is None:
-            return None, None
-        ci = getattr(self.info, "cost_input", 0) or 0
-        co = getattr(self.info, "cost_output", 0) or 0
+        """Declared-or-catalog ``(cost_in, cost_out)``; ``None`` when unpriced."""
+        ci = co = None
+        if self.spec is not None:
+            ci, co = self.spec.cost_in, self.spec.cost_out
+        if ci is None and co is None:
+            if self.info is None:
+                return None, None
+            ci = getattr(self.info, "cost_input", 0) or 0
+            co = getattr(self.info, "cost_output", 0) or 0
+        ci = float(ci) if ci and ci > 0 else 0.0
+        co = float(co) if co and co > 0 else 0.0
         if ci <= 0 and co <= 0:
             return None, None
-        return float(ci), float(co)
+        return ci, co
 
 
 # ---------------------------------------------------------------------------
@@ -414,24 +674,38 @@ _DEFAULT_WEIGHTS = {
 
 @dataclass
 class RoutingConfig:
-    """Resolved ``smart_model_routing`` settings with safe defaults."""
+    """Resolved ``smart_model_routing`` settings with safe defaults.
+
+    The keys shared with the sibling tree's contract are ``enabled``,
+    ``strategy``, ``stability_threshold`` (alias ``min_improvement``),
+    ``allow_unknown_metadata``, ``cost_optimization`` and
+    ``preferred_models_only``.  ``switch_on_cost``, ``llm_assisted_classification``,
+    ``weights``, ``reliability`` and ``exclude`` are local extensions that only
+    ever make selection *more* conservative.
+    """
 
     enabled: bool = False
     strategy: str = "automatic"  # automatic | cost | quality
     preferred_models_only: bool = True
     cost_optimization: bool = True
-    stability_threshold: float = 0.08
+    #: A rival must beat the incumbent by MORE than this to take the turn
+    #: (ties and borderline wins keep the current model).
+    stability_threshold: float = 0.15
     #: Allow a mid-session switch to a *cheaper* model.  Off by default: a
     #: model change invalidates the provider's prompt cache, so a downgrade
     #: must be an explicit choice, not an automatic one.
     switch_on_cost: bool = False
     allow_unknown_metadata: bool = True
     llm_assisted_classification: bool = False
-    weights: Dict[str, float] = field(default_factory=lambda: dict(_DEFAULT_WEIGHTS))
+    weights: Dict[str, float] = field(default_factory=dict)
     #: model key ("provider/model") or bare model -> 0..1 success rate.
     reliability: Dict[str, float] = field(default_factory=dict)
     #: models the operator never wants auto-selected (still usable manually).
     exclude: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # A fresh dict per instance: the module-level default is shared state.
+        self.weights = dict(_DEFAULT_WEIGHTS) if not self.weights else dict(self.weights)
 
     @classmethod
     def from_dict(cls, raw: Any) -> "RoutingConfig":
@@ -443,8 +717,11 @@ class RoutingConfig:
         cfg.strategy = strategy if strategy in ("automatic", "cost", "quality") else "automatic"
         cfg.preferred_models_only = bool(raw.get("preferred_models_only", cfg.preferred_models_only))
         cfg.cost_optimization = bool(raw.get("cost_optimization", cfg.cost_optimization))
+        # ``stability_threshold`` is canonical; ``min_improvement`` is the
+        # sibling tree's alias for the same knob.
+        threshold = raw.get("stability_threshold", raw.get("min_improvement", cfg.stability_threshold))
         try:
-            cfg.stability_threshold = max(0.0, float(raw.get("stability_threshold", cfg.stability_threshold)))
+            cfg.stability_threshold = max(0.0, float(threshold))
         except (TypeError, ValueError):
             pass
         cfg.allow_unknown_metadata = bool(raw.get("allow_unknown_metadata", cfg.allow_unknown_metadata))
@@ -473,6 +750,16 @@ class RoutingConfig:
             cfg.exclude = tuple(str(x) for x in excl if str(x).strip())
         return cfg
 
+    def settings(self) -> Dict[str, Any]:
+        """The settings block of the shared JSON report (exact key set)."""
+        return {
+            "strategy": self.strategy,
+            "stability_threshold": self.stability_threshold,
+            "allow_unknown_metadata": self.allow_unknown_metadata,
+            "cost_optimization": self.cost_optimization,
+            "preferred_models_only": self.preferred_models_only,
+        }
+
 
 def is_enabled(config: Any) -> bool:
     """True when dynamic selection is switched on.
@@ -493,12 +780,123 @@ def is_enabled(config: Any) -> bool:
 # Eligibility
 # ---------------------------------------------------------------------------
 
-def _excluded(candidate: ModelCandidate, cfg: RoutingConfig) -> bool:
+#: Request tiers at or above this rank demand a tiered model: a candidate that
+#: DECLARES a lower ``tier_rank`` is ineligible rather than merely penalised.
+#: An undeclared tier is unknown metadata (penalised, never a refusal), which
+#: is what keeps an untouched config behaving exactly as before.
+_TIER_FLOOR = int(Complexity.COMPLEX)
+
+#: Flat score cost of one required capability whose metadata is unknown.
+_UNKNOWN_CAPABILITY_PENALTY = 0.15
+
+
+def required_capabilities(profile: TaskProfile) -> Tuple[str, ...]:
+    """Capabilities the request cannot do without, in a stable order.
+
+    Text output is required by every request but listed last, so an exclusion
+    reason names the most specific gap first.
+    """
+    caps: List[str] = []
+    if profile.needs_reasoning:
+        caps.append("reasoning")
+    if profile.needs_tools:
+        caps.append("tools")
+    for modality in profile.input_modalities:
+        if modality == "text" or not modality:
+            continue
+        if modality == "image":
+            caps.append("vision")
+        elif modality == "audio":
+            caps.append("audio")
+        else:
+            caps.append(f"input_{modality}")
+    for modality in profile.output_modalities:
+        if modality == "text" or not modality:
+            continue
+        caps.append(f"output_{modality}")
+    if profile.needs_structured_output:
+        caps.append("structured")
+    caps.append("text_output")
+    return tuple(caps)
+
+
+def capability_state(candidate: ModelCandidate, capability: str) -> CapabilityState:
+    """Tri-state answer for one required capability (spec §9.2)."""
+    if capability == "text_output":
+        return candidate.supports_output("text")
+    if capability == "reasoning":
+        return candidate.supports_reasoning()
+    if capability == "tools":
+        return candidate.supports_tools()
+    if capability == "vision":
+        return candidate.supports_input("image")
+    if capability == "audio":
+        return candidate.supports_input("audio")
+    if capability == "structured":
+        return candidate.supports_structured_output()
+    if capability.startswith("input_"):
+        return candidate.supports_input(capability[len("input_"):])
+    if capability.startswith("output_"):
+        return candidate.supports_output(capability[len("output_"):])
+    return CapabilityState.UNKNOWN
+
+
+def unknown_required_capabilities(
+    candidate: ModelCandidate, profile: TaskProfile
+) -> Tuple[str, ...]:
+    """Required capabilities this candidate's metadata does not answer."""
+    return tuple(
+        cap
+        for cap in required_capabilities(profile)
+        if capability_state(candidate, cap) is CapabilityState.UNKNOWN
+    )
+
+
+def _exclusion_reason(
+    candidate: ModelCandidate, profile: TaskProfile, cfg: RoutingConfig
+) -> str:
+    """Why ``candidate`` cannot serve this request (``""`` when it can).
+
+    Hard constraints only: an ineligible model never wins on price, and the
+    reason is reported verbatim in the CLI's ``candidates[].excluded_reason``.
+    """
     if not candidate.enabled:
-        return True
+        return "not_enabled"
     if candidate.key in cfg.exclude or candidate.model in cfg.exclude:
-        return True
-    return candidate.is_deprecated()
+        return "excluded"
+    if candidate.is_deprecated():
+        return "deprecated"
+
+    # A pinned model wins over every other constraint except existence: the
+    # user's explicit choice is authoritative (spec §10).
+    if profile.pinned_model and candidate.model == profile.pinned_model:
+        return ""
+
+    # Context window: unknown is allowed (penalised later), too small is not.
+    ctx = candidate.context_window()
+    if ctx is not None and profile.required_context > ctx:
+        return "context_window_too_small"
+
+    # Output cap: a model that cannot emit the expected answer will truncate.
+    cap = candidate.max_output()
+    if cap is not None and profile.est_output_tokens > cap:
+        return "max_output_too_small"
+
+    # Tier floor: for complex/advanced requests a declared below-tier model is
+    # ineligible, not merely expensive-looking.
+    tier = candidate.tier_rank()
+    if tier is not None and int(profile.complexity) >= _TIER_FLOOR and tier < int(profile.complexity):
+        return "below_tier"
+
+    # Capability requirements: unsupported disqualifies always; unknown
+    # disqualifies only in strict mode (``allow_unknown_metadata: false``).
+    for capability in required_capabilities(profile):
+        state = capability_state(candidate, capability)
+        if state is CapabilityState.UNSUPPORTED:
+            return f"unsupported_{capability}"
+        if state is CapabilityState.UNKNOWN and not cfg.allow_unknown_metadata:
+            return f"unknown_{capability}"
+    return ""
 
 
 def filter_eligible(
@@ -508,74 +906,28 @@ def filter_eligible(
 ) -> List[ModelCandidate]:
     """Apply hard constraints; only survivors may be ranked (spec §15)."""
     cfg = config or RoutingConfig()
-    out: List[ModelCandidate] = []
-    for cand in candidates:
-        if _excluded(cand, cfg):
-            continue
-
-        # A pinned model wins over every other constraint except existence:
-        # the user's explicit choice is authoritative (spec §10).
-        if profile.pinned_model and cand.model == profile.pinned_model:
-            out.append(cand)
-            continue
-
-        # Context window: unknown is allowed (penalised later), too small is not.
-        ctx = cand.context_window()
-        if ctx is not None and profile.required_context > ctx:
-            continue
-
-        # Output cap: a model that cannot emit the expected answer will truncate.
-        cap = cand.max_output()
-        if cap is not None and profile.est_output_tokens > cap:
-            continue
-
-        # Input modalities.
-        ok = True
-        for mod in profile.input_modalities:
-            state = cand.supports_input(mod)
-            if state is CapabilityState.UNSUPPORTED:
-                ok = False
-                break
-            if state is CapabilityState.UNKNOWN and not cfg.allow_unknown_metadata:
-                ok = False
-                break
-        if not ok:
-            continue
-
-        # Output modalities.
-        for mod in profile.output_modalities:
-            state = cand.supports_output(mod)
-            if state is CapabilityState.UNSUPPORTED:
-                ok = False
-                break
-            if state is CapabilityState.UNKNOWN and not cfg.allow_unknown_metadata:
-                ok = False
-                break
-        if not ok:
-            continue
-
-        # Tools: only a *confirmed* lack disqualifies.
-        if profile.needs_tools and cand.supports_tools() is CapabilityState.UNSUPPORTED:
-            continue
-
-        if profile.needs_structured_output and cand.info is not None:
-            if getattr(cand.info, "structured_output", False) is False and getattr(
-                cand.info, "input_modalities", ()
-            ) and not cfg.allow_unknown_metadata:
-                # Only a hard exclusion in strict mode; otherwise penalised.
-                continue
-
-        out.append(cand)
-    return out
+    return [c for c in candidates if not _exclusion_reason(c, profile, cfg)]
 
 
 # ---------------------------------------------------------------------------
 # Cost + scoring
 # ---------------------------------------------------------------------------
 
-def estimate_cost(candidate: ModelCandidate, profile: TaskProfile) -> Optional[float]:
-    """Expected USD cost for this request; ``None`` when pricing is unknown."""
-    ci, co = candidate.costs()
+def estimate_cost(
+    candidate: ModelCandidate,
+    profile: TaskProfile,
+    *,
+    charge: Optional[Tuple[Optional[float], Optional[float]]] = None,
+) -> Optional[float]:
+    """Expected USD cost for this request; ``None`` when pricing is unknown.
+
+    ``charge`` overrides the candidate's own prices — the selection path passes
+    the pool median there so an unpriced model is never treated as free.
+    """
+    if charge is not None:
+        ci, co = charge
+    else:
+        ci, co = candidate.costs()
     if ci is None and co is None:
         return None
     ci = ci or 0.0
@@ -583,6 +935,66 @@ def estimate_cost(candidate: ModelCandidate, profile: TaskProfile) -> Optional[f
     return (profile.est_input_tokens / 1_000_000.0) * ci + (
         profile.est_output_tokens / 1_000_000.0
     ) * co
+
+
+def _median_pair(candidates: Sequence[ModelCandidate]) -> Optional[Tuple[float, float]]:
+    """Median known ``(cost_in, cost_out)`` across ``candidates``.
+
+    Computed per rate so a pool that prices input but not output still yields a
+    usable charge.  ``None`` when nothing in the pool is priced at all.
+    """
+    ins: List[float] = []
+    outs: List[float] = []
+    for cand in candidates:
+        ci, co = cand.costs()
+        if ci is not None:
+            ins.append(float(ci))
+        if co is not None:
+            outs.append(float(co))
+    if not ins and not outs:
+        return None
+    return (median(ins) if ins else 0.0, median(outs) if outs else 0.0)
+
+
+def charge_for(
+    candidate: ModelCandidate, median_pair: Optional[Tuple[float, float]]
+) -> Optional[Tuple[float, float]]:
+    """The prices a candidate is charged at: its own, else the pool median."""
+    ci, co = candidate.costs()
+    if ci is not None or co is not None:
+        return (ci or 0.0, co or 0.0)
+    return median_pair
+
+
+def pricing_for(
+    profile: TaskProfile,
+    candidates: Sequence[ModelCandidate],
+    *,
+    median_pair: Optional[Tuple[float, float]] = None,
+) -> Dict[str, Any]:
+    """The ``pricing`` block of the shared report.
+
+    ``median_fallback`` is the pair charged to unpriced models (never zero);
+    ``cheapest_eligible`` is the estimated cost of the cheapest eligible
+    candidate at its charged price.  ``median_pair`` lets the caller supply the
+    same pair the scoring path used, so the report cannot describe a different
+    charge than the one that decided the turn.
+    """
+    if median_pair is None:
+        median_pair = _median_pair(candidates)
+    costs = [
+        estimate_cost(c, profile, charge=charge_for(c, median_pair)) for c in candidates
+    ]
+    known = [c for c in costs if c is not None]
+    return {
+        "cheapest_eligible": round(min(known), 9) if known else None,
+        "median_fallback": (
+            {"cost_in": median_pair[0], "cost_out": median_pair[1]}
+            if median_pair is not None
+            else None
+        ),
+        "policy": "unpriced_models_charged_the_median_known_price",
+    }
 
 
 def _reliability_of(candidate: ModelCandidate, cfg: RoutingConfig) -> Optional[float]:
@@ -595,30 +1007,22 @@ def _reliability_of(candidate: ModelCandidate, cfg: RoutingConfig) -> Optional[f
 
 
 def _capability_fit(candidate: ModelCandidate, profile: TaskProfile) -> float:
-    """0..1 — can this model do the job, and is it the right *size* of model?"""
+    """0..1.25 — can this model do the job, and is it the right *size* model?"""
     fit = 1.0
 
     # Reasoning: needed for complex work, wasted (not harmful) on simple work.
     if profile.needs_reasoning:
-        state = candidate.supports_reasoning()
-        if state is CapabilityState.SUPPORTED:
+        if candidate.supports_reasoning() is CapabilityState.SUPPORTED:
             fit += 0.10
-        elif state is CapabilityState.UNKNOWN:
-            fit -= 0.15
     else:
         # Prefer non-reasoning models for simple asks: reasoning tokens are
         # billed as output and add latency with no quality benefit.
         if candidate.supports_reasoning() is CapabilityState.SUPPORTED and profile.complexity <= Complexity.ROUTINE:
             fit -= 0.05
 
-    if profile.needs_tools:
-        state = candidate.supports_tools()
-        if state is CapabilityState.UNKNOWN:
-            fit -= 0.20
-
-    if profile.needs_structured_output and candidate.info is not None:
-        if not getattr(candidate.info, "structured_output", False):
-            fit -= 0.10
+    # Unknown capability metadata is penalised FLAT per required capability
+    # (never treated as a refusal): 0.15 each, per the shared contract.
+    fit -= _UNKNOWN_CAPABILITY_PENALTY * len(unknown_required_capabilities(candidate, profile))
 
     # Modality breadth beyond what was asked for is not a virtue; modality
     # gaps that survived eligibility are UNKNOWN and already penalised.
@@ -643,21 +1047,23 @@ def score_candidate(
     *,
     current_model: str = "",
     cost_ceiling: Optional[float] = None,
+    charge: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> float:
     """Weighted score in roughly 0..1.2 (higher is better).
 
     Mandatory constraints are applied by :func:`filter_eligible`; this is the
-    ranking step only.  Cost is expressed relative to ``cost_ceiling`` (the
-    most expensive eligible candidate) so the term is stable across requests.
+    ranking step only.  Cost uses ``charge`` (own prices, else the pool median)
+    and is expressed relative to ``cost_ceiling`` (the most expensive eligible
+    candidate) so the term is stable across requests.
     """
     cfg = config or RoutingConfig()
     w = cfg.weights
 
     capability = _capability_fit(candidate, profile)
 
-    cost = estimate_cost(candidate, profile)
+    cost = estimate_cost(candidate, profile, charge=charge)
     if cost is None:
-        cost_score = 0.35  # unknown pricing: conservative, never a free lunch
+        cost_score = 0.35  # no price anywhere: conservative, never a free lunch
     elif not cfg.cost_optimization:
         cost_score = 1.0
     else:
@@ -689,8 +1095,20 @@ def score_candidate(
 
 
 # ---------------------------------------------------------------------------
-# Selection
+# Selection — ONE ranking path for the turn hook, `explain` and `status --json`
 # ---------------------------------------------------------------------------
+
+#: Every ``skip_reason`` value the shared contract allows (``""`` = a switch).
+SKIP_REASONS = (
+    "",
+    "disabled",
+    "no_candidates",
+    "no_eligible_model",
+    "already_current",
+    "within_stability_threshold",
+    "error",
+)
+
 
 @dataclass
 class Decision:
@@ -706,10 +1124,331 @@ class Decision:
     eligible_count: int = 0
     considered: List[Tuple[str, float]] = field(default_factory=list)
     pinned: bool = False
+    skip_reason: str = ""
+    kept_current: bool = False
 
     @property
     def key(self) -> str:
         return f"{self.provider}/{self.model}" if self.provider else self.model
+
+
+@dataclass
+class CandidateReport:
+    """One row of the shared report's ``candidates[]`` array."""
+
+    model: str
+    provider: str
+    eligible: bool
+    score: Optional[float]
+    tier: str
+    cost_in: Optional[float]
+    cost_out: Optional[float]
+    priced: bool
+    charged_as: str
+    unknown_capabilities: Tuple[str, ...]
+    excluded_reason: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "provider": self.provider,
+            "eligible": self.eligible,
+            "score": self.score,
+            "tier": self.tier,
+            "cost_in": self.cost_in,
+            "cost_out": self.cost_out,
+            "priced": self.priced,
+            "charged_as": self.charged_as,
+            "unknown_capabilities": list(self.unknown_capabilities),
+            "excluded_reason": self.excluded_reason,
+        }
+
+
+@dataclass
+class Selection:
+    """A complete selection pass: the choice plus every input to it."""
+
+    profile: TaskProfile
+    records: List[CandidateReport] = field(default_factory=list)
+    eligible_count: int = 0
+    best_key: str = ""
+    model: str = ""
+    provider: str = ""
+    score: float = 0.0
+    est_cost: Optional[float] = None
+    reason: str = ""
+    skip_reason: str = ""
+    kept_current: bool = False
+    current: str = ""
+    pinned: bool = False
+    considered: List[Tuple[str, float]] = field(default_factory=list)
+    pricing: Dict[str, Any] = field(default_factory=dict)
+
+    def decision(self) -> Optional[Decision]:
+        """The :class:`Decision` for this pass (``None`` when nothing was chosen)."""
+        if not self.model:
+            return None
+        return Decision(
+            model=self.model,
+            provider=self.provider,
+            score=round(self.score, 4),
+            est_cost=self.est_cost,
+            reason=self.reason,
+            switched=bool(self.current) and self.model != self.current,
+            complexity=self.profile.complexity.label,
+            eligible_count=self.eligible_count,
+            considered=list(self.considered),
+            pinned=self.pinned,
+            skip_reason=self.skip_reason,
+            kept_current=self.kept_current,
+        )
+
+
+def _capability_gap(
+    incumbent: ModelCandidate, best: ModelCandidate, profile: TaskProfile
+) -> bool:
+    """True when ``best`` closes a capability gap the incumbent has.
+
+    A gap is a hard reason to change models mid-session; a marginal score win
+    is not (spec §16.2).
+    """
+    if (
+        profile.needs_reasoning
+        and incumbent.supports_reasoning() is not CapabilityState.SUPPORTED
+        and best.supports_reasoning() is CapabilityState.SUPPORTED
+    ):
+        return True
+    return bool(
+        profile.needs_tools
+        and incumbent.supports_tools() is CapabilityState.UNSUPPORTED
+        and best.supports_tools() is CapabilityState.SUPPORTED
+    )
+
+
+def _tier_label(candidate: ModelCandidate) -> str:
+    tier = candidate.tier_rank()
+    if tier is None:
+        return "unknown"
+    for level in Complexity:
+        if int(level) == tier:
+            return level.label
+    return str(tier)
+
+
+def rank_candidates(
+    profile: TaskProfile,
+    candidates: Sequence[ModelCandidate],
+    config: Optional[RoutingConfig] = None,
+    *,
+    current_model: str = "",
+    mid_session: bool = False,
+) -> Selection:
+    """Rank ``candidates`` for ``profile`` and pick one.  THE scoring path.
+
+    Order of business, matching the shared contract:
+
+    1. eligibility before ranking (an ineligible model never wins on price);
+    2. one score per eligible model, priced by the pool median when a model
+       carries no price of its own;
+    3. hysteresis — the incumbent is kept unless it is ineligible or a rival
+       beats it by MORE than ``stability_threshold``;
+    4. ``mid_session`` additionally keeps an eligible incumbent that merely
+       scores higher (a switch would drop the provider's prompt cache).
+
+    The turn hook, ``preview_decision`` and the CLI report all call this
+    function, so a report can never disagree with behaviour for the same
+    inputs.
+    """
+    cfg = config or RoutingConfig()
+    current = str(current_model or "").strip()
+    selection = Selection(profile=profile, current=current)
+    candidates = list(candidates or [])
+
+    # ---- pinned model -----------------------------------------------------
+    if profile.pinned_model:
+        pinned = [c for c in candidates if c.model == profile.pinned_model and c.enabled]
+        if pinned:
+            cand = pinned[0]
+            selection.model, selection.provider = cand.model, cand.provider
+            selection.score, selection.pinned = 1.0, True
+            selection.est_cost = estimate_cost(cand, profile)
+            selection.reason = "user pinned model"
+            selection.eligible_count = 1
+            selection.considered = [(cand.key, 1.0)]
+            selection.best_key = cand.key
+            selection.records = [
+                _record(
+                    c, profile, cfg, None,
+                    1.0 if c is cand else None,
+                    _exclusion_reason(c, profile, cfg),
+                )
+                for c in candidates
+            ]
+            return selection
+        # Pinned but unknown: say so rather than silently choosing another.
+        selection.reason = f"pinned model {profile.pinned_model!r} is not an enabled candidate"
+        selection.skip_reason = "no_eligible_model"
+        selection.records = [
+            _record(c, profile, cfg, None, None, _exclusion_reason(c, profile, cfg))
+            for c in candidates
+        ]
+        return selection
+
+    if not candidates:
+        selection.reason = "no candidate models configured"
+        selection.skip_reason = "no_candidates"
+        selection.pricing = pricing_for(profile, [])
+        return selection
+
+    # ---- eligibility ------------------------------------------------------
+    eligible = filter_eligible(candidates, profile, cfg)
+    selection.eligible_count = len(eligible)
+    median_pair = _median_pair(eligible) or _median_pair(candidates)
+    selection.pricing = pricing_for(profile, eligible, median_pair=median_pair)
+
+    if not eligible:
+        selection.reason = (
+            "no eligible model: every candidate failed a hard constraint "
+            "(context, modality, tools, tier, or deprecation)"
+        )
+        selection.skip_reason = "no_eligible_model"
+        selection.records = [
+            _record(c, profile, cfg, median_pair, None, _exclusion_reason(c, profile, cfg))
+            for c in candidates
+        ]
+        return selection
+
+    costs = [
+        cost
+        for cost in (
+            estimate_cost(c, profile, charge=charge_for(c, median_pair)) for c in eligible
+        )
+        if cost is not None
+    ]
+    ceiling = max(costs) if len(costs) > 1 else None
+
+    scored = [
+        (
+            cand,
+            score_candidate(
+                cand, profile, cfg,
+                current_model=current,
+                cost_ceiling=ceiling,
+                charge=charge_for(cand, median_pair),
+            ),
+        )
+        for cand in eligible
+    ]
+    scored.sort(key=lambda item: (-item[1], item[0].key))
+
+    best, best_score = scored[0]
+    selection.best_key = best.key
+    selection.considered = [(c.key, round(s, 4)) for c, s in scored[:5]]
+
+    by_key = {(c.provider, c.model): s for c, s in scored}
+    selection.records = []
+    for cand in candidates:
+        score = by_key.get((cand.provider, cand.model))
+        selection.records.append(
+            _record(
+                cand, profile, cfg, median_pair,
+                score,
+                "" if score is not None else _exclusion_reason(cand, profile, cfg),
+            )
+        )
+
+    incumbent = next((c for c in eligible if c.model == current), None) if current else None
+
+    def _keep(cand: ModelCandidate, reason: str, skip_reason: str) -> Selection:
+        selection.model, selection.provider = cand.model, cand.provider
+        selection.score = by_key.get((cand.provider, cand.model), 0.0)
+        selection.est_cost = estimate_cost(cand, profile, charge=charge_for(cand, median_pair))
+        selection.reason = reason
+        selection.skip_reason = skip_reason
+        selection.kept_current = True
+        return selection
+
+    if incumbent is not None and incumbent is best:
+        return _keep(
+            incumbent, "current model remains the best eligible choice", "already_current"
+        )
+
+    if incumbent is not None and incumbent is not best:
+        inc_score = by_key.get((incumbent.provider, incumbent.model), 0.0)
+        gain = best_score - inc_score
+        best_cost = estimate_cost(best, profile, charge=charge_for(best, median_pair))
+        inc_cost = estimate_cost(
+            incumbent, profile, charge=charge_for(incumbent, median_pair)
+        )
+        downgrade = best_cost is not None and inc_cost is not None and best_cost < inc_cost
+
+        # Hysteresis: ties and borderline wins keep the current model.  A
+        # capability gap is not marginal — the incumbent cannot do the job.
+        if gain <= cfg.stability_threshold and not _capability_gap(incumbent, best, profile):
+            return _keep(
+                incumbent,
+                f"kept current model: best alternative {best.key} led by only "
+                f"{gain:.3f} < stability {cfg.stability_threshold:.3f}",
+                "within_stability_threshold",
+            )
+        if mid_session:
+            # A capable incumbent that merely scores lower is still serving the
+            # session; only an *ineligible* incumbent forces a mid-session
+            # change, because switching would invalidate the cached prompt
+            # prefix.  (A fresh turn — what `explain` / `status` describe — has
+            # no cache to protect and may switch on a capability gap.)
+            return _keep(
+                incumbent,
+                f"kept current model: {best.key} scored higher but a "
+                "mid-session switch requires a capability gap or ineligible "
+                "incumbent (prompt-cache stability)",
+                "within_stability_threshold",
+            )
+        if downgrade and not cfg.switch_on_cost:
+            return _keep(
+                incumbent,
+                f"kept current model: {best.key} is cheaper (score +{gain:.3f}) but a "
+                "cost-only downgrade mid-session is disabled (prompt-cache stability)",
+                "within_stability_threshold",
+            )
+
+    selection.model, selection.provider = best.model, best.provider
+    selection.score = best_score
+    selection.est_cost = estimate_cost(best, profile, charge=charge_for(best, median_pair))
+    selection.reason = (
+        f"selected over {len(eligible) - 1} other eligible model(s) for "
+        f"{profile.complexity.label} task"
+    )
+    selection.skip_reason = ""
+    selection.kept_current = False
+    return selection
+
+
+def _record(
+    candidate: ModelCandidate,
+    profile: TaskProfile,
+    cfg: RoutingConfig,
+    median_pair: Optional[Tuple[float, float]],
+    score: Optional[float],
+    excluded_reason: str,
+) -> CandidateReport:
+    """One report row, priced at what the model would actually be charged."""
+    own_in, own_out = candidate.costs()
+    charged = charge_for(candidate, median_pair)
+    priced = own_in is not None or own_out is not None
+    return CandidateReport(
+        model=candidate.model,
+        provider=candidate.provider,
+        eligible=not excluded_reason,
+        score=round(score, 4) if score is not None else None,
+        tier=_tier_label(candidate),
+        cost_in=round(charged[0], 6) if charged else None,
+        cost_out=round(charged[1], 6) if charged else None,
+        priced=priced,
+        charged_as="own" if priced else ("median" if charged else "unknown"),
+        unknown_capabilities=unknown_required_capabilities(candidate, profile),
+        excluded_reason=excluded_reason,
+    )
 
 
 def select_model(
@@ -718,127 +1457,19 @@ def select_model(
     config: Optional[RoutingConfig] = None,
     *,
     current_model: str = "",
+    mid_session: bool = False,
 ) -> Optional[Decision]:
     """Pick the best eligible model, or ``None`` when nothing qualifies.
 
+    Thin wrapper over :func:`rank_candidates` — the single scoring path.
     ``current_model`` drives hysteresis: the incumbent is kept unless a rival
-    beats it by ``stability_threshold`` (or the incumbent is ineligible).
+    beats it by more than ``stability_threshold`` (or the incumbent is
+    ineligible).
     """
-    cfg = config or RoutingConfig()
-
-    if profile.pinned_model:
-        pinned = [c for c in candidates if c.model == profile.pinned_model and c.enabled]
-        if pinned:
-            cand = pinned[0]
-            return Decision(
-                model=cand.model,
-                provider=cand.provider,
-                score=1.0,
-                est_cost=estimate_cost(cand, profile),
-                reason="user pinned model",
-                complexity=profile.complexity.label,
-                eligible_count=1,
-                considered=[(cand.key, 1.0)],
-                pinned=True,
-            )
-        # Pinned but unknown: say so rather than silently choosing another.
-        return None
-
-    eligible = filter_eligible(candidates, profile, cfg)
-    if not eligible:
-        return None
-
-    costs = [c for c in (estimate_cost(x, profile) for x in eligible) if c is not None]
-    ceiling = max(costs) if len(costs) > 1 else None
-
-    scored = [
-        (cand, score_candidate(cand, profile, cfg, current_model=current_model, cost_ceiling=ceiling))
-        for cand in eligible
-    ]
-    scored.sort(key=lambda item: (-item[1], item[0].key))
-
-    best, best_score = scored[0]
-    considered = [(c.key, round(s, 4)) for c, s in scored[:5]]
-
-    incumbent = None
-    if current_model:
-        incumbent = next((c for c in eligible if c.model == current_model), None)
-
-    if incumbent is not None and incumbent is not best:
-        inc_score = score_candidate(incumbent, profile, cfg, current_model=current_model, cost_ceiling=ceiling)
-        gain = best_score - inc_score
-        best_cost = estimate_cost(best, profile)
-        inc_cost = estimate_cost(incumbent, profile)
-        downgrade = (
-            best_cost is not None and inc_cost is not None and best_cost < inc_cost
-        )
-        # A capability gap is not a marginal score difference: an incumbent
-        # that cannot reason about an advanced task (or cannot call tools)
-        # must not be kept just because the score delta is small (spec §16.2).
-        capability_upgrade = (
-            (
-                profile.needs_reasoning
-                and incumbent.supports_reasoning() is not CapabilityState.SUPPORTED
-                and best.supports_reasoning() is CapabilityState.SUPPORTED
-            )
-            or (
-                profile.needs_tools
-                and incumbent.supports_tools() is CapabilityState.UNSUPPORTED
-                and best.supports_tools() is CapabilityState.SUPPORTED
-            )
-        )
-        if gain < cfg.stability_threshold and not capability_upgrade:
-            return Decision(
-                model=incumbent.model,
-                provider=incumbent.provider,
-                score=round(inc_score, 4),
-                est_cost=inc_cost,
-                reason=(
-                    f"kept current model: best alternative {best.key} led by only "
-                    f"{gain:.3f} < stability {cfg.stability_threshold:.3f}"
-                ),
-                switched=False,
-                complexity=profile.complexity.label,
-                eligible_count=len(eligible),
-                considered=considered,
-            )
-        if downgrade and not cfg.switch_on_cost:
-            # A cheaper model wins on score, but the incumbent is still fully
-            # eligible.  Switching would invalidate the provider's prompt
-            # cache mid-conversation, so it stays an explicit user choice.
-            return Decision(
-                model=incumbent.model,
-                provider=incumbent.provider,
-                score=round(inc_score, 4),
-                est_cost=inc_cost,
-                reason=(
-                    f"kept current model: {best.key} is cheaper (score +{gain:.3f}) but a "
-                    "cost-only downgrade mid-session is disabled (prompt-cache stability)"
-                ),
-                switched=False,
-                complexity=profile.complexity.label,
-                eligible_count=len(eligible),
-                considered=considered,
-            )
-
-    if incumbent is not None and incumbent is best:
-        reason = "current model remains the best eligible choice"
-        switched = False
-    else:
-        reason = f"selected over {len(eligible) - 1} other eligible model(s) for {profile.complexity.label} task"
-        switched = bool(current_model) and best.model != current_model
-
-    return Decision(
-        model=best.model,
-        provider=best.provider,
-        score=round(best_score, 4),
-        est_cost=estimate_cost(best, profile),
-        reason=reason,
-        switched=switched,
-        complexity=profile.complexity.label,
-        eligible_count=len(eligible),
-        considered=considered,
+    selection = rank_candidates(
+        profile, candidates, config, current_model=current_model, mid_session=mid_session
     )
+    return selection.decision()
 
 
 # ---------------------------------------------------------------------------
@@ -1028,7 +1659,9 @@ def _catalog_models(provider: str, limit: int = _CATALOG_POOL_LIMIT) -> List[str
     try:
         from agent import models_dev
 
-        listed = models_dev.list_provider_models(provider)
+        # Cache-only: selection must never touch the network (contract), so a
+        # stale or absent catalog simply means there is nothing to widen to.
+        listed = models_dev.list_provider_models(provider, allow_network=False)
     except Exception:  # pragma: no cover - catalog unavailable / defensive
         return []
     out = [str(m).strip() for m in (listed or []) if str(m).strip()]
@@ -1175,6 +1808,135 @@ def _candidates_from_pool(
     for owner, ids in groups:
         out.extend(candidates_for(owner, ids, enabled=enabled))
     return out
+
+
+def _spec_provider_and_model(
+    config: Any, spec: ModelSpec, *, default_provider: str
+) -> Tuple[str, str]:
+    """``(provider, model)`` for one declared spec.
+
+    An explicit ``provider`` wins; a ``provider/model`` name is split only when
+    the prefix names a provider this install actually has configured (so an
+    aggregator's ``vendor/model`` id is never mistaken for a provider).
+    """
+    provider = (spec.provider or "").strip()
+    name = spec.name.strip()
+    if provider:
+        head, sep, rest = name.partition("/")
+        if sep and rest.strip() and head.strip().lower() == provider.lower():
+            name = rest.strip()
+        return provider, name
+    return _split_provider_model(config, name, default_provider=default_provider)
+
+
+def candidates_from_specs(
+    config: Any,
+    specs: Sequence[ModelSpec],
+    *,
+    default_provider: str = "",
+    enabled: bool = True,
+) -> List[ModelCandidate]:
+    """Build candidates from declared specs, metadata overlaid on the catalog.
+
+    One ``candidates_for`` call per provider keeps the cached-catalog contract
+    (and the existing test seam) intact.  A model the catalog does not know is
+    still a candidate: its ``info`` is ``None``, which reads as UNKNOWN
+    metadata, never as a refusal.
+    """
+    groups: List[Tuple[str, List[Tuple[str, ModelSpec]]]] = []
+    index: Dict[str, int] = {}
+    for spec in specs:
+        provider, model = _spec_provider_and_model(
+            config, spec, default_provider=default_provider
+        )
+        if not model:
+            continue
+        if provider not in index:
+            index[provider] = len(groups)
+            groups.append((provider, []))
+        groups[index[provider]][1].append((model, spec))
+
+    out: List[ModelCandidate] = []
+    for provider, items in groups:
+        built = {
+            cand.model: cand
+            for cand in candidates_for(provider, [m for m, _ in items], enabled=enabled)
+        }
+        for model, spec in items:
+            cand = built.get(model) or ModelCandidate(
+                provider=provider, model=model, info=None, enabled=enabled
+            )
+            cand.spec = spec
+            out.append(cand)
+    return out
+
+
+def declared_model_list(
+    config: Any, provider: str, *, current_model: str = ""
+) -> Tuple[List[str], str, str]:
+    """The declared model ids, with NO catalog read.
+
+    ``(models, candidate_source, pool_scope)``.  Cheap enough for the per-turn
+    hot path: a single-model install must not pay for any metadata lookups.
+    """
+    current = str(current_model or "").strip()
+    specs, source = specs_from_config(config)
+    if specs:
+        names = [spec.name.strip() for spec in specs if spec.name.strip()]
+        if current and current not in names:
+            names.insert(0, current)
+        return names, source, source
+    models, pool_scope = routing_pool(config, provider, current_model=current)
+    return models, "preferred", pool_scope
+
+
+def resolve_candidates(
+    config: Any,
+    provider: str,
+    *,
+    current_model: str = "",
+    explicit_models: Optional[Sequence[str]] = None,
+) -> Tuple[List[ModelCandidate], str, str]:
+    """The candidate set a turn/CLI report works from.
+
+    Returns ``(candidates, candidate_source, pool_scope)``.
+
+    * ``explicit_models`` (the CLI's preview override) is the whole set;
+    * ``smart_model_routing.models`` — or its deprecated ``candidates``
+      equivalent — is used verbatim when present;
+    * otherwise the provider's configured model list is used, exactly as
+      before, with ``preferred_models_only`` deciding whether the catalog may
+      be consulted as a fallback.
+
+    The incumbent is always represented (prepended, never duplicated) so
+    hysteresis can compare against it even when it is not on the list.
+    """
+    current = str(current_model or "").strip()
+
+    if explicit_models is not None:
+        specs = [
+            spec
+            for spec in (ModelSpec.from_entry(item) for item in explicit_models)
+            if spec
+        ]
+        candidates = candidates_from_specs(config, specs, default_provider=provider)
+        return candidates, "explicit", "explicit"
+
+    specs, source = specs_from_config(config)
+    if specs:
+        candidates = candidates_from_specs(config, specs, default_provider=provider)
+        if current and not any(c.model == current for c in candidates):
+            incumbent = candidates_for(provider, [current])
+            candidates.insert(
+                0,
+                incumbent[0]
+                if incumbent
+                else ModelCandidate(provider=provider, model=current, info=None),
+            )
+        return candidates, source, source
+
+    models, pool_scope = routing_pool(config, provider, current_model=current)
+    return _candidates_from_pool(config, provider, models), "preferred", pool_scope
 
 
 def _call_switch_model(
@@ -1355,11 +2117,17 @@ def route_turn(
         cfg = RoutingConfig.from_dict((config or {}).get("smart_model_routing") or {})
         provider = str(getattr(agent, "provider", "") or "").strip()
         current = str(getattr(agent, "model", "") or "").strip()
-        models, pool_scope = routing_pool(config, provider, current_model=current)
+        models, _source, pool_scope = declared_model_list(
+            config, provider, current_model=current
+        )
         if len(models) <= 1 and pool_scope == "preferred":
             return None  # single-model config: no routing overhead (spec §4.1)
 
-        candidates = _candidates_from_pool(config, provider, models)
+        candidates, _source, pool_scope = resolve_candidates(
+            config, provider, current_model=current
+        )
+        models = [c.model for c in candidates]
+
         profile = classify_request(
             user_message or "",
             attachments=attachments,
@@ -1367,14 +2135,23 @@ def route_turn(
             tool_available=bool(getattr(agent, "tools", None)),
         )
         turn = int(getattr(agent, _ROUTER_TURN_ATTR, 0) or 0)
+        # A session running on a non-default model is a deliberate choice (a
+        # gateway /model override, a --model flag, a restored session), so it
+        # gets the same protection as a mid-session incumbent.
+        default_model = _configured_default_model(config, provider)
+        mid_session = turn > 0 or bool(default_model and current != default_model)
         if turn == 0 and not cfg.switch_on_cost:
             # First routed turn of a session: nothing is cached yet, so a
             # cost-driven initial selection is not a mid-session downgrade.
             # ``switch_on_cost`` guards the *mid-session* case only.
             cfg = replace(cfg, switch_on_cost=True)
-        decision = select_model(profile, candidates, cfg, current_model=current)
 
-        if decision is None and pool_scope != "preferred":
+        # ONE ranking path: the same function `explain` and `status --json` use.
+        selection = rank_candidates(
+            profile, candidates, cfg, current_model=current, mid_session=mid_session
+        )
+
+        if selection.skip_reason == "no_eligible_model" and pool_scope != "preferred":
             # Nothing on the operator's preferred list can serve this request.
             # Only now — and only because preferred_models_only is false — is
             # the provider catalog consulted, so a tool/modality gap is not
@@ -1382,19 +2159,21 @@ def route_turn(
             widened = widen_pool(provider, models)
             if len(widened) > len(models):
                 candidates = _candidates_from_pool(config, provider, widened)
-                decision = select_model(profile, candidates, cfg, current_model=current)
-                if decision is not None and decision.model not in models:
-                    decision = replace(
-                        decision,
-                        reason=decision.reason + "; no preferred model was eligible, "
-                        "selected from the provider catalog (preferred_models_only=false)",
+                selection = rank_candidates(
+                    profile, candidates, cfg, current_model=current, mid_session=mid_session
+                )
+                if selection.model and selection.model not in models:
+                    selection.reason = (
+                        selection.reason + "; no preferred model was eligible, "
+                        "selected from the provider catalog (preferred_models_only=false)"
                     )
                     _log.info(
                         "routing: widened beyond the preferred list to %s (%s)",
-                        decision.key, decision.reason,
+                        f"{selection.provider}/{selection.model}", selection.reason,
                     )
 
         setattr(agent, _ROUTER_TURN_ATTR, turn + 1)
+        decision = selection.decision()
         if decision is None:
             _log.info(
                 "routing: no eligible model among %d candidate(s); keeping %s",
@@ -1409,36 +2188,6 @@ def route_turn(
             )
             setattr(agent, _ROUTER_LAST_ATTR, decision)
             return decision
-
-        # Mid-session switches need a hard reason: the incumbent must be
-        # ineligible for this request, or it is the session's first routed
-        # turn on the *configured default* model (no prompt cache and no user
-        # choice to protect).  A marginal score win is not enough — changing
-        # models invalidates the provider's cached prefix.
-        #
-        # A session running on a non-default model is a deliberate choice
-        # (a gateway /model override, a --model flag, a restored session), so
-        # it gets the same protection as a mid-session incumbent.
-        eligible = filter_eligible(candidates, profile, cfg)
-        incumbent_eligible = any(c.model == current for c in eligible)
-        on_configured_default = not _configured_default_model(config, provider) or (
-            current == _configured_default_model(config, provider)
-        )
-        if incumbent_eligible and (turn > 0 or not on_configured_default):
-            kept = replace(
-                decision,
-                model=current,
-                provider=provider,
-                switched=False,
-                reason=(
-                    f"kept current model: {decision.key} scored higher but a "
-                    "mid-session switch requires a capability gap or ineligible "
-                    "incumbent (prompt-cache stability)"
-                ),
-            )
-            _log.info("routing: %s", kept.reason)
-            setattr(agent, _ROUTER_LAST_ATTR, kept)
-            return kept
 
         if decision.provider and decision.provider.strip().lower() != provider.strip().lower():
             # Cross-provider selection: the target provider's own profile is
@@ -1487,6 +2236,72 @@ def route_turn(
 # Preview (CLI `hermes model routing explain`, setup wizard)
 # ---------------------------------------------------------------------------
 
+def _report_provider(config: Any, provider: str = "") -> str:
+    """The provider a report resolves candidates against."""
+    prov = str(provider or "").strip()
+    if not prov and isinstance(config, dict):
+        model_section = config.get("model")
+        if isinstance(model_section, dict):
+            prov = str(model_section.get("provider") or "").strip()
+    return prov
+
+
+def _preview_selection(
+    config: Any,
+    prompt: str,
+    *,
+    attachments: Sequence[str] = (),
+    conversation_tokens: int = 0,
+    provider: str = "",
+    current_model: str = "",
+    candidates: Optional[Sequence[str]] = None,
+) -> Tuple[Selection, List[str]]:
+    """The shared pass behind `explain` and `status --json`.
+
+    Pure: no agent, no network, no config mutation.  Returns the selection and
+    the model list it was made from.  A preview is a *fresh session's first
+    turn* — nothing is prompt-cached yet — so it is never ``mid_session``.
+    """
+    cfg = RoutingConfig.from_dict(
+        config.get("smart_model_routing") if isinstance(config, dict) else None
+    )
+    prov = _report_provider(config, provider)
+
+    current = str(current_model or "").strip()
+    if not current:
+        current = _configured_default_model(config, prov)
+
+    cands, _source, pool_scope = resolve_candidates(
+        config, prov, current_model=current, explicit_models=candidates
+    )
+    models = [c.model for c in cands]
+
+    profile = classify_request(
+        prompt or "",
+        attachments=attachments,
+        conversation_tokens=conversation_tokens,
+    )
+    preview_cfg = cfg
+    if not cfg.switch_on_cost:
+        # Nothing is cached on a fresh session, so a cost-driven choice is not
+        # a mid-session downgrade.
+        preview_cfg = replace(cfg, switch_on_cost=True)
+
+    selection = rank_candidates(profile, cands, preview_cfg, current_model=current)
+    if selection.skip_reason == "no_eligible_model" and pool_scope == "preferred+catalog":
+        widened = widen_pool(prov, models)
+        if len(widened) > len(models):
+            cands = _candidates_from_pool(config, prov, widened)
+            selection = rank_candidates(profile, cands, preview_cfg, current_model=current)
+            if selection.model and selection.model not in models:
+                models = widened
+                selection.reason = (
+                    selection.reason + "; no preferred model was eligible, "
+                    "selected from the provider catalog (preferred_models_only=false)"
+                )
+    return selection, models
+
+
 def preview_decision(
     config: Any,
     prompt: str,
@@ -1499,63 +2314,131 @@ def preview_decision(
 ) -> Tuple[Optional[Decision], TaskProfile, List[str]]:
     """Select a model for ``prompt`` from config alone.
 
-    Pure: no agent, no network, no config mutation — so it is safe for
-    ``hermes model routing explain`` and for the setup wizard to call before
-    anything is enabled.  ``candidates`` overrides the configured model list
-    (lets an operator preview a multi-model setup before committing to it).
-
     Returns ``(decision, profile, candidate_models)``.  ``decision`` is
     ``None`` when routing is off, when fewer than two models are in play, or
     when no candidate satisfies the request's hard constraints.
     """
-    cfg_section = config.get("smart_model_routing") if isinstance(config, dict) else None
-    cfg = RoutingConfig.from_dict(cfg_section)
-
-    prov = str(provider or "").strip()
-    if not prov and isinstance(config, dict):
-        model_section = config.get("model")
-        if isinstance(model_section, dict):
-            prov = str(model_section.get("provider") or "").strip()
-
+    prov = _report_provider(config, provider)
     if candidates is not None:
-        # An explicit list is the whole candidate set (the operator is
-        # previewing a hypothetical config), so no model is injected into it
-        # and ``preferred_models_only`` does not apply to it.
-        models = [str(m).strip() for m in candidates if str(m).strip()]
-        current = str(current_model or "").strip()
-        if not current:
-            default = _configured_default_model(config, prov)
-            current = default if default in models else ""
-        pool_scope = "explicit"
+        names = [str(m).strip() for m in candidates if str(m).strip()]
+        scope = "explicit"
     else:
-        models, pool_scope = routing_pool(
+        names, _source, scope = declared_model_list(
             config, prov, current_model=str(current_model or "").strip()
         )
-        current = str(current_model or "").strip() or _configured_default_model(config, prov)
-
     profile = classify_request(
         prompt or "",
         attachments=attachments,
         conversation_tokens=conversation_tokens,
     )
-    if len(models) <= 1 and pool_scope != "preferred+catalog":
-        return None, profile, models
+    if len(names) <= 1 and scope != "preferred+catalog":
+        # Nothing to route: say so instead of inventing a choice.
+        return None, profile, names
 
-    cands = _candidates_from_pool(config, prov, models)
-    # A preview is a fresh session's first turn: nothing is prompt-cached yet,
-    # so a cost-driven choice is not a mid-session downgrade.
-    preview_cfg = replace(cfg, switch_on_cost=True) if not cfg.switch_on_cost else cfg
-    decision = select_model(profile, cands, preview_cfg, current_model=current)
-    if decision is None and pool_scope == "preferred+catalog":
-        widened = widen_pool(prov, models)
-        if len(widened) > len(models):
-            cands = _candidates_from_pool(config, prov, widened)
-            decision = select_model(profile, cands, preview_cfg, current_model=current)
-            if decision is not None and decision.model not in models:
-                models = widened
-                decision = replace(
-                    decision,
-                    reason=decision.reason + "; no preferred model was eligible, "
-                    "selected from the provider catalog (preferred_models_only=false)",
-                )
-    return decision, profile, models
+    selection, models = _preview_selection(
+        config,
+        prompt,
+        attachments=attachments,
+        conversation_tokens=conversation_tokens,
+        provider=provider,
+        current_model=current_model,
+        candidates=candidates,
+    )
+    return selection.decision(), selection.profile, models
+
+
+def routing_report(
+    config: Any,
+    prompt: str = "",
+    *,
+    attachments: Sequence[str] = (),
+    conversation_tokens: int = 0,
+    provider: str = "",
+    current_model: str = "",
+    candidates: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """The ``hermes model routing status --json`` document.
+
+    Exactly the shared key set::
+
+        enabled, settings, candidate_source, request, pricing, selected,
+        selected_provider, reason, skip_reason, current, kept_current,
+        eligible_count, candidates[]
+
+    Read-only and total: every failure inside selection becomes
+    ``skip_reason: "error"`` with the reason attached, so the CLI can still
+    exit 0 (only an unreadable config is a non-zero exit, and that is decided
+    by the caller).  A disabled section computes the hypothetical selection and
+    reports ``skip_reason: "disabled"``.
+    """
+    cfg = RoutingConfig.from_dict(
+        config.get("smart_model_routing") if isinstance(config, dict) else None
+    )
+    enabled = is_enabled(config)
+
+    try:
+        selection, _models = _preview_selection(
+            config,
+            prompt,
+            attachments=attachments,
+            conversation_tokens=conversation_tokens,
+            provider=provider,
+            current_model=current_model,
+            candidates=candidates,
+        )
+        _specs, source = specs_from_config(config)
+        if candidates is not None:
+            source = "explicit"
+        elif not source:
+            source = "preferred"
+        profile = selection.profile
+        records = selection.records
+        pricing = selection.pricing or pricing_for(profile, [])
+        selected = selection.model
+        selected_provider = selection.provider if selected else ""
+        reason = selection.reason
+        skip_reason = selection.skip_reason or ""
+        current = selection.current
+        kept_current = bool(selection.kept_current)
+        eligible_count = selection.eligible_count
+    except Exception as err:  # pragma: no cover - defensive: report never breaks
+        profile = TaskProfile()
+        records = []
+        pricing = pricing_for(profile, [])
+        selected = ""
+        selected_provider = ""
+        reason = f"routing report failed: {err}"
+        skip_reason = "error"
+        current = str(current_model or "").strip()
+        kept_current = False
+        eligible_count = 0
+        _specs, source = specs_from_config(config)
+
+    if not enabled:
+        # Disabled is a strict no-op for execution, but the report still says
+        # what routing WOULD do — with "disabled" as the skip reason.
+        skip_reason = "disabled"
+
+    return {
+        "enabled": enabled,
+        "settings": cfg.settings(),
+        "candidate_source": source,
+        "request": {
+            "tier": profile.complexity.label,
+            "est_input_tokens": profile.est_input_tokens,
+            "est_output_tokens": profile.est_output_tokens,
+            "needs_tools": profile.needs_tools,
+            "needs_vision": "image" in profile.input_modalities,
+            "needs_audio": "audio" in profile.input_modalities,
+            "reasons": list(profile.signals),
+        },
+        "pricing": pricing,
+        "selected": selected,
+        "selected_provider": selected_provider,
+        "reason": reason,
+        "skip_reason": skip_reason,
+        "current": current,
+        "kept_current": kept_current,
+        "eligible_count": eligible_count,
+        "candidates": [record.as_dict() for record in records],
+    }

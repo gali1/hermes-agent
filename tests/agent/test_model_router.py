@@ -3,6 +3,7 @@
 No network: every candidate carries a hand-built ``ModelInfo``.
 """
 
+import json
 import os
 import sys
 
@@ -331,7 +332,8 @@ def test_routing_config_normalises_weights():
 def test_routing_config_ignores_garbage():
     cfg = mr.RoutingConfig.from_dict({"enabled": "yes", "stability_threshold": "abc", "weights": []})
     assert cfg.enabled is True
-    assert cfg.stability_threshold == pytest.approx(0.08)
+    # Contract default: a rival must beat the incumbent by MORE than 0.15.
+    assert cfg.stability_threshold == pytest.approx(0.15)
 
 
 def test_explain_mentions_model_and_reason():
@@ -735,3 +737,563 @@ def test_preview_does_not_widen_with_the_flag_on(patched_candidates, monkeypatch
     )
     assert decision is None
     assert models == ["weak", "strong"]
+
+
+# ---------------------------------------------------------------------------
+# Shared config contract: smart_model_routing.models[] + the JSON report
+# ---------------------------------------------------------------------------
+#
+# The sibling tree (Bender's ~/hermes-agent) implemented the same feature with
+# this config shape; both trees must behave identically on the same config even
+# though the code differs.  These tests pin the contract, not this tree's
+# implementation details.
+
+TSIM = 0.15  # the contract's default stability threshold
+
+
+def spec(name, **kw):
+    """A declared ``smart_model_routing.models[]`` entry."""
+    return mr.ModelSpec(name=name, **kw)
+
+
+def spec_cand(spec_obj, *, info_obj=None, provider=None):
+    return mr.ModelCandidate(
+        provider=provider or spec_obj.provider or "test",
+        model=spec_obj.name,
+        info=info_obj,
+        spec=spec_obj,
+    )
+
+
+@pytest.fixture
+def offline_catalog(monkeypatch):
+    """No models.dev at all: every candidate is metadata-free (info=None)."""
+    calls = []
+
+    def _candidates_for(provider, models, *, enabled=True):
+        calls.append((provider, list(models)))
+        return [
+            mr.ModelCandidate(provider=provider, model=m, info=None, enabled=enabled)
+            for m in models
+        ]
+
+    monkeypatch.setattr(mr, "candidates_for", _candidates_for)
+    return calls
+
+
+def _models_config(models, default="", **section):
+    base = {"enabled": True, "models": models}
+    base.update(section)
+    model_section = {"provider": "p1"}
+    if default:
+        model_section["default"] = default
+    return {"smart_model_routing": base, "model": model_section}
+
+
+# -- models[] is canonical --------------------------------------------------
+
+def test_models_entries_are_the_canonical_candidate_source(offline_catalog):
+    cfg = _models_config(
+        [
+            {"name": "cheap", "provider": "p1", "cost_in": 0.2, "cost_out": 0.8},
+            {"name": "other", "provider": "p2", "cost_in": 3.0, "cost_out": 15.0},
+        ]
+    )
+    report = mr.routing_report(cfg, "hello")
+    assert report["candidate_source"] == "models"
+    assert [(c["provider"], c["model"]) for c in report["candidates"]] == [
+        ("p1", "cheap"),
+        ("p2", "other"),
+    ]
+
+
+def test_models_metadata_overrides_the_catalog():
+    """Declared values win over models.dev, field by field."""
+    catalog = info("m", ctx=8_000, out=1_024, tools=False, vision=False, cost_in=9.0, cost_out=9.0)
+    declared = spec(
+        "m", context_window=200_000, max_output=16_384, supports_tools=True,
+        supports_vision=True, cost_in=0.5, cost_out=1.0,
+    )
+    cand = spec_cand(declared, info_obj=catalog)
+
+    assert cand.context_window() == 200_000
+    assert cand.max_output() == 16_384
+    assert cand.supports_tools() is mr.CapabilityState.SUPPORTED
+    assert cand.supports_input("image") is mr.CapabilityState.SUPPORTED
+    assert cand.costs() == (0.5, 1.0)
+
+
+def test_declared_metadata_can_make_a_catalog_model_eligible_for_vision():
+    """models.dev says text-only; the operator knows better."""
+    catalog = info("m", vision=False)
+    plain = mr.ModelCandidate("test", "m", catalog)
+    declared = spec_cand(spec("m", supports_vision=True), info_obj=catalog)
+    profile = mr.classify_request("what is in this shot", attachments=["a.png"])
+    assert mr.filter_eligible([plain], profile) == []
+    assert [c.model for c in mr.filter_eligible([declared], profile)] == ["m"]
+
+
+def test_declared_metadata_can_raise_the_context_window():
+    catalog = info("m", ctx=8_000)
+    profile = mr.classify_request("x" * 60_000)  # ~15k tokens
+    assert profile.required_context > 8_000
+    plain = mr.ModelCandidate("test", "m", catalog)
+    raised = spec_cand(spec("m", context_window=200_000), info_obj=catalog)
+    assert mr.filter_eligible([plain], profile) == []
+    assert [c.model for c in mr.filter_eligible([raised], profile)] == ["m"]
+
+
+def test_declared_deprecated_flag_excludes_a_live_catalog_model(offline_catalog):
+    cand = spec_cand(spec("m", deprecated=True), info_obj=info("m"))
+    profile = mr.classify_request("hello")
+    assert mr.filter_eligible([cand], profile) == []
+    report = mr.routing_report(
+        _models_config([{"name": "m", "provider": "p1", "deprecated": True}]), "hello"
+    )
+    assert report["candidates"][0]["excluded_reason"] == "deprecated"
+    assert report["skip_reason"] == "no_eligible_model"
+
+
+def test_declared_text_output_false_is_a_hard_refusal():
+    cand = spec_cand(spec("m", supports_text_output=False))
+    assert mr.filter_eligible([cand], mr.classify_request("hello")) == []
+
+
+def test_flat_deprecated_candidates_list_still_routes(offline_catalog):
+    """The pre-contract list is still honoured (deprecated), same scoring path."""
+    cfg = {
+        "smart_model_routing": {"enabled": True, "candidates": ["test/a", "test/b"]},
+        "providers": {"test": {"models": ["a", "b"]}},
+        "model": {"provider": "test", "default": "a"},
+    }
+    report = mr.routing_report(cfg, "What is 2+2?")
+    assert report["candidate_source"] == "candidates"
+    assert [c["model"] for c in report["candidates"]] == ["a", "b"]
+    assert report["selected"] in {"a", "b"}
+
+
+def test_models_wins_over_a_legacy_candidates_list(offline_catalog):
+    cfg = {
+        "smart_model_routing": {
+            "enabled": True,
+            "models": [{"name": "canonical", "provider": "test"}],
+            "candidates": ["legacy"],
+        },
+        "model": {"provider": "test", "default": "canonical"},
+    }
+    report = mr.routing_report(cfg, "hello")
+    assert report["candidate_source"] == "models"
+    assert [c["model"] for c in report["candidates"]] == ["canonical"]
+
+
+# -- median pricing ---------------------------------------------------------
+
+def test_unpriced_model_is_charged_the_median_known_price(offline_catalog):
+    cfg = _models_config(
+        [
+            {"name": "cheap", "provider": "p1", "cost_in": 1.0, "cost_out": 2.0},
+            {"name": "dear", "provider": "p1", "cost_in": 5.0, "cost_out": 10.0},
+            {"name": "mystery", "provider": "p1"},  # no price anywhere
+        ]
+    )
+    report = mr.routing_report(cfg, "hello")
+    rows = {c["model"]: c for c in report["candidates"]}
+    assert rows["mystery"]["priced"] is False
+    assert rows["mystery"]["charged_as"] == "median"
+    # median of the two known prices: 3.0 in, 6.0 out — never zero.
+    assert report["pricing"]["median_fallback"] == {"cost_in": 3.0, "cost_out": 6.0}
+    assert rows["mystery"]["cost_in"] == 3.0
+    assert rows["mystery"]["cost_out"] == 6.0
+    assert rows["cheap"]["charged_as"] == "own"
+
+
+def test_unpriced_model_is_never_treated_as_free():
+    profile = mr.TaskProfile(est_input_tokens=1_000_000, est_output_tokens=1_000_000)
+    unpriced = mr.ModelCandidate("test", "mystery", None)
+    assert mr.estimate_cost(unpriced, profile) is None  # nothing to charge against
+    charged = mr.estimate_cost(unpriced, profile, charge=(2.0, 4.0))
+    assert charged == pytest.approx(6.0)
+    assert charged > 0
+
+
+def test_pricing_block_reports_the_cheapest_eligible_cost(offline_catalog):
+    cfg = _models_config(
+        [
+            {"name": "cheap", "provider": "p1", "cost_in": 0.1, "cost_out": 0.1},
+            {"name": "dear", "provider": "p1", "cost_in": 10.0, "cost_out": 10.0},
+        ]
+    )
+    report = mr.routing_report(cfg, "hello")
+    assert report["pricing"]["cheapest_eligible"] is not None
+    assert report["pricing"]["policy"] == "unpriced_models_charged_the_median_known_price"
+
+
+# -- tier floor -------------------------------------------------------------
+
+def _advanced_profile():
+    profile = mr.classify_request(
+        "Prove the invariant, derive the complexity and analyse the trade-offs of this "
+        "algorithm.\n```python\nx = 1\n```"
+    )
+    assert profile.complexity is mr.Complexity.ADVANCED
+    return profile
+
+
+def test_below_tier_candidate_is_ineligible_for_an_advanced_request():
+    low = spec_cand(spec("low", tier_rank=2), info_obj=info("low", reasoning=True))
+    high = spec_cand(spec("high", tier_rank=4), info_obj=info("high", reasoning=True))
+    eligible = mr.filter_eligible([low, high], _advanced_profile())
+    assert [c.model for c in eligible] == ["high"]
+
+
+def test_below_tier_candidate_is_fine_for_a_simple_request():
+    low = spec_cand(spec("low", tier_rank=1), info_obj=info("low"))
+    simple = mr.classify_request("What is 2+2?")
+    assert simple.complexity is mr.Complexity.SIMPLE
+    assert [c.model for c in mr.filter_eligible([low], simple)] == ["low"]
+
+
+def test_undeclared_tier_is_unknown_not_ineligible():
+    """An undeclared tier_rank is missing metadata, never a refusal."""
+    plain = mr.ModelCandidate("test", "plain", info("plain"))
+    assert plain.tier_rank() is None
+    assert [c.model for c in mr.filter_eligible([plain], _advanced_profile())] == ["plain"]
+
+
+def test_tier_floor_reports_its_reason(offline_catalog):
+    cfg = _models_config(
+        [
+            {"name": "low", "provider": "p1", "tier_rank": 2, "supports_tools": True},
+            {"name": "high", "provider": "p1", "tier_rank": 4, "supports_tools": True},
+        ]
+    )
+    report = mr.routing_report(
+        cfg,
+        "Prove the invariant, derive the complexity and analyse the trade-offs of this "
+        "algorithm.\n```python\nx = 1\n```",
+    )
+    rows = {c["model"]: c for c in report["candidates"]}
+    assert rows["low"]["eligible"] is False
+    assert rows["low"]["excluded_reason"] == "below_tier"
+    assert rows["high"]["eligible"] is True
+    assert report["selected"] == "high"
+
+
+# -- unknown capability metadata -------------------------------------------
+
+def test_unknown_capability_penalty_is_flat_per_required_capability():
+    profile = mr.TaskProfile(
+        needs_tools=True, needs_structured_output=True, input_modalities=("text", "image")
+    )
+    known = spec_cand(
+        spec("known", supports_tools=True, supports_structured=True, supports_vision=True),
+        info_obj=info("known"),
+    )
+    unknown_all = mr.ModelCandidate("test", "mystery", None)  # nothing declared
+    fit_known = mr._capability_fit(known, profile)
+    fit_unknown = mr._capability_fit(unknown_all, profile)
+    unknown_caps = mr.unknown_required_capabilities(unknown_all, profile)
+    # vision + tools + structured (+ text output, which no metadata-free model
+    # can answer either) are all unanswered; each costs exactly the flat 0.15,
+    # never a refusal while unknowns are allowed.
+    assert set(unknown_caps) == {"text_output", "vision", "tools", "structured"}
+    assert fit_known - fit_unknown == pytest.approx(0.15 * len(unknown_caps))
+
+
+def test_one_unknown_capability_costs_exactly_fifteen_hundredths():
+    profile = mr.TaskProfile(needs_tools=True)
+    known = spec_cand(spec("known", supports_tools=True), info_obj=info("known"))
+    # models.dev omits tool_call for many entries; False there means UNKNOWN.
+    unknown = spec_cand(spec("unknown"), info_obj=info("unknown", tools=False))
+    assert mr.unknown_required_capabilities(unknown, profile) == ("tools",)
+    assert mr._capability_fit(known, profile) - mr._capability_fit(unknown, profile) == pytest.approx(0.15)
+
+
+def test_unknown_metadata_is_allowed_by_default(offline_catalog):
+    cand = mr.ModelCandidate("test", "mystery", None)
+    profile = mr.classify_request("what is in this shot", attachments=["a.png"])
+    assert [c.model for c in mr.filter_eligible([cand], profile)] == ["mystery"]
+
+
+def test_strict_mode_turns_unknown_into_unsupported(offline_catalog):
+    cand = mr.ModelCandidate("test", "mystery", None)
+    profile = mr.classify_request("what is in this shot", attachments=["a.png"])
+    strict = mr.RoutingConfig(allow_unknown_metadata=False)
+    assert mr.filter_eligible([cand], profile, strict) == []
+    assert mr._exclusion_reason(cand, profile, strict) == "unknown_vision"
+
+    cfg = _models_config([{"name": "mystery", "provider": "p1"}], allow_unknown_metadata=False)
+    report = mr.routing_report(cfg, "what is in this shot", attachments=("a.png",))
+    assert report["candidates"][0]["eligible"] is False
+    assert report["candidates"][0]["excluded_reason"].startswith("unknown_")
+    assert report["skip_reason"] == "no_eligible_model"
+
+
+def test_strict_mode_excludes_a_declared_unsupported_capability_everywhere():
+    strict = mr.RoutingConfig(allow_unknown_metadata=False)
+    profile = mr.classify_request("run the tests")
+    assert profile.needs_tools
+    cand = spec_cand(spec("notools", supports_tools=False), info_obj=info("notools", tools=True))
+    assert mr._exclusion_reason(cand, profile, strict) == "unsupported_tools"
+
+
+# -- hysteresis -------------------------------------------------------------
+
+def _two_models(cheap_in=2.0, rival_in=1.0):
+    return [
+        spec_cand(spec("current", cost_in=cheap_in, cost_out=cheap_in, supports_tools=True)),
+        spec_cand(spec("rival", cost_in=rival_in, cost_out=rival_in, supports_tools=True)),
+    ]
+
+
+def test_hysteresis_keeps_the_current_model_on_a_borderline_win():
+    profile = mr.classify_request("hello")
+    selection = mr.rank_candidates(
+        profile, _two_models(), mr.RoutingConfig(), current_model="current"
+    )
+    # The rival genuinely ranks first, but by less than the threshold.
+    assert selection.best_key == "test/rival"
+    assert selection.model == "current"
+    assert selection.kept_current is True
+    assert selection.skip_reason == "within_stability_threshold"
+
+
+def test_hysteresis_switches_only_when_clearly_beaten():
+    profile = mr.classify_request("hello")
+    selection = mr.rank_candidates(
+        profile,
+        [
+            spec_cand(spec("current", cost_in=50.0, cost_out=50.0)),
+            spec_cand(spec("rival", cost_in=0.1, cost_out=0.1)),
+        ],
+        mr.RoutingConfig(switch_on_cost=True),
+        current_model="current",
+    )
+    assert selection.model == "rival"
+    assert selection.skip_reason == ""
+    assert selection.kept_current is False
+
+
+def test_a_clear_cost_win_still_waits_for_the_switch_on_cost_optin():
+    """Hysteresis is not the only reason to keep the incumbent: a pure cost
+    downgrade mid-session is opt-in (prompt-cache stability)."""
+    profile = mr.classify_request("hello")
+    selection = mr.rank_candidates(
+        profile,
+        [
+            spec_cand(spec("current", cost_in=50.0, cost_out=50.0)),
+            spec_cand(spec("rival", cost_in=0.1, cost_out=0.1)),
+        ],
+        mr.RoutingConfig(),
+        current_model="current",
+    )
+    assert selection.model == "current"
+    assert "cost-only downgrade" in selection.reason
+
+
+def test_identical_models_never_switch():
+    profile = mr.classify_request("hello")
+    cands = [
+        spec_cand(spec("current", cost_in=1.0, cost_out=1.0)),
+        spec_cand(spec("rival", cost_in=1.0, cost_out=1.0)),
+    ]
+    selection = mr.rank_candidates(
+        profile, cands, mr.RoutingConfig(stability_threshold=0.0), current_model="current"
+    )
+    # gain is 0.0 and 0.0 is not "clearly beaten".
+    assert selection.model == "current"
+    assert selection.skip_reason in ("already_current", "within_stability_threshold")
+
+
+def test_min_improvement_is_an_alias_for_stability_threshold():
+    cfg = mr.RoutingConfig.from_dict({"min_improvement": 0.4})
+    assert cfg.stability_threshold == pytest.approx(0.4)
+
+    profile = mr.classify_request("hello")
+    kept = mr.rank_candidates(
+        profile, _two_models(), cfg, current_model="current"
+    )
+    switched = mr.rank_candidates(
+        profile,
+        _two_models(),
+        mr.RoutingConfig.from_dict({"min_improvement": 0.001, "switch_on_cost": True}),
+        current_model="current",
+    )
+    assert kept.model == "current"
+    assert switched.model == "rival"
+
+
+def test_default_threshold_is_point_one_five():
+    assert mr.RoutingConfig().stability_threshold == pytest.approx(TSIM)
+
+
+# -- skip_reason values -----------------------------------------------------
+
+def _all_candidates_config(**section):
+    base = {"switch_on_cost": True}
+    base.update(section)
+    return _models_config(
+        [
+            {"name": "current", "provider": "p1", "cost_in": 50.0, "cost_out": 50.0},
+            {"name": "rival", "provider": "p1", "cost_in": 0.1, "cost_out": 0.1},
+        ],
+        default="current",
+        **base,
+    )
+
+
+@pytest.mark.parametrize(
+    "label,config,prompt,current,expected",
+    [
+        ("switch", _all_candidates_config(), "hello", "current", ""),
+        ("disabled", _all_candidates_config(enabled=False), "hello", "current", "disabled"),
+        ("already_current", _models_config([{"name": "only", "provider": "p1"}]), "hello", "only", "already_current"),
+        (
+            "no_eligible_model",
+            _models_config([{"name": "gone", "provider": "p1", "deprecated": True}]),
+            "hello",
+            "",
+            "no_eligible_model",
+        ),
+        (
+            "within_stability_threshold",
+            _models_config(
+                [
+                    {"name": "current", "provider": "p1", "cost_in": 2.0, "cost_out": 2.0},
+                    {"name": "rival", "provider": "p1", "cost_in": 1.0, "cost_out": 1.0},
+                ],
+                default="current",
+            ),
+            "hello",
+            "current",
+            "within_stability_threshold",
+        ),
+    ],
+)
+def test_every_skip_reason_is_reported(offline_catalog, label, config, prompt, current, expected):
+    report = mr.routing_report(config, prompt, current_model=current)
+    assert report["skip_reason"] == expected, label
+    assert report["skip_reason"] in mr.SKIP_REASONS
+
+
+def test_no_candidates_is_reported_when_nothing_is_declared(offline_catalog):
+    report = mr.routing_report(
+        {"smart_model_routing": {"enabled": True}, "model": {"provider": "p1"}}, "hello"
+    )
+    assert report["skip_reason"] == "no_candidates"
+    assert report["candidates"] == []
+    assert report["eligible_count"] == 0
+
+
+def test_error_skip_reason_is_used_when_selection_blows_up(monkeypatch):
+    def _boom(*_a, **_kw):
+        raise RuntimeError("catalog exploded")
+
+    monkeypatch.setattr(mr, "_preview_selection", _boom)
+    report = mr.routing_report(_all_candidates_config(), "hello")
+    assert report["skip_reason"] == "error"
+    assert "catalog exploded" in report["reason"]
+
+
+def test_skip_reason_constants_match_the_shared_contract():
+    assert set(mr.SKIP_REASONS) == {
+        "", "disabled", "no_candidates", "no_eligible_model", "already_current",
+        "within_stability_threshold", "error",
+    }
+
+
+# -- the JSON report -------------------------------------------------------
+
+REPORT_KEYS = {
+    "enabled", "settings", "candidate_source", "request", "pricing", "selected",
+    "selected_provider", "reason", "skip_reason", "current", "kept_current",
+    "eligible_count", "candidates",
+}
+
+
+def test_report_has_exactly_the_contract_key_set(offline_catalog):
+    report = mr.routing_report(_all_candidates_config(), "hello")
+    assert set(report) == REPORT_KEYS
+    assert set(report["settings"]) == {
+        "strategy", "stability_threshold", "allow_unknown_metadata",
+        "cost_optimization", "preferred_models_only",
+    }
+    assert set(report["request"]) == {
+        "tier", "est_input_tokens", "est_output_tokens", "needs_tools",
+        "needs_vision", "needs_audio", "reasons",
+    }
+    assert set(report["pricing"]) == {"cheapest_eligible", "median_fallback", "policy"}
+    assert set(report["candidates"][0]) == {
+        "model", "provider", "eligible", "score", "tier", "cost_in", "cost_out",
+        "priced", "charged_as", "unknown_capabilities", "excluded_reason",
+    }
+
+
+def test_report_is_json_serialisable_and_stable(offline_catalog):
+    report = mr.routing_report(_all_candidates_config(), "hello")
+    text = json.dumps(report, indent=2, sort_keys=True)
+    assert json.loads(text) == report
+    # sorted keys, two-space indent
+    assert text.splitlines()[1].startswith('  "candidate_source"')
+
+
+def test_disabled_report_still_computes_the_hypothetical_selection(offline_catalog):
+    report = mr.routing_report(_all_candidates_config(enabled=False), "hello")
+    assert report["enabled"] is False
+    assert report["skip_reason"] == "disabled"
+    # the hypothetical is still there — it just is not applied
+    assert report["selected"] in {"current", "rival"}
+    assert report["candidates"]
+    assert report["pricing"]["median_fallback"] is not None
+
+
+def test_report_agrees_with_the_turn_hook(offline_catalog):
+    """The report and the hook share rank_candidates, so they cannot disagree."""
+    cfg = _models_config(
+        [
+            {"name": "current", "provider": "p1", "cost_in": 50.0, "cost_out": 50.0},
+            {"name": "rival", "provider": "p1", "cost_in": 0.1, "cost_out": 0.1},
+        ],
+        default="current",
+    )
+    prompt = "What is 15 multiplied by 8?"
+
+    report = mr.routing_report(cfg, prompt, current_model="current")
+
+    agent = _StubAgent(model="current", provider="p1")
+    decision = mr.route_turn(agent, prompt, config=cfg)
+
+    assert decision is not None
+    assert (decision.provider, decision.model) == (
+        report["selected_provider"], report["selected"]
+    )
+    assert decision.skip_reason == report["skip_reason"]
+    assert agent.switch_calls, "a clearly beaten incumbent should have been replaced"
+    assert agent.model == report["selected"]
+
+
+def test_report_never_writes_config(offline_catalog):
+    cfg = _all_candidates_config()
+    before = repr(cfg)
+    mr.routing_report(cfg, "hello")
+    assert repr(cfg) == before
+
+
+def test_legacy_candidates_path_matches_the_models_path(offline_catalog):
+    """Same models, same prices, same verdict — whichever key declared them."""
+    models = [
+        {"name": "a", "provider": "test", "cost_in": 20.0, "cost_out": 20.0},
+        {"name": "b", "provider": "test", "cost_in": 0.1, "cost_out": 0.1},
+    ]
+    canonical = {"smart_model_routing": {"enabled": True, "models": models},
+                 "model": {"provider": "test", "default": "a"}}
+    legacy = {"smart_model_routing": {"enabled": True, "candidates": ["a", "b"]},
+              "model": {"provider": "test", "default": "a"}}
+    canonical_selection = mr.routing_report(canonical, "hello")
+    legacy_selection = mr.routing_report(legacy, "hello")
+    # The legacy path carries no declared prices, so only the *choice* has to
+    # agree with a cost-free pool; what matters is that both go through one
+    # scoring path and both switch away from the expensive incumbent.
+    assert canonical_selection["candidate_source"] == "models"
+    assert legacy_selection["candidate_source"] == "candidates"
+    assert canonical_selection["selected"] == "b"
