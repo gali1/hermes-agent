@@ -61,6 +61,8 @@ __all__ = [
     "configured_models",
     "declared_model_list",
     "estimate_cost",
+    "estimate_cost_breakdown",
+    "expected_retry_fraction",
     "explain",
     "filter_eligible",
     "is_enabled",
@@ -153,6 +155,16 @@ class TaskProfile:
     output_modalities: Tuple[str, ...] = ("text",)
     #: Context the request must fit into (conversation + prompt + output).
     required_context: int = 0
+    #: Input tokens expected to hit the provider's prompt cache (billed at the
+    #: cache-read rate when the catalog prices one).  0 on a cold turn.
+    est_cached_input_tokens: int = 0
+    #: Reasoning tokens the turn will pay for on top of the answer; billed at the
+    #: output rate because that is how providers charge them.
+    est_reasoning_tokens: int = 0
+    #: Number of image attachments, the basis for the modality term (each is
+    #: priced as a fixed token equivalent at the input rate — the catalog has no
+    #: per-image surcharge field, and inventing one would be a fiction).
+    image_inputs: int = 0
     #: User pinned a model for this request; selection must not override it.
     pinned_model: str = ""
     #: Which signals fired, for the human-readable explanation.
@@ -268,6 +280,8 @@ def classify_request(
     tool_available: bool = True,
     pinned_model: str = "",
     expected_output_tokens: Optional[int] = None,
+    cached_input_tokens: int = 0,
+    expected_reasoning_tokens: Optional[int] = None,
 ) -> TaskProfile:
     """Classify a request deterministically.
 
@@ -338,10 +352,15 @@ def classify_request(
 
     # ---- modalities -------------------------------------------------------
     in_mods: List[str] = ["text"]
+    image_inputs = 0
     for hint in attachments:
         h = str(hint).strip().lower()
         if not h:
             continue
+        if h == "image":
+            image_inputs += 1
+        elif h.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
+            image_inputs += 1
         if h in _INPUT_MODALITIES and h not in in_mods:
             in_mods.append(h)
             signals.append(f"input:{h}")
@@ -392,6 +411,21 @@ def classify_request(
     else:
         out_tokens = max(1, int(expected_output_tokens))
 
+    # Prompt-cache credit is caller-supplied: only the turn hook knows whether the
+    # stable prefix was already sent (a cold first turn pays full input price).  It
+    # is clamped to the input estimate so it can never manufacture a negative bill.
+    cached_tokens = max(0, min(int(cached_input_tokens or 0), in_tokens))
+
+    # Reasoning tokens are billed as output by every provider we price; assume a
+    # half-answer's worth of deliberation for a reasoning task, and none otherwise.
+    # Explicitly overridable by a caller that measures its own reasoning budget.
+    if expected_reasoning_tokens is None:
+        reasoning_tokens = int(round(out_tokens * 0.5)) if needs_reasoning else 0
+    else:
+        reasoning_tokens = max(0, int(expected_reasoning_tokens))
+    if reasoning_tokens:
+        signals.append("reasoning-tokens")
+
     return TaskProfile(
         complexity=level,
         est_input_tokens=in_tokens,
@@ -402,6 +436,9 @@ def classify_request(
         input_modalities=tuple(in_mods),
         output_modalities=tuple(out_mods),
         required_context=in_tokens + out_tokens,
+        est_cached_input_tokens=cached_tokens,
+        est_reasoning_tokens=reasoning_tokens,
+        image_inputs=image_inputs,
         pinned_model=(pinned_model or "").strip(),
         signals=tuple(signals),
     )
@@ -439,6 +476,7 @@ SPEC_FIELDS = (
     "max_output",
     "cost_in",
     "cost_out",
+    "cost_cache_read",
     "tier_rank",
     "supports_tools",
     "supports_vision",
@@ -457,7 +495,7 @@ _BOOL_SPEC_FIELDS = (
     "deprecated",
 )
 _INT_SPEC_FIELDS = ("context_window", "max_output", "tier_rank")
-_COST_SPEC_FIELDS = ("cost_in", "cost_out")
+_COST_SPEC_FIELDS = ("cost_in", "cost_out", "cost_cache_read")
 
 
 def _as_bool(value: Any) -> Optional[bool]:
@@ -527,6 +565,7 @@ class ModelSpec:
     max_output: Optional[int] = None
     cost_in: Optional[float] = None
     cost_out: Optional[float] = None
+    cost_cache_read: Optional[float] = None
     tier_rank: Optional[int] = None
     supports_tools: Optional[bool] = None
     supports_vision: Optional[bool] = None
@@ -761,6 +800,22 @@ class ModelCandidate:
         if ci <= 0 and co <= 0:
             return None, None
         return ci, co
+
+    def cache_cost(self) -> Optional[float]:
+        """Cache-read price, declared override first, else catalog, else ``None``.
+
+        ``None`` is not "free": the cost model falls back to the input rate, which
+        is the conservative reading (a model with no published cache discount is
+        billed as if every cached token still cost full price).
+        """
+        if self.spec is not None and self.spec.cost_cache_read:
+            return float(self.spec.cost_cache_read)
+        rate = getattr(self.info, "cost_cache_read", None) if self.info is not None else None
+        try:
+            value = float(rate) if rate else 0.0
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1490,16 +1545,65 @@ def filter_eligible(
 # Cost + scoring
 # ---------------------------------------------------------------------------
 
-def estimate_cost(
+#: Tokens one image attachment is charged as.  Vision models bill an image as a
+#: token block, not as a separate line item; models.dev publishes no per-image
+#: price, so a fixed equivalent keeps images priced without inventing a rate.
+#: 1600 is the upper end of the common 1024×1024 tiling on current vision APIs.
+_IMAGE_TOKEN_EQUIVALENT = 1600
+
+#: Most one retry can add to a request's cost.  A model that fails half the time
+#: expects one retry; past that the candidate is unreliable enough that price is
+#: not the interesting number.
+_MAX_RETRY_FRACTION = 1.0
+
+
+def expected_retry_fraction(reliability: Optional[float]) -> float:
+    """Expected retries per successful request for a declaration, capped.
+
+    ``reliability`` is the operator-declared success rate (the only source the
+    engine has — nothing measures outcomes).  Unknown means ``0.0``: the cost
+    model does not invent a retry charge for a model nobody has characterised.
+    """
+    if reliability is None:
+        return 0.0
+    try:
+        p = float(reliability)
+    except (TypeError, ValueError):
+        return 0.0
+    if p >= 1.0:
+        return 0.0
+    if p <= 0.0:
+        return _MAX_RETRY_FRACTION
+    return min(_MAX_RETRY_FRACTION, (1.0 - p) / p)
+
+
+def estimate_cost_breakdown(
     candidate: ModelCandidate,
     profile: TaskProfile,
     *,
     charge: Optional[Tuple[Optional[float], Optional[float]]] = None,
-) -> Optional[float]:
-    """Expected USD cost for this request; ``None`` when pricing is unknown.
+    cache_charge: Optional[float] = None,
+    reliability: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Expected USD cost for this request, term by term; ``None`` when unpriced.
 
-    ``charge`` overrides the candidate's own prices — the selection path passes
-    the pool median there so an unpriced model is never treated as free.
+    Terms (all in USD per million tokens, the catalog's normalised unit):
+
+    - ``input`` — input tokens that are not cache hits, at ``cost_in``;
+    - ``cached_input`` — cache-hit tokens at the cache-read price, falling back
+      to ``cost_in`` when no discount is published;
+    - ``output`` — the answer, at ``cost_out``;
+    - ``reasoning`` — deliberation tokens at ``cost_out``, and only for models
+      that actually report reasoning support (a model that cannot reason does
+      not get billed for reasoning it will not emit);
+    - ``modality`` — image attachments as token equivalents at ``cost_in``;
+    - ``retries`` — the subtotal times the expected retry fraction derived from
+      a declared reliability.
+
+    ``charge`` overrides the candidate's own ``(cost_in, cost_out)`` — the
+    selection path passes the pool median there so an unpriced model is never
+    treated as free.  When a charge override is in play the cache rate defaults
+    to that same input rate: an unpriced model cannot claim a discount.
     """
     if charge is not None:
         ci, co = charge
@@ -1507,11 +1611,86 @@ def estimate_cost(
         ci, co = candidate.costs()
     if ci is None and co is None:
         return None
-    ci = ci or 0.0
-    co = co or 0.0
-    return (profile.est_input_tokens / 1_000_000.0) * ci + (
-        profile.est_output_tokens / 1_000_000.0
-    ) * co
+    ci = float(ci or 0.0)
+    co = float(co or 0.0)
+
+    cached_tokens = max(0, min(int(profile.est_cached_input_tokens or 0), int(profile.est_input_tokens or 0)))
+    billable_input = max(0, int(profile.est_input_tokens or 0) - cached_tokens)
+
+    own_in, own_out = candidate.costs()
+    declared_cache = candidate.cache_cost()
+    # Own/declared cache price applies whenever the candidate is being charged its
+    # own input price (the normal case, and also charge=None).  A model priced at
+    # the pool median has no published rate of its own to discount from.
+    charged_own_prices = charge is None or own_in is not None or own_out is not None
+    if cache_charge is not None:
+        cache_rate = float(cache_charge)
+    elif charged_own_prices and declared_cache is not None:
+        cache_rate = declared_cache
+    else:
+        cache_rate = ci
+
+    reasoning_tokens = int(profile.est_reasoning_tokens or 0)
+    if reasoning_tokens and candidate.supports_reasoning() is not CapabilityState.SUPPORTED:
+        # Only a model that reports reasoning support spends these tokens.
+        reasoning_tokens = 0
+
+    image_tokens = max(0, int(profile.image_inputs or 0)) * _IMAGE_TOKEN_EQUIVALENT
+
+    input_cost = (billable_input / 1_000_000.0) * ci
+    cached_cost = (cached_tokens / 1_000_000.0) * cache_rate
+    output_cost = (int(profile.est_output_tokens or 0) / 1_000_000.0) * co
+    reasoning_cost = (reasoning_tokens / 1_000_000.0) * co
+    modality_cost = (image_tokens / 1_000_000.0) * ci
+
+    subtotal = input_cost + cached_cost + output_cost + reasoning_cost + modality_cost
+    retry_fraction = expected_retry_fraction(reliability)
+    retry_cost = subtotal * retry_fraction
+
+    return {
+        "units": "usd_per_million_tokens",
+        "input": round(input_cost, 12),
+        "cached_input": round(cached_cost, 12),
+        "output": round(output_cost, 12),
+        "reasoning": round(reasoning_cost, 12),
+        "modality": round(modality_cost, 12),
+        "subtotal": round(subtotal, 12),
+        "retries": round(retry_cost, 12),
+        "expected_retries": round(retry_fraction, 6),
+        "total": round(subtotal + retry_cost, 12),
+        "tokens": {
+            "billable_input": billable_input,
+            "cached_input": cached_tokens,
+            "output": int(profile.est_output_tokens or 0),
+            "reasoning": reasoning_tokens,
+            "image_equivalent": image_tokens,
+        },
+        "charged": {"cost_in": ci, "cost_out": co, "cost_cache_read": cache_rate},
+        "policy": (
+            "reasoning_at_output_rate; images_as_input_token_equivalents; "
+            "cache_read_falls_back_to_input; retries_from_declared_reliability"
+        ),
+    }
+
+
+def estimate_cost(
+    candidate: ModelCandidate,
+    profile: TaskProfile,
+    *,
+    charge: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    cache_charge: Optional[float] = None,
+    reliability: Optional[float] = None,
+) -> Optional[float]:
+    """Expected USD cost for this request; ``None`` when pricing is unknown.
+
+    Total of :func:`estimate_cost_breakdown`.  With no cache credit, no
+    reasoning tokens, no images and no declared reliability the total is exactly
+    the input-plus-output estimate it has always been.
+    """
+    breakdown = estimate_cost_breakdown(
+        candidate, profile, charge=charge, cache_charge=cache_charge, reliability=reliability
+    )
+    return None if breakdown is None else breakdown["total"]
 
 
 def _median_pair(candidates: Sequence[ModelCandidate]) -> Optional[Tuple[float, float]]:
@@ -1548,6 +1727,7 @@ def pricing_for(
     candidates: Sequence[ModelCandidate],
     *,
     median_pair: Optional[Tuple[float, float]] = None,
+    config: Optional[RoutingConfig] = None,
 ) -> Dict[str, Any]:
     """The ``pricing`` block of the shared report.
 
@@ -1555,12 +1735,19 @@ def pricing_for(
     ``cheapest_eligible`` is the estimated cost of the cheapest eligible
     candidate at its charged price.  ``median_pair`` lets the caller supply the
     same pair the scoring path used, so the report cannot describe a different
-    charge than the one that decided the turn.
+    charge than the one that decided the turn.  ``config`` supplies the declared
+    reliabilities so the retry term matches the one ranking used.
     """
+    cfg = config or RoutingConfig()
     if median_pair is None:
         median_pair = _median_pair(candidates)
     costs = [
-        estimate_cost(c, profile, charge=charge_for(c, median_pair)) for c in candidates
+        estimate_cost(
+            c, profile,
+            charge=charge_for(c, median_pair),
+            reliability=_reliability_of(c, cfg),
+        )
+        for c in candidates
     ]
     known = [c for c in costs if c is not None]
     return {
@@ -1639,7 +1826,8 @@ def score_candidate(
 
     capability = _capability_fit(candidate, profile)
 
-    cost = estimate_cost(candidate, profile, charge=charge)
+    rel = _reliability_of(candidate, cfg)
+    cost = estimate_cost(candidate, profile, charge=charge, reliability=rel)
     if cost is None:
         cost_score = 0.35  # no price anywhere: conservative, never a free lunch
     elif not cfg.cost_optimization:
@@ -1650,7 +1838,14 @@ def score_candidate(
         ceiling = cost_ceiling if cost_ceiling and cost_ceiling > 0 else None
         cost_score = 1.0 - min(1.0, cost / ceiling) if ceiling else 1.0
 
-    rel = _reliability_of(candidate, cfg)
+    if profile.needs_reasoning and candidate.supports_reasoning() is not CapabilityState.SUPPORTED:
+        # Spec §7 items 3/4: when the task requires reasoning, a model whose
+        # reasoning support is unconfirmed must not become the pick merely
+        # because its price is lower — that is the "under-serve complex work to
+        # save money" failure, and honestly-priced reasoning tokens would
+        # otherwise hand it the whole cost term.
+        cost_score = 0.0
+
     # Cold start: unknown reliability is 0.5, never 1.0 (spec §16.3).
     rel_score = 0.5 if rel is None else max(0.0, min(1.0, rel))
 
@@ -1863,7 +2058,9 @@ def rank_candidates(
             cand = pinned[0]
             selection.model, selection.provider = cand.model, cand.provider
             selection.score, selection.pinned = 1.0, True
-            selection.est_cost = estimate_cost(cand, profile)
+            selection.est_cost = estimate_cost(
+                cand, profile, reliability=_reliability_of(cand, cfg)
+            )
             selection.reason = "user pinned model"
             selection.eligible_count = 1
             selection.considered = [(cand.key, 1.0)]
@@ -1896,7 +2093,7 @@ def rank_candidates(
     eligible = filter_eligible(candidates, profile, cfg)
     selection.eligible_count = len(eligible)
     median_pair = _median_pair(eligible) or _median_pair(candidates)
-    selection.pricing = pricing_for(profile, eligible, median_pair=median_pair)
+    selection.pricing = pricing_for(profile, eligible, median_pair=median_pair, config=cfg)
 
     if not eligible:
         selection.reason = (
@@ -1913,7 +2110,12 @@ def rank_candidates(
     costs = [
         cost
         for cost in (
-            estimate_cost(c, profile, charge=charge_for(c, median_pair)) for c in eligible
+            estimate_cost(
+                c, profile,
+                charge=charge_for(c, median_pair),
+                reliability=_reliability_of(c, cfg),
+            )
+            for c in eligible
         )
         if cost is not None
     ]
@@ -1969,7 +2171,11 @@ def rank_candidates(
     def _keep(cand: ModelCandidate, reason: str, skip_reason: str) -> Selection:
         selection.model, selection.provider = cand.model, cand.provider
         selection.score = by_key.get((cand.provider, cand.model), 0.0)
-        selection.est_cost = estimate_cost(cand, profile, charge=charge_for(cand, median_pair))
+        selection.est_cost = estimate_cost(
+            cand, profile,
+            charge=charge_for(cand, median_pair),
+            reliability=_reliability_of(cand, cfg),
+        )
         selection.reason = reason
         selection.skip_reason = skip_reason
         selection.kept_current = True
@@ -1983,9 +2189,15 @@ def rank_candidates(
     if incumbent is not None and incumbent is not best:
         inc_score = by_key.get((incumbent.provider, incumbent.model), 0.0)
         gain = best_score - inc_score
-        best_cost = estimate_cost(best, profile, charge=charge_for(best, median_pair))
+        best_cost = estimate_cost(
+            best, profile,
+            charge=charge_for(best, median_pair),
+            reliability=_reliability_of(best, cfg),
+        )
         inc_cost = estimate_cost(
-            incumbent, profile, charge=charge_for(incumbent, median_pair)
+            incumbent, profile,
+            charge=charge_for(incumbent, median_pair),
+            reliability=_reliability_of(incumbent, cfg),
         )
         downgrade = best_cost is not None and inc_cost is not None and best_cost < inc_cost
 
@@ -2021,7 +2233,11 @@ def rank_candidates(
 
     selection.model, selection.provider = best.model, best.provider
     selection.score = best_score
-    selection.est_cost = estimate_cost(best, profile, charge=charge_for(best, median_pair))
+    selection.est_cost = estimate_cost(
+        best, profile,
+        charge=charge_for(best, median_pair),
+        reliability=_reliability_of(best, cfg),
+    )
     selection.reason = (
         f"selected over {len(eligible) - 1} other eligible model(s) for "
         f"{profile.complexity.label} task"
@@ -2763,6 +2979,19 @@ def _conversation_token_estimate(messages: Any, agent: Any = None) -> int:
         return 0
 
 
+def _cached_prefix_tokens(agent: Any) -> int:
+    """Tokens of the stable prompt prefix a provider can serve from its cache.
+
+    Only the system prompt is byte-stable across turns; conversation history
+    grows and is not guaranteed identical, so it is never credited.  ``0`` when
+    there is no cached prompt — a cold turn pays full input price.
+    """
+    if agent is None:
+        return 0
+    text = str(getattr(agent, "_cached_system_prompt", "") or "")
+    return _estimate_tokens(text) if text else 0
+
+
 def route_turn(
     agent: Any,
     user_message: str,
@@ -2829,13 +3058,16 @@ def route_turn(
         )
         models = [c.model for c in candidates]
 
+        turn = int(getattr(agent, _ROUTER_TURN_ATTR, 0) or 0)
         profile = classify_request(
             user_message or "",
             attachments=attachments,
             conversation_tokens=conversation_tokens,
+            # Prompt-cache credit only from the second routed turn: turn 0 is the
+            # cold request that populates the cache, so it pays full input price.
+            cached_input_tokens=_cached_prefix_tokens(agent) if turn > 0 else 0,
             tool_available=bool(getattr(agent, "tools", None)),
         )
-        turn = int(getattr(agent, _ROUTER_TURN_ATTR, 0) or 0)
         # A session running on a non-default model is a deliberate choice (a
         # gateway /model override, a --model flag, a restored session), so it
         # gets the same protection as a mid-session incumbent.

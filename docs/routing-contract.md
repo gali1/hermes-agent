@@ -64,6 +64,28 @@ ties. It cannot alone dislodge an incumbent **at the default `stability_threshol
 0.15** — that is a threshold-dependent statement, not an absolute one: any configured
 threshold below 0.15 makes the 0.15 quality-strategy swing decisive on its own.
 
+### C4a — What "cost" means (oklab-1)
+
+`estimate_cost` is the total of `estimate_cost_breakdown`'s terms, all in USD per
+million tokens (the catalog's unit): uncached input at `cost_in`; cache-hit input at
+`cost_cache_read` (declared override or catalog) **falling back to `cost_in`** when no
+discount is published; the answer at `cost_out`; reasoning tokens at `cost_out` and
+only for a model reporting reasoning support; images as a fixed 1600-token input
+equivalent (`_IMAGE_TOKEN_EQUIVALENT`) because models.dev has no per-image price; and
+**expected retries** = subtotal × `(1−p)/p` from a declared `reliability`, capped at
+1.0, and `0` when no reliability is declared. Cache credit is caller-supplied and only
+from the second routed turn (turn 0 populates the cache), and is clamped to the input
+estimate. `charge` (the pool median for an unpriced model) prices every term, so an
+unpriced model can never claim a discount.
+
+With no cache credit, no reasoning tokens, no images and no declared reliability the
+total is exactly the old `input*in + output*out` — a config that declares none of the
+new terms prices identically to before. A model whose required capability is
+**UNKNOWN** gets no cost credit on a reasoning task (`cost_score = 0`): honestly
+priced reasoning tokens would otherwise let an unconfirmed non-reasoner win hard
+prompts on price, which items 3/4 forbid. bro-2's cost penalty is unchanged.
+
+
 ## C5 — Stability (anti-flapping)
 The incumbent model keeps the turn unless a rival beats it by more than
 `stability_threshold` (default `0.15`; `min_improvement` is the same knob under
