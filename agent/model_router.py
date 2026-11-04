@@ -1058,6 +1058,7 @@ def score_candidate(
     config: Optional[RoutingConfig] = None,
     *,
     current_model: str = "",
+    current_provider: str = "",
     cost_ceiling: Optional[float] = None,
     charge: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> float:
@@ -1090,7 +1091,9 @@ def score_candidate(
 
     context = _context_fit(candidate, profile)
 
-    continuity = 1.0 if current_model and candidate.model == current_model else 0.0
+    continuity = 1.0 if (current_model and candidate.model == current_model
+                         and (not current_provider
+                              or candidate.provider.strip().lower() == current_provider.strip().lower())) else 0.0
 
     if cfg.strategy == "cost":
         w = {"capability": 0.35, "cost": 0.55, "reliability": 0.05, "context": 0.05, "continuity": 0.0}
@@ -1257,6 +1260,7 @@ def rank_candidates(
     config: Optional[RoutingConfig] = None,
     *,
     current_model: str = "",
+    current_provider: str = "",
     mid_session: bool = False,
 ) -> Selection:
     """Rank ``candidates`` for ``profile`` and pick one.  THE scoring path.
@@ -1349,6 +1353,7 @@ def rank_candidates(
             score_candidate(
                 cand, profile, cfg,
                 current_model=current,
+                current_provider=current_provider,
                 cost_ceiling=ceiling,
                 charge=charge_for(cand, median_pair),
             ),
@@ -1373,7 +1378,21 @@ def rank_candidates(
             )
         )
 
-    incumbent = next((c for c in eligible if c.model == current), None) if current else None
+    # The incumbent is identity-based, not name-based: one model id can exist on two
+    # providers, and a name-only match lets the "kept current" path report a provider
+    # the session is not actually on. Falls back to the name only when the caller has
+    # no provider to compare with (configs that omit it keep working).
+    incumbent = None
+    if current:
+        named = [c for c in eligible if c.model == current]
+        if current_provider:
+            incumbent = next(
+                (c for c in named
+                 if c.provider.strip().lower() == current_provider.strip().lower()),
+                None,
+            )
+        if incumbent is None:
+            incumbent = named[0] if named else None
 
     def _keep(cand: ModelCandidate, reason: str, skip_reason: str) -> Selection:
         selection.model, selection.provider = cand.model, cand.provider
@@ -1473,6 +1492,7 @@ def select_model(
     config: Optional[RoutingConfig] = None,
     *,
     current_model: str = "",
+    current_provider: str = "",
     mid_session: bool = False,
 ) -> Optional[Decision]:
     """Pick the best eligible model, or ``None`` when nothing qualifies.
@@ -1483,7 +1503,8 @@ def select_model(
     ineligible).
     """
     selection = rank_candidates(
-        profile, candidates, config, current_model=current_model, mid_session=mid_session
+        profile, candidates, config, current_model=current_model,
+        current_provider=current_provider, mid_session=mid_session,
     )
     return selection.decision()
 
@@ -2173,7 +2194,8 @@ def route_turn(
 
         # ONE ranking path: the same function `explain` and `status --json` use.
         selection = rank_candidates(
-            profile, candidates, cfg, current_model=current, mid_session=mid_session
+            profile, candidates, cfg, current_model=current,
+            current_provider=provider, mid_session=mid_session,
         )
 
         if selection.skip_reason == "no_eligible_model" and pool_scope != "preferred":
@@ -2185,7 +2207,8 @@ def route_turn(
             if len(widened) > len(models):
                 candidates = _candidates_from_pool(config, provider, widened)
                 selection = rank_candidates(
-                    profile, candidates, cfg, current_model=current, mid_session=mid_session
+                    profile, candidates, cfg, current_model=current,
+                    current_provider=provider, mid_session=mid_session,
                 )
                 if selection.model and selection.model not in models:
                     selection.reason = (
@@ -2206,7 +2229,9 @@ def route_turn(
             )
             return None
 
-        if decision.model == current:
+        same_provider = (not decision.provider or not provider
+                         or decision.provider.strip().lower() == provider.strip().lower())
+        if decision.model == current and same_provider:
             _log.info(
                 "routing: kept %s (%s) for %s task",
                 decision.key, decision.reason, decision.complexity,

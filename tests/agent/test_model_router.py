@@ -1369,3 +1369,44 @@ def test_candidate_reliability_is_only_operator_config():
     assert plain.reliability is None
     cfg = mr.RoutingConfig.from_dict({"reliability": {"m": 0.9}})
     assert mr._reliability_of(plain, cfg) == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Incumbent identity is (provider, model), not the model name alone. One model id
+# can be offered by two providers, and a name-only match reports a provider the
+# session is not on (contract C5 / C8 boundary).
+# ---------------------------------------------------------------------------
+
+
+def test_same_model_name_on_two_providers_keeps_the_incumbent_provider():
+    profile = mr.classify_request("What is 15 multiplied by 8?")
+    incumbent = mr.ModelCandidate("prov-a", "same-model", info("same-model"))
+    rival = mr.ModelCandidate("prov-b", "same-model", info("same-model"))
+    selection = mr.rank_candidates(
+        profile, [rival, incumbent], current_model="same-model", current_provider="prov-a"
+    )
+    assert (selection.provider, selection.model) == ("prov-a", "same-model")
+    assert selection.skip_reason == "already_current"
+
+
+def test_continuity_does_not_credit_another_providers_identical_model_name():
+    profile = mr.classify_request("What is 15 multiplied by 8?")
+    cfg = mr.RoutingConfig(strategy="quality")      # continuity carries weight here
+    mine = mr.ModelCandidate("prov-a", "same-model", info("same-model"))
+    theirs = mr.ModelCandidate("prov-b", "same-model", info("same-model"))
+    scored_mine = mr.score_candidate(mine, profile, cfg, current_model="same-model",
+                                     current_provider="prov-a")
+    scored_theirs = mr.score_candidate(theirs, profile, cfg, current_model="same-model",
+                                       current_provider="prov-a")
+    assert scored_mine > scored_theirs
+
+
+def test_ties_resolve_on_the_provider_qualified_key():
+    """The documented order is (-score, provider/model): total, so two providers
+    offering the same model name cannot tie into declaration order."""
+    profile = mr.classify_request("What is 15 multiplied by 8?")
+    a = mr.ModelCandidate("aaa", "same-model", info("same-model"))
+    z = mr.ModelCandidate("zzz", "same-model", info("same-model"))
+    first = mr.rank_candidates(profile, [z, a])
+    second = mr.rank_candidates(profile, [a, z])
+    assert first.best_key == second.best_key == "aaa/same-model"
