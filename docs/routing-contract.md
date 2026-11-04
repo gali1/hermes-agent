@@ -108,11 +108,18 @@ A switch may cross providers, but must resolve credentials through the target
 provider's existing profile and rebuild credential pools, prompt-cache flags and
 the compressor exactly as a manual switch does. Provider pools are never mixed:
 a cross-provider move clears the previous provider's pool rather than borrowing
-from it. fastembed performs the re-resolution itself at the turn boundary;
-bro-2 delegates to the agent's existing `switch_model`, which rebuilds the pools,
-prompt-cache flags and compressor exactly as a manual switch would (verified in
-`agent/model_routing.py: maybe_apply_model_routing`). Neither side may switch by
-mutating the model name alone.
+from it. Neither side may switch by mutating the model name alone.
+
+**Mechanism — delegation first (agreed with bro-2).** The switch is delegated to the
+runtime's model-swap entry point (`agent.switch_model`) whenever one exists, because
+that is the seam that re-resolves endpoint and credentials by construction and the
+seam both sides' falsifiers already exercise. In-place re-resolution is the
+**fallback**, not a parallel design, and it is allowed only when `switch_model` is
+absent — the implementation must name that absence in the reason it reports. The
+fallback must satisfy the same postconditions (target-profile credentials, previous
+pool cleared, prompt-cache flags, compressor) and is verified by the same falsifier;
+without that, "otherwise managed in place" becomes a permanent way for one side to
+stay put.
 
 ## C9 — Multimodal continuity — **NOT IMPLEMENTED, both sides (status, not contract text)**
 
@@ -151,8 +158,16 @@ dropping the attachment.
 Every decision carries a human-readable reason and a machine `skip_reason`, drawn
 from one vocabulary both sides accept: `no_candidates`, `no_eligible_model`,
 `already_current`, `within_stability_threshold`, `moa_active`, `disabled`, `error`
-(oklab-1 pins the set in `SKIP_REASONS`; `moa_active` is reserved — nothing emits it
-yet, because the MoA path does not consult the router).
+(oklab-1 pins the set in `SKIP_REASONS`).
+
+**`moa_active` is in the vocabulary but neither side emits it, and both are silent about
+it.** oklab-1 skips routing at the call site when a MoA config is present
+(`conversation_loop.py:1581`); bro-2 skips inside the router
+(`model_routing.py:678`) and returns `None` before any `Decision` exists. C7 is
+preserved on both sides, but C10's requirement that every skip be explainable is
+**unmet for this case** — nothing surfaces `skip_reason=moa_active` in the dict. Open
+item below; the earlier claim in this document that the MoA path "does not consult the
+router" was true of oklab-1 only and is withdrawn.
 
 **The machine surface is a dict, and it is normative.** oklab-1 calls it
 `routing_report()` (`model_router.py:2361-2455`), bro-2 calls it `explain_routing()`
@@ -208,13 +223,14 @@ Still open:
 
 1. **C9a wiring** — the one genuinely unimplemented clause. Both sides must derive the
    modality requirement from attachments at the turn boundary. Owner: both.
+2. **C10 `moa_active` is silent** — both sides skip routing under MoA without exposing
+   the reason; emit `skip_reason=moa_active` in the dict surface so a user can see why
+   no selection happened. Owner: both.
 2. **bro-2 defect — fixed, wiring still open** — `classify_request` no longer raises on a
    content-parts list and derives the modality flags from the parts (regression tests in
    `tests/agent/test_model_routing.py`). What remains is item 1's string-prompt path.
    Owner: bro-2, then both.
-3. **C8 form** — self-managed switching there vs `switch_model` delegation here. Both
-   are acceptable in behaviour; decide whether the delegation form becomes the shared
-   contract. Owner: both.
-4. **Name collision to document** — C4 `reliability` (routing preference) and the tool
+4. **C8 form (closed)** — delegation-first agreed; see C8 above.
+5. **Name collision to document** — C4 `reliability` (routing preference) and the tool
    search's `reliability_rerank` (call-outcome re-rank) are unrelated knobs with similar
    names; never let one config imply the other.
