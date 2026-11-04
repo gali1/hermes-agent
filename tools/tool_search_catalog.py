@@ -11,7 +11,10 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-import snowballstemmer
+try:  # pure-Python Snowball stemmer; see the guarded fallback in ``_stem``
+    import snowballstemmer
+except ImportError:  # pragma: no cover - exercised by the lean-install test
+    snowballstemmer = None  # type: ignore[assignment]
 
 # Reserved bridge names: a user/plugin/MCP tool may not take them (registry override
 # protection rejects such registrations).
@@ -43,7 +46,14 @@ _thread_local = threading.local()
 def _stem(token: str) -> str:
     """Stem one token, memoized across stateless catalog rebuilds. Snowball stemmers carry
     mutable parsing state and bridge dispatch runs on parallel tool-call threads, so the
-    stemmer is one-per-thread, created lazily."""
+    stemmer is one-per-thread, created lazily.
+
+    If the package is absent (a lean install on Python < 3.14, where the pinned
+    requirement's marker skips it) the token is returned unchanged rather than raising:
+    matching degrades to exact prefixes, which is worse recall, not a broken tool search.
+    """
+    if snowballstemmer is None:
+        return token
     if getattr(_thread_local, "stemmer", None) is None:
         _thread_local.stemmer = snowballstemmer.stemmer("english")
     return _thread_local.stemmer.stemWord(token)

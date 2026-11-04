@@ -534,3 +534,39 @@ class TestDispatchWiring:
                                             "zero_match_llm_timeout": 99})
         assert config.reliability_rerank is True
         assert config.zero_match_llm_timeout == 15.0
+
+
+class TestLeanInstallStemmer:
+    """A missing Snowball stemmer must degrade recall, never break tool search.
+
+    The pinned requirement carries a ``python_version >= '3.14'`` marker, so a 3.12/3.13
+    install legitimately does not have it. The import is therefore optional and ``_stem``
+    must fall through to the raw token.
+    """
+
+    def test_import_survives_a_missing_stemmer(self, monkeypatch):
+        import importlib
+
+        import tools.tool_search_catalog as catalog
+
+        monkeypatch.setattr(catalog, "snowballstemmer", None)
+        monkeypatch.setattr(catalog, "_thread_local", catalog.threading.local())
+        catalog._stem.cache_clear()
+        try:
+            assert catalog._stem("issues") == "issues"      # no crash, no stemming
+            assert catalog._tokenize("Create Issue") == ["create", "issue"]
+        finally:
+            catalog._stem.cache_clear()
+
+    def test_search_still_returns_hits_without_a_stemmer(self, monkeypatch):
+        import tools.tool_search_catalog as catalog
+
+        monkeypatch.setattr(catalog, "snowballstemmer", None)
+        monkeypatch.setattr(catalog, "_thread_local", catalog.threading.local())
+        catalog._stem.cache_clear()
+        try:
+            entries = [_entry("anytool_widget_lookup", "Look up a widget by id")]
+            hits = catalog.search_catalog(entries, "widget lookup", limit=5)
+            assert [e.name for e in hits] == ["anytool_widget_lookup"]
+        finally:
+            catalog._stem.cache_clear()
