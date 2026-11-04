@@ -430,6 +430,25 @@ class TestValidatorFindings:
         decision = maybe_apply_model_routing(agent, "hello")
         assert decision is not None and decision.model == "cheap"
 
+    def test_preferred_models_only_defaults_to_false(self):
+        """C6 of docs/routing-contract.md: the restriction is an explicit opt-in."""
+        assert parse_settings({}).preferred_models_only is False
+        assert parse_settings({"preferred_models_only": True}).preferred_models_only is True
+
+    def test_absent_preferred_models_only_falls_back_to_the_catalog(self, monkeypatch):
+        """Default false means no models list still routes over the cached catalog."""
+        calls = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(model_routing, "options_from_catalog", lambda *a, **k: [
+            ModelOption(name="expensive", provider="p", cost_in=5.0, cost_out=15.0, tier_rank=3),
+            ModelOption(name="cheap", provider="p", cost_in=0.1, cost_out=0.2, tier_rank=3),
+        ])
+        agent = _Agent({"smart_model_routing": {"enabled": True, "models": []}},
+                       model="expensive", provider="p")
+        decision = maybe_apply_model_routing(agent, "hello")
+        assert decision is not None and decision.model == "cheap"
+
     def test_explain_scores_do_not_collide_on_duplicate_names(self):
         a = ModelOption(name="shared", provider="alpha", cost_in=0.1, cost_out=0.1, tier_rank=3)
         b = ModelOption(name="shared", provider="beta", cost_in=9.0, cost_out=9.0, tier_rank=3)
