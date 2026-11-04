@@ -724,6 +724,43 @@ def _prompt_container_resources(config: dict):
 
 
 
+def _setup_routing_prompt(config: dict, provider: Optional[str]) -> None:
+    """Offer opt-in dynamic model selection for this provider.
+
+    Leaves the config untouched unless the user says yes, and never asks when
+    fewer than two models are configured: with one model ``route_turn`` returns
+    before doing any work, so the question would promise something it cannot
+    deliver.
+    """
+    try:
+        from agent import model_router as router
+
+        models = router.configured_models(config, provider or "")
+    except Exception as exc:  # pragma: no cover - setup must never die here
+        logger.debug("routing prompt skipped: %s", exc)
+        return
+
+    if len(models) < 2:
+        return
+
+    section = config.get("smart_model_routing")
+    if not isinstance(section, dict):
+        section = {}
+
+    if section.get("enabled"):
+        print_info("Dynamic model selection is ON — requests route to the cheapest model that fits.")
+        return
+
+    print_header("Dynamic Model Selection")
+    print_info(f"{len(models)} models configured for {provider}: {', '.join(models)}")
+    print_info("Each request is routed to the cheapest model that can serve it.")
+    print_info("Deterministic (no extra LLM call). Change later with: hermes model routing")
+    if prompt_yes_no("Enable dynamic model selection?", default=False):
+        section["enabled"] = True
+        config["smart_model_routing"] = section
+        print_success("Dynamic model selection enabled.")
+
+
 def setup_model_provider(config: dict, *, quick: bool = False):
     """Configure the inference provider and default model.
 
@@ -770,6 +807,11 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     _m = config.get("model")
     if isinstance(_m, dict):
         selected_provider = _m.get("provider")
+
+    # Dynamic model selection is opt-in (spec §4.2 / §13.1). Asked only when
+    # there is an actual choice to make — with a single model the router is a
+    # documented no-op, so the question would be noise.
+    _setup_routing_prompt(config, selected_provider)
 
     # Credential rotation, vision-backend selection, and TTS provider are no
     # longer prompted here. They have safe defaults (rotation off, vision

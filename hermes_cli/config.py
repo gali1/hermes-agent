@@ -964,6 +964,41 @@ DEFAULT_CONFIG = {
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
+    # Dynamic model selection ("smart model routing").  OFF by default: when
+    # disabled nothing consults the router and behaviour is unchanged.  The
+    # engine itself is agent/model_router.py (deterministic — no LLM call and
+    # no network request is made to choose a model).
+    "smart_model_routing": {
+        "enabled": False,
+        # automatic | cost | quality
+        "strategy": "automatic",
+        # Restrict automatic selection to the models the user listed for the
+        # provider.  Tool-dependent routing may look wider (see spec §12).
+        "preferred_models_only": True,
+        "cost_optimization": True,
+        # Score improvement a rival must beat the current model by before the
+        # session switches models.  Prevents oscillation.
+        "stability_threshold": 0.08,
+        # Missing models.dev metadata is UNKNOWN, not "unsupported".
+        "allow_unknown_metadata": True,
+        # Allow an automatic mid-session switch to a CHEAPER model.  Off by
+        # default: changing models invalidates the provider's prompt cache.
+        "switch_on_cost": False,
+        # Deterministic classification is the default; an auxiliary LLM
+        # classifier stays opt-in and is never on the hot path.
+        "llm_assisted_classification": False,
+        "weights": {
+            "capability": 0.45,
+            "cost": 0.30,
+            "reliability": 0.10,
+            "context": 0.10,
+            "continuity": 0.05,
+        },
+        # model key ("provider/model") or bare model -> 0..1 success rate.
+        "reliability": {},
+        # Never auto-select these; manual selection still works.
+        "exclude": [],
+    },
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
