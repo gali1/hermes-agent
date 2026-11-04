@@ -149,8 +149,13 @@ part must not select a model whose input modality excludes images, and must not 
   satisfy C9a.
 
 **C9b — output modality and attachment continuity.** An image-edit follow-up must keep
-the original attachment and require image-output capability. Neither side records a
-modality on the decision (`Decision` has no such field), so this cannot be tested yet.
+the original attachment and require image-output capability. oklab-1 now records the
+precondition: `Decision.input_modalities` / `.output_modalities` are populated from the
+profile, so a later turn can ask what the earlier decision promised. What is still
+missing on **both** sides is the second half — recognizing that a turn *asks for* image
+output, and re-attaching the original image on a follow-up. `SPEC_FIELDS` also cannot
+declare `supports_image_output`, so even a correct request could not exclude a text-only
+model; that field has to exist before C9b can be enforced rather than merely recorded.
 
 **Invariant that does hold:** neither side may satisfy a modality requirement by
 dropping the attachment.

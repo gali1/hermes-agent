@@ -1492,3 +1492,15 @@ def test_moa_skip_appears_in_the_machine_report():
     assert "mixture-of-agents" in report["reason"]
     # the hypothetical rows stay, so the skip is not mistaken for "no candidates"
     assert report["candidates"]
+
+
+def test_decision_records_the_modalities_it_was_made_for():
+    """C9b's precondition: an image-edit follow-up needs to know what the earlier
+    decision promised, and a Decision with no modality record cannot tell it."""
+    profile = mr.classify_request("Describe this chart", attachments=["image"])
+    cand = mr.ModelCandidate("test", "sees", info("sees", vision=True))
+    selection = mr.rank_candidates(profile, [cand])
+    decision = selection.decision()
+    assert decision is not None
+    assert "image" in decision.input_modalities
+    assert decision.output_modalities == ("text",)

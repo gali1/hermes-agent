@@ -1228,6 +1228,11 @@ class Decision:
     pinned: bool = False
     skip_reason: str = ""
     kept_current: bool = False
+    #: Input/output modalities the decision was made for (contract C9). Without
+    #: this record C9b cannot be tested: a later turn (an image-edit follow-up,
+    #: say) has no way to know what the previous decision actually promised.
+    input_modalities: Tuple[str, ...] = ("text",)
+    output_modalities: Tuple[str, ...] = ("text",)
 
     @property
     def key(self) -> str:
@@ -1303,6 +1308,8 @@ class Selection:
             pinned=self.pinned,
             skip_reason=self.skip_reason,
             kept_current=self.kept_current,
+            input_modalities=tuple(self.profile.input_modalities),
+            output_modalities=tuple(self.profile.output_modalities),
         )
 
 
