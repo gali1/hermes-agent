@@ -2080,6 +2080,10 @@ DEFAULT_CONFIG = {
             # multiplier is 0.2..1.0, neutral with <3 calls or a >=40% success rate,
             # and is applied AFTER admission, so it only reorders: the candidate set
             # and the returned match count never shrink.
+            # CANONICAL NAME across every deployment. The pre-unification spelling
+            # `reliability` is still honoured as a deprecated alias (reported with a
+            # warning, never silently ignored); if both are set, this key wins and the
+            # conflict is logged. Unknown keys under tools.tool_search are reported too.
             "reliability_rerank": False,
             # When lexical search returns NOTHING, make ONE bounded model pass over a
             # capped catalog listing (names + one-line descriptions) to propose

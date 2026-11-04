@@ -70,6 +70,7 @@ class ToolSearchConfig:
         values fall back to safe defaults — a config typo must not break the agent."""
         if not isinstance(raw, dict):  # legacy bool / None
             raw = {"enabled": "off" if raw is False else "auto"}
+        _warn_unknown_keys(raw)
         max_search_limit = _clamped_int(raw.get("max_search_limit"), 25, 1, 50)
         defer_raw = raw.get("defer")
         if defer_raw is not None and not isinstance(defer_raw, (list, tuple, set)):
@@ -90,7 +91,7 @@ class ToolSearchConfig:
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
                          if isinstance(defer_raw, (list, tuple, set)) else None),
-            reliability_rerank=_flag(raw.get("reliability_rerank")),
+            reliability_rerank=_reliability_flag(raw),
             zero_match_llm=_flag(raw.get("zero_match_llm")),
             zero_match_llm_timeout=_clamped_float(
                 raw.get("zero_match_llm_timeout"), 4.0, 0.05, 15.0))
@@ -127,6 +128,53 @@ def _clamped_float(value: Any, fallback: float, lo: float, hi: float) -> float:
 
 
 _FLAG_TRUE = frozenset({"1", "true", "on", "yes", "y", "enabled"})
+
+#: Keys ``tools.tool_search`` understands. Anything else is reported once, loudly: a
+#: configuration key that is silently ignored is a setting the user believes is active.
+_KNOWN_KEYS = frozenset({
+    "enabled", "threshold_pct", "search_default_limit", "max_search_limit", "listing",
+    "listing_max_tokens", "defer", "reliability_rerank", "zero_match_llm",
+    "zero_match_llm_timeout",
+    # Pre-unification name, still honoured through ``_reliability_flag``.
+    "reliability",
+})
+
+#: Canonical key for the reliability re-rank, and the legacy alias kept working by it.
+RELIABILITY_FLAG = "reliability_rerank"
+RELIABILITY_FLAG_LEGACY = ("reliability",)
+
+
+def _reliability_flag(raw: dict) -> bool:
+    """Resolve the reliability re-rank flag from *raw*, honouring the legacy alias.
+
+    ``reliability_rerank`` is canonical across both deployments; ``reliability`` is the
+    pre-unification name and keeps working with a deprecation warning. When both are
+    present the canonical key wins and the conflict is reported — never resolved by
+    silence, because the two names were deployed meaning the same thing on different
+    hosts and a silent choice would differ between them.
+    """
+    present_legacy = [k for k in RELIABILITY_FLAG_LEGACY if k in raw]
+    if RELIABILITY_FLAG in raw:
+        if present_legacy:
+            logger.warning(
+                "tools.tool_search sets both %s and %s; using %s (canonical) and ignoring %s",
+                RELIABILITY_FLAG, present_legacy[0], RELIABILITY_FLAG, present_legacy[0])
+        return _flag(raw[RELIABILITY_FLAG])
+    if present_legacy:
+        logger.warning(
+            "tools.tool_search.%s is deprecated; rename it to %s (it is still honoured today)",
+            present_legacy[0], RELIABILITY_FLAG)
+        return _flag(raw[present_legacy[0]])
+    return False
+
+
+def _warn_unknown_keys(raw: dict) -> None:
+    """Report configuration keys this build does not understand (once per assembly)."""
+    unknown = sorted(str(k) for k in raw if str(k) not in _KNOWN_KEYS)
+    if unknown:
+        logger.warning(
+            "tools.tool_search has unknown key(s) %s; they are NOT in effect. Known keys: %s",
+            ", ".join(unknown), ", ".join(sorted(_KNOWN_KEYS)))
 
 
 def _flag(value: Any) -> bool:
