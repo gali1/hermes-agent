@@ -1911,6 +1911,145 @@ def cmd_model(args):
         )
 
 
+def _routing_section(config: dict) -> dict:
+    """Return the ``smart_model_routing`` section, creating it in ``config``."""
+    section = config.get("smart_model_routing")
+    if not isinstance(section, dict):
+        section = {}
+        config["smart_model_routing"] = section
+    return section
+
+
+def _print_routing_status(config: dict) -> None:
+    """Print the resolved routing settings and what they can choose from."""
+    from agent import model_router as router
+
+    section = config.get("smart_model_routing")
+    cfg = router.RoutingConfig.from_dict(section)
+
+    provider = ""
+    model_section = config.get("model")
+    if isinstance(model_section, dict):
+        provider = str(model_section.get("provider") or "").strip()
+
+    state = "ON" if cfg.enabled else "OFF"
+    print(f"\n  Dynamic model selection: {state}")
+    print(f"  strategy:                 {cfg.strategy}")
+    print(f"  preferred models only:    {'yes' if cfg.preferred_models_only else 'no'}")
+    print(f"  cost optimization:        {'yes' if cfg.cost_optimization else 'no'}")
+    print(f"  mid-session cost switch:  {'yes' if cfg.switch_on_cost else 'no'}")
+    print(f"  stability threshold:      {cfg.stability_threshold}")
+    print(f"  provider:                 {provider or '(none configured)'}")
+
+    models = router.configured_models(config, provider) if provider else []
+    if models:
+        print(f"  candidates ({len(models)}):            {', '.join(models)}")
+    else:
+        print("  candidates (0):            none listed for this provider")
+
+    if provider and not cfg.preferred_models_only:
+        pool = router.widen_pool(provider, models)
+        if len(pool) > len(models):
+            print(
+                f"  widening pool:            {len(pool)} model(s) — the provider catalog\n"
+                "                            is consulted only when no preferred model\n"
+                "                            can serve the request"
+            )
+
+    if len(models) <= 1:
+        print(
+            "\n  note: fewer than two models are configured for this provider, so\n"
+            "        routing stays inert even when enabled. List more models under\n"
+            f"        providers.{provider or '<provider>'}.models (or model.preferred_models)\n"
+            "        to give it something to choose between."
+        )
+    print("  Saved in: config.yaml (smart_model_routing)\n")
+
+
+def cmd_model_routing(args):
+    """Inspect or change dynamic model selection (``smart_model_routing``).
+
+    Non-interactive by design — every verb prints facts and returns 0, so the
+    command is safe from scripts, cron and the gateway.  Nothing here changes
+    how a turn executes; it only edits the opt-in config section that
+    ``agent/model_router.py`` reads.
+    """
+    from agent import model_router as router
+    from hermes_cli.config import load_config, save_config
+
+    action = getattr(args, "routing_command", None) or "status"
+    config = load_config()
+
+    if action in ("enable", "disable"):
+        section = _routing_section(config)
+        section["enabled"] = action == "enable"
+        if action == "enable":
+            strategy = getattr(args, "strategy", None)
+            if strategy:
+                section["strategy"] = strategy
+            threshold = getattr(args, "stability_threshold", None)
+            if threshold is not None:
+                section["stability_threshold"] = max(0.0, float(threshold))
+            if getattr(args, "switch_on_cost", None):
+                section["switch_on_cost"] = True
+            if getattr(args, "all_models", False):
+                section["preferred_models_only"] = False
+        save_config(config)
+        label = "enabled" if action == "enable" else "disabled"
+        print(f"\n  ✓ Dynamic model selection: {label}")
+        print("  Saved to config.yaml\n")
+        # Re-read so the status below reflects what actually landed on disk.
+        config = load_config()
+        _print_routing_status(config)
+        return 0
+
+    if action == "explain":
+        prompt = " ".join(getattr(args, "prompt", None) or []).strip()
+        raw_candidates = getattr(args, "candidates", None)
+        cand_list = (
+            [m.strip() for m in raw_candidates.split(",") if m.strip()]
+            if raw_candidates
+            else None
+        )
+        raw_attach = getattr(args, "attachments", None)
+        attachments = (
+            tuple(a.strip() for a in raw_attach.split(",") if a.strip())
+            if raw_attach
+            else ()
+        )
+
+        decision, profile, models = router.preview_decision(
+            config,
+            prompt,
+            attachments=attachments,
+            conversation_tokens=int(getattr(args, "conversation_tokens", 0) or 0),
+            provider=getattr(args, "provider", None) or "",
+            current_model=getattr(args, "current_model", None) or "",
+            candidates=cand_list,
+        )
+
+        enabled = router.is_enabled(config)
+        print(f"\n  Dynamic model selection is {'ON' if enabled else 'OFF'}"
+              f"{'' if enabled else ' — this is what it *would* decide'}")
+        print(f"  prompt: {prompt[:120]}{'…' if len(prompt) > 120 else ''}")
+        if len(models) <= 1:
+            print(
+                "\n  Nothing to route: only one candidate model is in play"
+                f" ({', '.join(models) or 'none'}).\n"
+                "  Add more models to the provider config, or preview with:\n"
+                '    hermes model routing explain "<prompt>" --candidates a,b,c\n'
+            )
+            return 0
+        print()
+        for line in router.explain(decision, profile).splitlines():
+            print(f"  {line}")
+        print()
+        return 0
+
+    _print_routing_status(config)
+    return 0
+
+
 # Provider id -> flow(config, current_model, args). Lambdas resolve the
 # _model_flow_* names at call time so test monkeypatches keep intercepting.
 # ``custom:*``, remove-custom and the generic API-key set are the fallthrough
@@ -3371,7 +3510,7 @@ def _build_cli_parser():
     parser, subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
 
-    build_model_parser(subparsers, cmd_model=cmd_model)
+    build_model_parser(subparsers, cmd_model=cmd_model, cmd_model_routing=cmd_model_routing)
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
     build_worktree_parser(subparsers)
