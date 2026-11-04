@@ -1107,6 +1107,75 @@ def _configured_default_model(config: Any, provider: str) -> str:
     return default.strip() if isinstance(default, str) else ""
 
 
+def _configured_provider_keys(config: Any) -> Dict[str, str]:
+    """Lower-cased provider key -> the operator's spelling, from ``providers:``.
+
+    Only user-declared profiles are listed: those are the providers whose
+    endpoint and credential reference live in ``config.yaml``, so a
+    turn-boundary switch has something to resolve.  Built-in providers are
+    recognised separately by :func:`_resolve_provider_runtime`.
+    """
+    out: Dict[str, str] = {}
+    if not isinstance(config, dict):
+        return out
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for name, entry in providers.items():
+            if isinstance(name, str) and name.strip() and isinstance(entry, dict):
+                out[name.strip().lower()] = name.strip()
+    return out
+
+
+def _split_provider_model(
+    config: Any, model: str, *, default_provider: str
+) -> Tuple[str, str]:
+    """Split a ``"provider/model"`` candidate id when the prefix is configured.
+
+    ``smart_model_routing.candidates`` is a flat list, so a cross-provider
+    entry has to name its provider.  The prefix is only treated as a provider
+    when it matches a key under ``providers:``; otherwise the id is left whole,
+    so a slash-carrying id (an aggregator's ``vendor/model``) keeps pointing at
+    the session provider exactly as before.
+    """
+    text = str(model or "").strip()
+    if "/" not in text:
+        return default_provider, text
+    prefix, rest = text.split("/", 1)
+    canonical = _configured_provider_keys(config).get(prefix.strip().lower())
+    if not canonical or not rest.strip():
+        return default_provider, text
+    if canonical.strip().lower() == (default_provider or "").strip().lower():
+        return default_provider, rest.strip()
+    return canonical, rest.strip()
+
+
+def _candidates_from_pool(
+    config: Any,
+    provider: str,
+    models: Iterable[str],
+    *,
+    enabled: bool = True,
+) -> List[ModelCandidate]:
+    """Build candidates for ``provider`` plus any provider-qualified ids.
+
+    One ``candidates_for`` call per provider keeps the existing metadata
+    lookup contract intact; with no qualified ids this is exactly
+    ``candidates_for(provider, models)``.
+    """
+    groups: List[Tuple[str, List[str]]] = []
+    index: Dict[str, int] = {}
+    for model in models:
+        owner, bare = _split_provider_model(config, model, default_provider=provider)
+        if owner not in index:
+            index[owner] = len(groups)
+            groups.append((owner, []))
+        groups[index[owner]][1].append(bare)
+    out: List[ModelCandidate] = []
+    for owner, ids in groups:
+        out.extend(candidates_for(owner, ids, enabled=enabled))
+    return out
+
+
 def _call_switch_model(agent: Any, decision: Decision) -> bool:
     """Apply ``decision`` through the existing runtime swap helper."""
     fn = getattr(agent, "switch_model", None)
@@ -1161,7 +1230,7 @@ def route_turn(
         if len(models) <= 1 and pool_scope == "preferred":
             return None  # single-model config: no routing overhead (spec §4.1)
 
-        candidates = candidates_for(provider, models)
+        candidates = _candidates_from_pool(config, provider, models)
         profile = classify_request(
             user_message or "",
             attachments=attachments,
@@ -1183,7 +1252,7 @@ def route_turn(
             # answered by silently keeping an incapable model.
             widened = widen_pool(provider, models)
             if len(widened) > len(models):
-                candidates = candidates_for(provider, widened)
+                candidates = _candidates_from_pool(config, provider, widened)
                 decision = select_model(profile, candidates, cfg, current_model=current)
                 if decision is not None and decision.model not in models:
                     decision = replace(
@@ -1325,7 +1394,7 @@ def preview_decision(
     if len(models) <= 1 and pool_scope != "preferred+catalog":
         return None, profile, models
 
-    cands = candidates_for(prov, models)
+    cands = _candidates_from_pool(config, prov, models)
     # A preview is a fresh session's first turn: nothing is prompt-cached yet,
     # so a cost-driven choice is not a mid-session downgrade.
     preview_cfg = replace(cfg, switch_on_cost=True) if not cfg.switch_on_cost else cfg
@@ -1333,7 +1402,7 @@ def preview_decision(
     if decision is None and pool_scope == "preferred+catalog":
         widened = widen_pool(prov, models)
         if len(widened) > len(models):
-            cands = candidates_for(prov, widened)
+            cands = _candidates_from_pool(config, prov, widened)
             decision = select_model(profile, cands, preview_cfg, current_model=current)
             if decision is not None and decision.model not in models:
                 models = widened
