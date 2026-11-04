@@ -450,6 +450,140 @@ def decide_image_input_mode(
     return "text"
 
 
+# ─── Follow-up image continuity ──────────────────────────────────────────────
+#
+# The decision above is keyed on *this turn's* attachments. A follow-up turn
+# ("make it brighter") arrives with none, so the caller used to skip routing
+# entirely and build a plain-text request. The image the user means then
+# survives only if the previous turn's raw ``image_url`` part is still in
+# memory — the session-DB persist path (``run_agent._flush_messages_to_db``)
+# flattens list content and the compressor replaces historical image parts with
+# placeholders, so after a resume/compression the pixels are gone. In ``text``
+# mode they were never there.
+#
+# Both modes leave a durable *path* in the text part of the turn
+# (``[Image attached at: <path>]`` from :func:`build_native_content_parts`,
+# ``use vision_analyze with image_url: <path>`` from the text pipeline), so the
+# reference is recoverable with the existing :func:`extract_image_refs` —
+# without changing what the routing decision decides for the turn.
+
+#: How many trailing messages to scan for the image a follow-up refers to.
+_FOLLOWUP_LOOKBACK = 12
+
+_LIVE_IMAGE_PART_TYPES = frozenset({"image_url", "image", "input_image"})
+
+# Any of these makes the message point back at an image the user already
+# supplied ("it", "this", "the image", ...). Deliberately requires a deictic:
+# a bare "brighter" with no object is more likely to be about something else.
+_IMAGE_DEICTIC_RE = re.compile(
+    r"\b(?:it|its|this|that|these|those|image|picture|photo|screenshot|pic|render)\b",
+    re.IGNORECASE,
+)
+
+# Edit operations that only make sense against an existing image. Kept to
+# appearance/geometry verbs+adjectives; generic verbs ("change", "make",
+# "add") are excluded because they show up in ordinary text follow-ups
+# ("make it quick").
+_IMAGE_EDIT_CUES = frozenset({
+    "bright", "brighter", "brighten", "dark", "darker", "darken",
+    "crop", "cropped", "rotate", "rotated", "flip", "mirror", "resize",
+    "resized", "enlarge", "upscale", "upscaled", "downscale", "blur",
+    "blurred", "sharpen", "sharper", "recolor", "recolour", "tint",
+    "saturate", "desaturate", "desaturated", "contrast", "exposure",
+    "warmer", "cooler", "retouch", "redraw", "zoom", "grayscale", "sepia",
+})
+
+
+def is_image_edit_followup(text: Any) -> bool:
+    """True if *text* is an edit request aimed at an image already supplied.
+
+    Requires both a deictic reference ("it", "this", "the image", ...) and an
+    image-editing cue ("brighter", "crop", "upscale", ...). Conservative on
+    purpose: a false negative leaves the previous turn's path hint in history
+    (the model can still call ``vision_analyze``), while a false positive
+    re-sends an unrelated picture and burns tokens.
+
+    Note this only ever *adds* context for a turn that has no attachment of its
+    own; it never changes the native/text decision.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    low = text.lower()
+    if not _IMAGE_DEICTIC_RE.search(low):
+        return False
+    words = set(re.findall(r"[a-z]+(?:'[a-z]+)?", low))
+    return bool(words & _IMAGE_EDIT_CUES)
+
+
+def _content_text(content: Any) -> str:
+    """Flatten a message's ``content`` to its text, ignoring image parts."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    chunks: List[str] = []
+    for part in content:
+        if isinstance(part, str):
+            chunks.append(part)
+        elif isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
+            chunks.append(str(part.get("text") or ""))
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _content_has_live_image(content: Any) -> bool:
+    """True if *content* still carries image bytes/blocks the request can use."""
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") not in _LIVE_IMAGE_PART_TYPES:
+            continue
+        # OpenAI chat.completions / responses: {"image_url": {"url": ...}}
+        # or {"image_url": "data:..."}; Anthropic-style: {"source": {...}}.
+        value = part.get("image_url") or part.get("image") or part.get("source")
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("data")
+        if value:
+            return True
+    return False
+
+
+def carried_image_refs(
+    history: Any,
+    *,
+    lookback: int = _FOLLOWUP_LOOKBACK,
+) -> Tuple[List[str], List[str]]:
+    """Recover the image a follow-up turn refers to from earlier turns.
+
+    Walks *history* newest-first (bounded by *lookback*) and returns
+    ``(local_paths, urls)`` from the first message that mentions an image.
+
+    Returns ``([], [])`` when:
+
+      * that message still carries live image parts — the pixels are already in
+        the request and re-attaching would duplicate the payload, or
+      * no message in the window mentions an existing local image or image URL.
+
+    Local paths are validated against the filesystem by
+    :func:`extract_image_refs`; URLs are returned as-is (the provider fetches
+    them).
+    """
+    if not isinstance(history, (list, tuple)) or not history:
+        return [], []
+    window = list(history)[-max(1, int(lookback)):]
+    for msg in reversed(window):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if _content_has_live_image(content):
+            return [], []
+        local_paths, urls = extract_image_refs(_content_text(content))
+        if local_paths or urls:
+            return local_paths, urls
+    return [], []
+
+
 # Image size handling is REACTIVE rather than proactive: we attempt native
 # attachment at full size regardless of provider, and rely on
 # ``run_agent._try_shrink_image_parts_in_messages`` to shrink + retry if
@@ -762,4 +896,6 @@ __all__ = [
     "decide_image_input_mode",
     "build_native_content_parts",
     "extract_image_refs",
+    "is_image_edit_followup",
+    "carried_image_refs",
 ]
