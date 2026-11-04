@@ -99,6 +99,36 @@ class TestMultimodalPayload:
     def test_explicit_flag_survives_parts(self):
         assert classify_request([{"type": "text", "text": "hi"}], has_images=True).needs_vision
 
+    def test_string_prompt_with_image_path_requires_vision(self, tmp_path):
+        """C9a for the string path: an attached image is a hard requirement, not prose.
+
+        ``image_routing.extract_image_refs`` is what later turns the path into a content part,
+        so routing must ask the same question here or a text-only model wins the turn and the
+        attachment is dropped/failed after selection.
+        """
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+        profile = classify_request(f"what is wrong in {img}?")
+        assert profile.needs_vision is True and profile.tier == "specialized"
+        assert not is_eligible(TEXT_ONLY, profile)
+        assert is_eligible(VISION, profile)
+
+    def test_string_prompt_with_missing_path_does_not_require_vision(self):
+        """A path that is not a file is prose, not an attachment."""
+        profile = classify_request("look at /nope/definitely-missing.png and tell me")
+        assert profile.needs_vision is False
+
+    def test_explain_agrees_with_selection_on_string_image_path(self, tmp_path):
+        """The explain surface must not re-derive modality differently from selection."""
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n")
+        report = explain_routing({"enabled": True}, f"describe {img}", options=[TEXT_ONLY, VISION])
+        assert report["request"]["needs_vision"] is True
+        rows = {row["model"]: row for row in report["candidates"]}
+        assert rows["text-only"]["eligible"] is False
+        assert "vision" in rows["text-only"]["excluded_reason"]
+        assert rows["vision"]["eligible"] is True
+
 
 class TestEligibility:
     def test_vision_required_excludes_explicit_text_only(self):

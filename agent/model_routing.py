@@ -190,6 +190,25 @@ def _content_parts(payload: Any) -> Tuple[str, bool, bool, bool]:
     return "\n".join(c for c in chunks if c), flags["image"], flags["audio"], flags["file"]
 
 
+def _string_image_refs(text: str) -> bool:
+    """True when a *string* prompt names an image that will be attached for the turn.
+
+    The reference shape is the peer's ``message_text_and_attachments()``: modality comes from
+    what is attached, never from the words. For a string payload the attachment is expressed as
+    a local path or an http(s) URL, which is exactly what ``image_routing.extract_image_refs``
+    later turns into content parts — so routing asks the same question with the same function
+    instead of inferring vision from prose. A path that does not exist is not an attachment.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    try:
+        from agent.image_routing import extract_image_refs
+        paths, urls = extract_image_refs(text)
+    except Exception:  # pragma: no cover - routing must never break a turn
+        return False
+    return bool(paths or urls)
+
+
 def classify_request(
     text: Any,
     *,
@@ -203,9 +222,13 @@ def classify_request(
     Length is a weak signal on its own — a short question can need deep reasoning and a long
     one can be a copy-paste — so the tier comes from the strongest signal present, and length
     only breaks ties. ``text`` may be a string or a content-parts list; modality flags found
-    in the parts are OR'd with the caller's explicit flags.
+    in the parts are OR'd with the caller's explicit flags. A string prompt that references an
+    image is the same requirement as an image part: the attachment is derived from the payload,
+    not from the surrounding words.
     """
     body, part_images, part_audio, part_files = _content_parts(text)
+    if not part_images and _string_image_refs(text):
+        part_images = True
     has_images = has_images or part_images
     has_audio = has_audio or part_audio
     has_files = has_files or part_files
