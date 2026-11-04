@@ -10334,6 +10334,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # prompt, so the LLM produces one coherent reply in the user's
                 # language. The hardcoded send has therefore been removed.
 
+        # Follow-up turns ("make it brighter") carry no attachment of their own,
+        # so the image block above never runs for them: the turn is dispatched
+        # as plain text and the image the user means is gone as soon as the
+        # original turn's image part has been flattened by session persist or
+        # compression (and it was never present at all in text mode). Re-route
+        # those turns through the same image-input decision used for fresh
+        # attachments so the original reference survives — natively when the
+        # active model can see it. See agent/image_routing.py.
+        if not event.media_urls:
+            try:
+                from agent.image_routing import (
+                    carried_image_refs,
+                    is_image_edit_followup,
+                )
+
+                _carry_paths: List[str] = []
+                _carry_urls: List[str] = []
+                if is_image_edit_followup(message_text):
+                    _carry_paths, _carry_urls = carried_image_refs(history)
+
+                if _carry_paths:
+                    _carry_mode = self._decide_image_input_mode(
+                        source=source,
+                        session_key=session_key,
+                    )
+                    if _carry_mode == "native":
+                        pending_native = getattr(
+                            self, "_pending_native_image_paths_by_session", None
+                        )
+                        if pending_native is None:
+                            pending_native = {}
+                            self._pending_native_image_paths_by_session = pending_native
+                        pending_native[session_key] = list(_carry_paths)
+                        logger.info(
+                            "Image routing: carried %d image(s) into an edit "
+                            "follow-up (native).",
+                            len(_carry_paths),
+                        )
+                    else:
+                        logger.info(
+                            "Image routing: carried %d image(s) into an edit "
+                            "follow-up (text mode=%s).",
+                            len(_carry_paths), _carry_mode,
+                        )
+                        message_text = await self._enrich_message_with_vision(
+                            message_text,
+                            _carry_paths,
+                        )
+
+                if _carry_urls:
+                    # The native buffer only carries local paths; a URL
+                    # reference still reaches the model as a path hint it can
+                    # hand to vision_analyze.
+                    message_text = f"{message_text}\n\n" + "\n".join(
+                        f"[Image the user is referring to: {u}]" for u in _carry_urls
+                    )
+            except Exception as _carry_exc:
+                logger.debug(
+                    "image_routing: follow-up image carry-over failed — %s",
+                    _carry_exc,
+                )
+
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
             for _apath in audio_file_paths:
