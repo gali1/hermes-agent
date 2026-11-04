@@ -1297,3 +1297,34 @@ def test_legacy_candidates_path_matches_the_models_path(offline_catalog):
     assert canonical_selection["candidate_source"] == "models"
     assert legacy_selection["candidate_source"] == "candidates"
     assert canonical_selection["selected"] == "b"
+
+
+# ---------------------------------------------------------------------------
+# Shared contract C6 (docs/routing-contract.md): widening is the default, and a
+# single-model provider list stays a no-op unless the operator opts in.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_contract_default_allows_widening():
+    cfg = mr.RoutingConfig.from_dict({})
+    assert cfg.preferred_models_only is False
+    assert cfg.preferred_models_only_explicit is False
+
+    explicit = mr.RoutingConfig.from_dict({"preferred_models_only": True})
+    assert explicit.preferred_models_only is True
+    assert explicit.preferred_models_only_explicit is True
+
+
+def test_single_model_pool_stays_preferred_without_an_explicit_flag():
+    cfg = _multi_config(("weak",), preferred_only=False)
+    cfg["smart_model_routing"].pop("preferred_models_only")
+    pool, scope = mr.routing_pool(cfg, "test", current_model="weak")
+    assert scope == "preferred"          # nothing to choose between, no catalog scan
+    assert pool == ["weak"]
+
+
+def test_single_model_pool_widens_only_when_explicitly_asked(patched_candidates):
+    cfg = _multi_config(("weak",), preferred_only=False)   # key present and False
+    assert mr.RoutingConfig.from_dict(cfg["smart_model_routing"]).preferred_models_only_explicit
+    _pool, scope = mr.routing_pool(cfg, "test", current_model="weak")
+    assert scope == "preferred+catalog"  # opt-in widening is honoured

@@ -686,7 +686,13 @@ class RoutingConfig:
 
     enabled: bool = False
     strategy: str = "automatic"  # automatic | cost | quality
-    preferred_models_only: bool = True
+    #: Shared contract default with bro-2 (docs/routing-contract.md C6): a restriction needs an
+    #: explicit opt-in. With ``true`` and no ``models`` list, routing silently stops selecting,
+    #: which is a worse fresh-install surprise than routing across the eligible catalog.
+    preferred_models_only: bool = False
+    #: True when the operator wrote the key, so a single-model provider list can stay a no-op
+    #: without pretending the default was ``true``.
+    preferred_models_only_explicit: bool = False
     cost_optimization: bool = True
     #: A rival must beat the incumbent by MORE than this to take the turn
     #: (ties and borderline wins keep the current model).
@@ -716,6 +722,7 @@ class RoutingConfig:
         strategy = str(raw.get("strategy", cfg.strategy) or cfg.strategy).lower()
         cfg.strategy = strategy if strategy in ("automatic", "cost", "quality") else "automatic"
         cfg.preferred_models_only = bool(raw.get("preferred_models_only", cfg.preferred_models_only))
+        cfg.preferred_models_only_explicit = "preferred_models_only" in raw
         cfg.cost_optimization = bool(raw.get("cost_optimization", cfg.cost_optimization))
         # ``stability_threshold`` is canonical; ``min_improvement`` is the
         # sibling tree's alias for the same knob.
@@ -1696,7 +1703,11 @@ def routing_pool(
 
     section = config.get("smart_model_routing") if isinstance(config, dict) else None
     cfg = RoutingConfig.from_dict(section)
-    if cfg.preferred_models_only:
+    # C6 of the shared contract (docs/routing-contract.md): widening is the default, but a
+    # provider that lists exactly ONE model has nothing to choose between — consulting the
+    # catalog there would add ranking work to a config that asked for a single model. That
+    # stays a no-op unless the operator explicitly sets preferred_models_only.
+    if cfg.preferred_models_only or (len(preferred) <= 1 and not cfg.preferred_models_only_explicit):
         return preferred, "preferred"
     return preferred, "preferred+catalog"
 
