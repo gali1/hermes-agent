@@ -190,7 +190,8 @@ class TestMaybeApply:
 
     def test_switch_failure_is_swallowed(self, monkeypatch):
         """A routing failure must never break the turn."""
-        agent = _Agent({"smart_model_routing": {"enabled": True, "models": [
+        agent = _Agent({"smart_model_routing": {"enabled": True, "preferred_models_only": False,
+                                                "models": [
             {"name": "cheap", "cost_in": 0.1, "tier_rank": 0}]}}, model="strong")
 
         def _boom(*a, **k):
@@ -198,6 +199,38 @@ class TestMaybeApply:
 
         monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _boom)
         assert maybe_apply_model_routing(agent, "hello") is None
+
+    def test_single_model_pool_is_noop_without_explicit_key(self, monkeypatch):
+        """One preferred model is not a choice: no catalog scan, no routing decision."""
+        catalog_calls = []
+
+        def _catalog(provider=""):
+            catalog_calls.append(provider)
+            return []
+
+        def _no_switch(*a, **k):
+            raise AssertionError("a single-model pool must not route")
+
+        monkeypatch.setattr(model_routing, "options_from_catalog", _catalog)
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _no_switch)
+        agent = _Agent({"smart_model_routing": {"enabled": True, "models": [
+            {"name": "cheap", "cost_in": 0.1, "cost_out": 0.2, "tier_rank": 0}]}},
+            model="strong")
+        assert maybe_apply_model_routing(agent, "hello") is None
+        assert catalog_calls == []
+
+    def test_explicit_false_lets_routing_run(self, monkeypatch):
+        """Writing the key turns the single-model no-op back into a real decision."""
+        switched = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda a, m, p: switched.append((m, p)))
+        agent = _Agent({"smart_model_routing": {
+            "enabled": True, "preferred_models_only": False,
+            "models": [{"name": "cheap", "cost_in": 0.1, "cost_out": 0.2, "tier_rank": 0}]}},
+            model="strong")
+        decision = maybe_apply_model_routing(agent, "hello")
+        assert decision is not None and decision.model == "cheap"
+        assert switched == [("cheap", "p")]
 
 
 class TestSettingsContract:
@@ -207,6 +240,14 @@ class TestSettingsContract:
         st = parse_settings({})
         assert st.enabled is False and st.strategy == "automatic"
         assert st.stability_threshold == 0.15 and st.allow_unknown_metadata is True
+
+    def test_preferred_models_only_default_is_false_and_key_presence_tracked(self):
+        st = parse_settings({})
+        assert st.preferred_models_only is False
+        assert st.preferred_models_only_explicit is False
+        assert parse_settings({"preferred_models_only": False}).preferred_models_only_explicit is True
+        written = parse_settings({"preferred_models_only": True})
+        assert written.preferred_models_only is True and written.preferred_models_only_explicit
 
     def test_lab_spelling(self):
         st = parse_settings({"enabled": True, "stability_threshold": 0.4, "strategy": "cost"})
@@ -326,7 +367,8 @@ class TestSkipReasons:
 class TestMoAGuard:
     """Both implementations skip routing while the Mixture-of-Agents facade is active."""
 
-    ENABLED = {"smart_model_routing": {"enabled": True, "models": [
+    ENABLED = {"smart_model_routing": {"enabled": True, "preferred_models_only": False,
+                                      "models": [
         {"name": "cheap", "cost_in": 0.1, "tier_rank": 0}]}}
 
     def test_provider_moa_skips_routing(self, monkeypatch):

@@ -370,6 +370,9 @@ class RoutingSettings:
     allow_unknown_metadata: bool = True
     cost_optimization: bool = True
     preferred_models_only: bool = False
+    # Key presence, not value: a one-model pool is only widened when the operator
+    # actually wrote the key. A default must not silently turn a no-op into a switch.
+    preferred_models_only_explicit: bool = False
     models: Tuple[Any, ...] = ()
 
     @property
@@ -398,6 +401,7 @@ def parse_settings(raw: Any) -> RoutingSettings:
         allow_unknown_metadata=bool(raw.get("allow_unknown_metadata", True)),
         cost_optimization=bool(raw.get("cost_optimization", True)),
         preferred_models_only=bool(raw.get("preferred_models_only", False)),
+        preferred_models_only_explicit="preferred_models_only" in raw,
         models=tuple(models) if isinstance(models, (list, tuple)) else (),
     )
 
@@ -596,8 +600,15 @@ def maybe_apply_model_routing(agent: Any, text: str) -> Optional[RoutingDecision
         return None
     try:
         options = options_from_config(cfg)
+        # A provider that lists exactly one model offers no choice: no catalog scan, no
+        # routing decision — unless the operator wrote the key, which makes the intent explicit.
+        if len(options) == 1 and not st.preferred_models_only_explicit:
+            logger.debug("model routing skipped: single-model preferred pool (%s)",
+                         options[0].name)
+            return None
+        scope = "preferred" if st.preferred_models_only else "preferred+catalog"
         if not options:
-            if st.preferred_models_only:
+            if scope == "preferred":
                 # "Preferred models only" with no preferred list means there is nothing to
                 # choose between. Falling back to the whole catalog would do the exact
                 # opposite of what the setting asks for.
