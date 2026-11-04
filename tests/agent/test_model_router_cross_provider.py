@@ -241,3 +241,48 @@ def test_unconfigured_provider_is_skipped_with_the_reason_logged(
     assert "prov-c/model-c" in reason
     assert "prov-c" in reason
     assert "PROV_C_API_KEY" in reason
+
+
+# ---------------------------------------------------------------------------
+# The two edges the boundary must not cross
+# ---------------------------------------------------------------------------
+
+def test_unknown_provider_is_never_handed_to_the_aggregator(monkeypatch):
+    """``resolve_runtime_provider`` falls through to OpenRouter for names it
+    does not know; routing must decline before that, not silently re-route the
+    model to an aggregator the operator never assigned it to."""
+    import hermes_cli.runtime_provider as rp
+
+    def _boom(**_kwargs):
+        raise AssertionError("an unconfigured provider must not be resolved at all")
+
+    monkeypatch.setattr(rp, "resolve_runtime_provider", _boom)
+
+    runtime, reason = mr._resolve_provider_runtime({}, "acme-relay", "some-model")
+
+    assert runtime is None
+    assert "acme-relay" in reason
+    assert "not configured" in reason
+
+
+def test_local_profile_without_a_key_is_still_usable(profile, catalog, monkeypatch):
+    """A profile that declares no credential (a local server) must not be
+    mistaken for an unconfigured one."""
+    cfg = _config(
+        candidates=["local/model-c"],
+        extra_providers={
+            "local": {"name": "Local", "base_url": "http://127.0.0.1:11434/v1", "models": ["model-c"]}
+        },
+    )
+    profile.update(cfg)
+    # Give the local provider its own catalog entry under the right name.
+    monkeypatch.setitem(_SPECS, ("local", "model-c"), dict(cost_in=0.1, cost_out=0.2))
+
+    agent = _StubAgent()
+    decision = mr.route_turn(agent, "What is 15 multiplied by 8?", config=cfg)
+
+    assert decision is not None
+    assert (decision.provider, decision.model) == ("local", "model-c")
+    assert agent.base_url == "http://127.0.0.1:11434/v1"
+    assert agent.provider == "local"
+

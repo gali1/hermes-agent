@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -1176,21 +1177,149 @@ def _candidates_from_pool(
     return out
 
 
-def _call_switch_model(agent: Any, decision: Decision) -> bool:
-    """Apply ``decision`` through the existing runtime swap helper."""
+def _call_switch_model(
+    agent: Any,
+    decision: Decision,
+    *,
+    runtime: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Apply ``decision`` through the existing runtime swap helper.
+
+    ``runtime`` is the target provider's resolved profile (endpoint, key,
+    transport).  It is only ever passed for a cross-provider switch, where
+    ``agent.switch_model`` would otherwise rebuild the client from the OUTGOING
+    provider's ``api_key``/``base_url`` — a request that cannot succeed.
+    """
     fn = getattr(agent, "switch_model", None)
     if not callable(fn):
         return False
-    supports_pin = False
     try:
-        supports_pin = "user_initiated" in inspect.signature(fn).parameters
+        params = inspect.signature(fn).parameters
     except (TypeError, ValueError):  # builtins / mocks without a signature
-        supports_pin = False
-    if supports_pin:
-        fn(decision.model, decision.provider, user_initiated=False)
+        params = {}
+    accepts_any = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+    kwargs: Dict[str, Any] = {}
+    if runtime:
+        for name in ("api_key", "base_url", "api_mode"):
+            value = runtime.get(name)
+            if value and (name in params or accepts_any):
+                kwargs[name] = value
+    if "user_initiated" in params or accepts_any:
+        fn(decision.model, decision.provider, user_initiated=False, **kwargs)
     else:
-        fn(decision.model, decision.provider)
+        fn(decision.model, decision.provider, **kwargs)
     return True
+
+
+_SECRET_PLACEHOLDERS = {"", "no-key-required"}
+
+
+def _provider_entry(config: Any, provider: str) -> Optional[Dict[str, Any]]:
+    """The ``providers:<name>`` block for ``provider`` (case-insensitive)."""
+    if not isinstance(config, dict):
+        return None
+    providers = config.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    wanted = (provider or "").strip().lower()
+    for name, entry in providers.items():
+        if (
+            isinstance(name, str)
+            and isinstance(entry, dict)
+            and name.strip().lower() == wanted
+        ):
+            return entry
+    return None
+
+
+def _declared_credential(entry: Optional[Dict[str, Any]]) -> Tuple[str, bool]:
+    """``(env var name, inline key present)`` for a provider profile.
+
+    A ``${VAR}`` reference is reported by variable *name*; the value is never
+    read into an error message or a log line.
+    """
+    if not isinstance(entry, dict):
+        return "", False
+    inline = str(entry.get("api_key") or "").strip()
+    if inline.startswith("${") and inline.endswith("}"):
+        return inline[2:-1].strip(), False
+    return str(entry.get("key_env") or "").strip(), bool(inline)
+
+
+def _provider_key_env_vars(provider: str, entry: Optional[Dict[str, Any]]) -> List[str]:
+    """Credential variables a provider reads, for messages (names only)."""
+    var, _inline = _declared_credential(entry)
+    if var:
+        return [var]
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+
+        pconfig = PROVIDER_REGISTRY.get((provider or "").strip().lower())
+        return [str(v) for v in (getattr(pconfig, "api_key_env_vars", ()) or ()) if str(v)]
+    except Exception:  # pragma: no cover - registry unavailable
+        return []
+
+
+def _resolve_provider_runtime(
+    config: Any, provider: str, model: str
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Resolve ``provider``'s saved profile into a runtime, or explain the gap.
+
+    Delegates to :func:`hermes_cli.runtime_provider.resolve_runtime_provider`,
+    the same provider-profile resolution ``/model`` uses
+    (``hermes_cli/model_switch.py:1209``), so the switch inherits that
+    provider's endpoint, credential reference and transport instead of a second
+    credential code path.  Returns ``(runtime, "")`` on success and
+    ``(None, reason)`` when the provider cannot serve a request; every reason
+    names credential *variables*, never their values.
+    """
+    provider = (provider or "").strip()
+    if not provider:
+        return None, "the selected model has no provider"
+
+    entry = _provider_entry(config, provider)
+    if entry is None:
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+
+            known = provider.lower() in PROVIDER_REGISTRY
+        except Exception:  # pragma: no cover - registry unavailable
+            known = False
+        if not known:
+            # Deliberately resolved no further: the generic resolver falls
+            # through to OpenRouter for names it does not know, which would
+            # quietly send this model to an aggregator the operator never
+            # selected for it.
+            return None, (
+                f"provider {provider!r} is not configured "
+                "(no providers: entry and not a built-in provider)"
+            )
+
+    var, inline = _declared_credential(entry)
+    if var and not os.environ.get(var, "").strip():
+        return None, f"provider {provider!r} has no credentials ({var} is not set)"
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested=provider, target_model=model) or {}
+    except Exception as err:
+        return None, f"provider {provider!r} credentials could not be resolved: {err}"
+
+    api_key = str(runtime.get("api_key") or "").strip()
+    base_url = str(runtime.get("base_url") or "").strip()
+    if not base_url and not api_key:
+        return None, f"provider {provider!r} resolved neither an endpoint nor credentials"
+    if api_key in _SECRET_PLACEHOLDERS and (entry is None or var or inline):
+        # A placeholder is not a credential: it is what the resolver returns
+        # for a local endpoint with no auth.  Only a profile that declares no
+        # key at all (a local service) may go out without one.
+        names = _provider_key_env_vars(provider, entry)
+        hint = f" ({' / '.join(names)} not set)" if names else ""
+        return None, f"provider {provider!r} has no API key{hint}"
+    return runtime, ""
 
 
 def route_turn(
@@ -1311,15 +1440,33 @@ def route_turn(
             setattr(agent, _ROUTER_LAST_ATTR, kept)
             return kept
 
-        if decision.provider and provider and decision.provider != provider:
-            # Cross-provider selection needs credential resolution, which this
-            # turn-level hook deliberately does not guess at.
-            _log.info(
-                "routing: cross-provider switch to %s not applied at turn "
-                "boundary (credential resolution out of scope); keeping %s",
-                decision.key, current,
+        if decision.provider and decision.provider.strip().lower() != provider.strip().lower():
+            # Cross-provider selection: the target provider's own profile is
+            # the only place its endpoint and credential reference exist, so
+            # resolve it here (the same resolution /model uses) and hand it to
+            # the swap.  Without this the rebuilt client keeps the outgoing
+            # provider's endpoint AND key, so the turn dies instead of moving.
+            runtime, why = _resolve_provider_runtime(
+                config, decision.provider, decision.model
             )
-            return None
+            if runtime is None:
+                # Never guess and never half-switch: name the model and the
+                # provider, and keep the session where it is.
+                _log.info(
+                    "routing: skipped %s: %s; keeping %s",
+                    decision.key, why, current or "(unset)",
+                )
+                return None
+            if not _call_switch_model(agent, decision, runtime=runtime):
+                _log.info("routing: agent has no switch_model(); keeping %s", current)
+                return None
+            _log.info(
+                "routing: switched %s -> %s (%s) for %s task via %s profile",
+                current or "(unset)", decision.key, decision.reason,
+                decision.complexity, decision.provider,
+            )
+            setattr(agent, _ROUTER_LAST_ATTR, decision)
+            return decision
 
         if not _call_switch_model(agent, decision):
             _log.info("routing: agent has no switch_model(); keeping %s", current)
