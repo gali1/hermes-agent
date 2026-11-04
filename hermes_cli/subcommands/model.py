@@ -67,9 +67,50 @@ def build_model_parser(
     )
     routing_sub = routing_parser.add_subparsers(dest="routing_command")
 
-    routing_sub.add_parser(
+    _status = routing_sub.add_parser(
         "status",
         help="Show whether dynamic selection is on and what it can choose from",
+        description=(
+            "Print the resolved routing settings and the candidate pool.\n\n"
+            "With --json, prints the shared machine-readable report: the exact\n"
+            "key set enabled/settings/candidate_source/request/pricing/selected/\n"
+            "selected_provider/reason/skip_reason/current/kept_current/\n"
+            "eligible_count/candidates (sorted keys, 2-space indent). Read-only."
+        ),
+    )
+    _status.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit the shared JSON report (sort_keys, indent=2) instead of text",
+    )
+    _status.add_argument(
+        "prompt",
+        nargs="*",
+        help="Optional user message to classify for the report (default: none)",
+    )
+    _status.add_argument(
+        "--current-model",
+        default=None,
+        help="Treat this model as the session's incumbent (default: config default)",
+    )
+    _status.add_argument(
+        "--provider",
+        default=None,
+        help="Provider to resolve candidates against (default: model.provider)",
+    )
+    _status.add_argument(
+        "--attachments",
+        default=None,
+        metavar="image,pdf,...",
+        help="Modality hints for the request (image, pdf, audio, video)",
+    )
+    _status.add_argument(
+        "--conversation-tokens",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Size of the running context, added to the input estimate",
     )
 
     _enable = routing_sub.add_parser(
@@ -86,7 +127,7 @@ def build_model_parser(
         type=float,
         default=None,
         metavar="N",
-        help="Score a rival must beat the current model by before switching (default 0.08)",
+        help="Score a rival must beat the current model by before switching (default 0.15)",
     )
     _enable.add_argument(
         "--switch-on-cost",

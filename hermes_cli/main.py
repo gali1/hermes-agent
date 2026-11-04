@@ -1938,10 +1938,15 @@ def _print_routing_status(config: dict) -> None:
     print(f"  preferred models only:    {'yes' if cfg.preferred_models_only else 'no'}")
     print(f"  cost optimization:        {'yes' if cfg.cost_optimization else 'no'}")
     print(f"  mid-session cost switch:  {'yes' if cfg.switch_on_cost else 'no'}")
+    models = []
+    source = ""
+    if provider:
+        models, source, _scope = router.declared_model_list(config, provider)
     print(f"  stability threshold:      {cfg.stability_threshold}")
     print(f"  provider:                 {provider or '(none configured)'}")
+    if source:
+        print(f"  candidate source:         {source}")
 
-    models = router.configured_models(config, provider) if provider else []
     if models:
         print(f"  candidates ({len(models)}):            {', '.join(models)}")
     else:
@@ -1978,7 +1983,13 @@ def cmd_model_routing(args):
     from hermes_cli.config import load_config, save_config
 
     action = getattr(args, "routing_command", None) or "status"
-    config = load_config()
+    try:
+        config = load_config()
+    except Exception as err:
+        # A config that cannot be read is the ONLY non-zero exit: nothing can be
+        # reported honestly, and silently inventing defaults would be a lie.
+        print(f"✗ could not read config.yaml: {err}", file=sys.stderr)
+        return 2
 
     if action in ("enable", "disable"):
         section = _routing_section(config)
@@ -2044,6 +2055,30 @@ def cmd_model_routing(args):
         for line in router.explain(decision, profile).splitlines():
             print(f"  {line}")
         print()
+        return 0
+
+    # ---- status (text, or --json for the shared machine-readable contract) --
+    if getattr(args, "json", False):
+        import json as _json
+
+        prompt = " ".join(getattr(args, "prompt", None) or []).strip()
+        raw_attach = getattr(args, "attachments", None)
+        attachments = (
+            tuple(a.strip() for a in raw_attach.split(",") if a.strip())
+            if raw_attach
+            else ()
+        )
+        report = router.routing_report(
+            config,
+            prompt,
+            attachments=attachments,
+            conversation_tokens=int(getattr(args, "conversation_tokens", 0) or 0),
+            provider=getattr(args, "provider", None) or "",
+            current_model=getattr(args, "current_model", None) or "",
+        )
+        # sort_keys + indent=2 is the shared contract: two trees can diff the
+        # documents byte for byte.
+        print(_json.dumps(report, indent=2, sort_keys=True))
         return 0
 
     _print_routing_status(config)

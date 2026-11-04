@@ -257,3 +257,184 @@ def test_explain_candidates_override_config(home, capsys):
     assert code == 0
     out = capsys.readouterr().out
     assert "x-model" in out or "y-model" in out
+
+
+# ---------------------------------------------------------------------------
+# `status --json` — the shared machine-readable contract
+# ---------------------------------------------------------------------------
+#
+# Both trees must emit the same document for the same config: exactly these
+# top-level keys, json.dumps(indent=2, sort_keys=True), exit 0 unless the config
+# itself cannot be read (then exit 2).
+
+REPORT_KEYS = {
+    "enabled", "settings", "candidate_source", "request", "pricing", "selected",
+    "selected_provider", "reason", "skip_reason", "current", "kept_current",
+    "eligible_count", "candidates",
+}
+
+
+def _parse(out: str):
+    import json
+
+    return json.loads(out)
+
+
+def test_status_json_flag_is_registered_only_on_status():
+    parser, _picker, _routing = _build()
+    ns = parser.parse_args(["model", "routing", "status", "--json"])
+    assert ns.json is True
+    # explain keeps its own surface; the flag is not silently accepted there
+    with pytest.raises(SystemExit):
+        parser.parse_args(["model", "routing", "explain", "hi", "--json"])
+
+
+def test_status_json_emits_the_contract_document(home, capsys):
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="status", json=True, provider="prov")) == 0
+    out = capsys.readouterr().out
+    report = _parse(out)
+
+    assert set(report) == REPORT_KEYS
+    assert set(report["settings"]) == {
+        "strategy", "stability_threshold", "allow_unknown_metadata",
+        "cost_optimization", "preferred_models_only",
+    }
+    assert set(report["request"]) == {
+        "tier", "est_input_tokens", "est_output_tokens", "needs_tools",
+        "needs_vision", "needs_audio", "reasons",
+    }
+    assert set(report["pricing"]) == {"cheapest_eligible", "median_fallback", "policy"}
+    assert report["settings"]["stability_threshold"] == pytest.approx(0.15)
+    # sort_keys + indent=2: re-serialising reproduces the output byte for byte
+    import json
+
+    assert out.strip() == json.dumps(report, indent=2, sort_keys=True)
+
+
+def test_status_json_reports_disabled_but_still_shows_the_hypothetical(home, capsys):
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="status", json=True, provider="prov")) == 0
+    report = _parse(capsys.readouterr().out)
+    assert report["enabled"] is False
+    assert report["skip_reason"] == "disabled"
+    # the hypothetical selection is still computed and explained
+    assert report["candidates"]
+    assert report["selected"] in {"model-a", "model-b"}
+    assert report["reason"]
+
+
+def test_status_json_is_read_only(home, capsys):
+    from hermes_cli.config import load_config
+    from hermes_cli.main import cmd_model_routing
+
+    before = repr(load_config())
+    cmd_model_routing(_ns(routing_command="status", json=True, provider="prov"))
+    capsys.readouterr()
+    assert repr(load_config()) == before
+
+
+def test_status_json_models_entries_carry_metadata(home, capsys, monkeypatch):
+    """`models[]` is the canonical list; its metadata reaches the report."""
+    import hermes_cli.config as cfg
+
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  default: model-a\n"
+        "  provider: prov\n"
+        "smart_model_routing:\n"
+        "  enabled: true\n"
+        "  models:\n"
+        "    - name: model-a\n"
+        "      provider: prov\n"
+        "      cost_in: 1.0\n"
+        "      cost_out: 2.0\n"
+        "      tier_rank: 2\n"
+        "      supports_tools: true\n"
+        "    - name: model-b\n"
+        "      provider: prov\n"
+        "      cost_in: 10.0\n"
+        "      cost_out: 10.0\n"
+        "      tier_rank: 4\n"
+        "      supports_tools: true\n"
+        "    - name: mystery\n"
+        "      provider: prov\n",
+        encoding="utf-8",
+    )
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="status", json=True)) == 0
+    report = _parse(capsys.readouterr().out)
+
+    assert report["candidate_source"] == "models"
+    assert [c["model"] for c in report["candidates"]] == ["model-a", "model-b", "mystery"]
+    assert report["eligible_count"] == 3
+    # the unpriced model is charged the median of the two known prices
+    mystery = next(c for c in report["candidates"] if c["model"] == "mystery")
+    assert mystery["priced"] is False
+    assert mystery["charged_as"] == "median"
+    assert mystery["cost_in"] == pytest.approx(5.5)
+
+
+def test_status_json_prompt_argument_classifies_the_request(home, capsys):
+    from hermes_cli.main import cmd_model_routing
+
+    argv = [
+        "Prove", "the", "invariant", "and", "derive", "the", "trade-offs",
+        "```python", "x = 1", "```",
+    ]
+    assert cmd_model_routing(
+        _ns(routing_command="status", json=True, provider="prov", prompt=argv)
+    ) == 0
+    report = _parse(capsys.readouterr().out)
+    assert report["request"]["tier"] == "advanced"
+    assert report["request"]["est_output_tokens"] > 300
+
+
+def test_status_json_exits_two_when_the_config_cannot_be_read(monkeypatch, capsys):
+    import hermes_cli.config as cfg
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("config.yaml is not readable")
+
+    monkeypatch.setattr(cfg, "load_config", _boom)
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="status", json=True)) == 2
+    captured = capsys.readouterr()
+    assert "not readable" in captured.err
+    assert captured.out == ""
+
+
+def test_status_json_exits_zero_for_a_misconfigured_but_readable_config(
+    tmp_path, monkeypatch, capsys
+):
+    """Garbage in the section must be reported, never crash the command."""
+    home = tmp_path / "broken"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import hermes_cli.config as cfg
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    (home / "config.yaml").write_text(
+        "model:\n  provider: prov\n"
+        "smart_model_routing:\n"
+        "  enabled: true\n"
+        "  models: not-a-list\n"
+        "  stability_threshold: abc\n"
+        "  strategy: nonsense\n",
+        encoding="utf-8",
+    )
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="status", json=True)) == 0
+    report = _parse(capsys.readouterr().out)
+    assert set(report) == REPORT_KEYS
+    assert report["settings"]["strategy"] == "automatic"
+    assert report["settings"]["stability_threshold"] == pytest.approx(0.15)
