@@ -12,8 +12,12 @@ provider configured as ``web.extract_backend`` falls through):
 3. Legacy preference walk (``_LEGACY_PREFERENCE``) filtered by availability —
    the historic ``tools.web_tools._get_backend()`` order, so installs that never
    set a config key keep landing on the same provider.
-4. Keyless free-tier walk (``_KEYLESS_PREFERENCE``), last resort.
-5. ``None`` — the tool points the user at ``hermes tools``.
+4. Keyed late-comers (``_KEYED_PREFERENCE``, e.g. Google CSE): registered AND
+   available, but after the legacy walk so no existing backend is downgraded.
+5. Keyless free-tier walk (``_KEYLESS_PREFERENCE``), last resort.
+6. ``None`` — the tool points the user at ``hermes tools``.
+
+The chosen backend and the reason are logged at DEBUG.
 """
 
 from __future__ import annotations
@@ -62,6 +66,19 @@ def _configured_backend(capability: str) -> Optional[str]:
 # tier on upgrade; filtered by ``is_available()`` at walk time.
 _LEGACY_PREFERENCE = ("firecrawl", "parallel", "tavily", "perplexity", "exa", "searxng", "brave-free", "ddgs")
 
+# Keyed providers that are not part of the historic walk (they arrived after it). They are
+# tried AFTER the legacy walk and BEFORE the keyless tier: an install that already lands on a
+# legacy backend keeps it, while a keyed Google CSE setup still beats an anonymous public
+# free tier. An explicit ``web.search_backend`` / ``web.backend`` always wins outright.
+_KEYED_PREFERENCE = ("google_cse",)
+
+
+def _chosen(provider: WebSearchProvider, capability: str, reason: str) -> WebSearchProvider:
+    """Log the resolution result and why, at DEBUG (the chosen backend + its reason)."""
+    logger.debug("web %s backend: %s (%s)", capability, provider.name, reason)
+    return provider
+
+
 # Anonymous public free tiers (see plugins/web/keyless_mcp.py); strictly last
 # resort, i.e. zero web credentials and no importable ddgs. Unpinned keyless
 # traffic round-robins across the ring per request; an explicit `hermes tools`
@@ -90,7 +107,8 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     ``is_available()`` is False (the dispatcher surfaces a precise
     "X_API_KEY is not set" error instead of a silent switch); then the single
     available capable provider; then the availability-filtered legacy walk;
-    then the keyless free-tier walk; else None.
+    then keyed late-comers (``_KEYED_PREFERENCE``); then the keyless free-tier
+    walk; else None. The chosen backend and the reason are logged at DEBUG.
     """
     snapshot = _registry.merged()
 
@@ -106,7 +124,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     if configured:
         provider = snapshot.get(configured)
         if provider is not None and _capable(provider):
-            return provider
+            return _chosen(provider, capability, "explicitly configured")
         if provider is None:
             logger.debug("web backend '%s' configured but not registered; falling back", configured)
         else:
@@ -117,13 +135,25 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     # Fallbacks are availability-filtered so a registered-but-keyless provider
     # never becomes "active" on a fresh install.
     eligible = [p for p in snapshot.values() if _capable(p) and _available(p)]
-    if len(eligible) == 1:
-        return eligible[0]
+    # Keyed late-comers are deliberately excluded from the single-provider
+    # shortcut: they must be reached through their own tier, after the legacy
+    # walk, so the ordering is the same whether one or many legacy backends
+    # happen to be available.
+    eligible_legacy = [p for p in eligible if p.name not in _KEYED_PREFERENCE]
+    if len(eligible_legacy) == 1:
+        return _chosen(eligible_legacy[0], capability, "only available provider")
 
     for legacy in _LEGACY_PREFERENCE:
         provider = snapshot.get(legacy)
         if provider is not None and provider in eligible:
-            return provider
+            return _chosen(provider, capability, "legacy preference walk")
+
+    # Keyed late-comers: registered and available, but after the historic walk
+    # so an existing backend is never downgraded by their presence.
+    for keyed in _KEYED_PREFERENCE:
+        provider = snapshot.get(keyed)
+        if provider is not None and provider in eligible:
+            return _chosen(provider, capability, "keyed tier after legacy walk")
 
     # Keyless free tier (anonymous public MCP tiers) is last-resort only: it is
     # reachable solely when the legacy walk found nothing, never pre-empting a
@@ -135,10 +165,11 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
                 continue
             try:
                 if provider.is_keyless_available():
-                    return provider
+                    return _chosen(provider, capability, "keyless tier, last resort")
             except Exception as exc:  # noqa: BLE001 — buggy provider skipped
                 logger.debug("provider %s.is_keyless_available() raised %s", name, exc)
 
+    logger.debug("web %s backend: none (no configured, available or keyless provider)", capability)
     return None
 
 
