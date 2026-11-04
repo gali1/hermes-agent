@@ -195,6 +195,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--reasoning level] [--global|--session] [--refresh]",
                busy_policy="reject", busy_handler="model", desktop="hidden"),
+    # Hyphenated on purpose: ``/model-routing`` is the name users type, and ``get_command`` does
+    # NOT fold hyphens.  ``model_routing`` is an alias so the underscore spelling (and Telegram's
+    # sanitized menu entry) resolves to the same CommandDef and the same handler
+    # (``_command_handler_table`` maps ``-`` -> ``_``).
+    CommandDef("model-routing", "Enable, disable or configure smart model routing", "Configuration",
+               aliases=("model_routing",),
+               args_hint="[enable|disable|models|preferences|yes|cancel]",
+               busy_policy="dispatch"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",), args_hint="[auto|codex_app_server]",
                busy_policy="reject", busy_handler="codex-runtime"),
