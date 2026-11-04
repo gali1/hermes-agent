@@ -865,3 +865,58 @@ class GatewayModelCommandsMixin:
         if picker_sent:
             return None  # Picker sent — adapter handles the response
         return t("gateway.fast.status", mode=status)
+
+    async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle ``/model-routing`` — view, enable, or disable smart model routing.
+
+        Stateless on purpose: enabling requires the literal word ``confirm`` in the same
+        message, so the preview is always shown before the write and no per-chat pending state
+        can go stale or be answered by a different user. Disabling is the safe direction and
+        applies immediately. Every write goes through the shared ``write_routing_config``.
+        """
+        from hermes_cli.config import get_config_path, read_user_config_raw
+        from hermes_cli.subcommands.model import (
+            _render_routing, _routing_report, write_routing_config)
+
+        try:
+            args = event.get_command_args().strip().lower().split()
+        except Exception:
+            args = []
+
+        try:
+            data = dict(read_user_config_raw(get_config_path()) or {})
+        except Exception as exc:
+            return f"routing: config unreadable ({exc.__class__.__name__}: {exc})"
+
+        raw = data.get("smart_model_routing")
+        block = raw if isinstance(raw, dict) else {}
+        current = _routing_report(data, block)
+
+        if not args or args[0] == "status":
+            return (_render_routing(current) + "\n\n"
+                    "Usage:\n"
+                    "  /model-routing on          preview enabling\n"
+                    "  /model-routing on confirm  enable\n"
+                    "  /model-routing off         disable (single-model behaviour)")
+
+        action = args[0]
+        if action in ("off", "disable", "single"):
+            result = write_routing_config({"enabled": False})
+            if not result["ok"]:
+                return "routing: " + "; ".join(result["problems"])
+            return ("Routing disabled — single-model behaviour restored.\n\n"
+                    + _render_routing(_routing_report(data, result["saved"])))
+
+        if action in ("on", "enable"):
+            preview = _routing_report(data, {**block, "enabled": True})
+            if "confirm" not in args[1:]:
+                return ("Enabling routing changes the model on every turn.\n\n"
+                        + _render_routing(preview)
+                        + "\n\nReply `/model-routing on confirm` to apply.")
+            result = write_routing_config({"enabled": True})
+            if not result["ok"]:
+                return "routing: " + "; ".join(result["problems"])
+            return ("Routing enabled.\n\n"
+                    + _render_routing(_routing_report(data, result["saved"])))
+
+        return "Unknown option. Use `/model-routing [status|on [confirm]|off]`."

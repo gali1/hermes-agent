@@ -512,6 +512,58 @@ def parse_settings(raw: Any) -> RoutingSettings:
     )
 
 
+ROUTING_STRATEGIES = ("automatic", "cost", "quality")
+_ROUTING_BOOL_KEYS = ("enabled", "preferred_models_only", "allow_unknown_metadata", "cost_optimization")
+
+
+def validate_routing_config(raw: Any) -> List[str]:
+    """Human-readable problems with a ``smart_model_routing`` block; empty means valid.
+
+    Never raises: this runs on user input and on config read back from disk.
+    """
+    problems: List[str] = []
+    if raw is None:
+        return problems
+    if not isinstance(raw, dict):
+        return ["smart_model_routing must be a mapping"]
+    if "strategy" in raw:
+        strategy = str(raw.get("strategy") or "").strip().lower()
+        if strategy not in ROUTING_STRATEGIES:
+            problems.append(
+                f"strategy must be one of {', '.join(ROUTING_STRATEGIES)} "
+                f"(got {raw.get('strategy')!r})")
+    if "stability_threshold" in raw:
+        try:
+            threshold = float(raw["stability_threshold"])
+        except (TypeError, ValueError):
+            problems.append("stability_threshold must be a number between 0 and 1")
+        else:
+            if not 0.0 <= threshold <= 1.0:
+                problems.append(
+                    f"stability_threshold must be between 0 and 1 (got {threshold})")
+    if "models" in raw and not isinstance(raw["models"], (list, tuple)):
+        problems.append("models must be a list of model names")
+    for key in _ROUTING_BOOL_KEYS:
+        if key in raw and not isinstance(raw[key], bool):
+            problems.append(f"{key} must be true or false")
+    return problems
+
+
+def merge_routing_config(raw: Any, **changes: Any) -> Dict[str, Any]:
+    """Return a new ``smart_model_routing`` dict with *changes* applied.
+
+    Keys the caller does not mention are preserved untouched, including any this engine does
+    not know about, so a future/foreign key is never dropped by a write from an interface.
+    ``None`` means "leave as is".
+    """
+    merged = dict(raw) if isinstance(raw, dict) else {}
+    for key, value in changes.items():
+        if value is None:
+            continue
+        merged[key] = list(value) if isinstance(value, tuple) else value
+    return merged
+
+
 def _tri_flag(entry: Dict[str, Any], key: str) -> Optional[bool]:
     """True/False when stated, None when the entry says nothing (unknown, not unsupported)."""
     if key not in entry or entry[key] is None:

@@ -52,6 +52,37 @@ def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
         help="Prompt to classify (default: a representative probe prompt).")
     status_parser.set_defaults(func=cmd_model_routing_status)
 
+    # State-changing subcommands. Every one goes through _routing_apply so the CLI, the setup
+    # wizard and the gateway share a single read/validate/preview/write path.
+    for name, help_text in (
+        ("enable", "Turn routing on (shows the preview and asks for confirmation)."),
+        ("disable", "Turn routing off; the single-model setting takes over again."),
+        ("configure", "Set routing options non-interactively."),
+    ):
+        sub = routing_subs.add_parser(name, help=help_text)
+        sub.add_argument("--yes", "-y", action="store_true",
+                         help="Skip the confirmation prompt (for scripts).")
+        if name == "configure":
+            sub.add_argument("--strategy", choices=("automatic", "cost", "quality"), default=None)
+            sub.add_argument("--threshold", type=float, default=None,
+                             help="stability_threshold: improvement needed to switch (0-1).")
+            sub.add_argument("--models", default=None,
+                             help="Comma-separated model names; empty string means all eligible.")
+            sub.add_argument("--all-eligible", action="store_true",
+                             help="Route across the whole catalog (same as --models '').")
+            sub.add_argument("--selected-only", action="store_true",
+                             help="Route only among the models in --models.")
+            sub.add_argument("--allow-unknown-metadata", dest="allow_unknown", default=None,
+                             action="store_true")
+            sub.add_argument("--strict-metadata", dest="allow_unknown", action="store_false",
+                             help="Treat unknown capability metadata as unsupported.")
+            sub.add_argument("--cost-optimization", dest="cost_opt", default=None,
+                             action="store_true")
+            sub.add_argument("--no-cost-optimization", dest="cost_opt", action="store_false")
+        sub.set_defaults(func=cmd_model_routing_enable if name == "enable"
+                         else cmd_model_routing_disable if name == "disable"
+                         else cmd_model_routing_configure)
+
 
 def cmd_model_routing_status(args) -> int:
     """Print the routing contract and the decision the next turn would make.
@@ -95,3 +126,142 @@ def cmd_model_routing_status(args) -> int:
     print(f"skip_reason: {report['skip_reason'] or '(switches)'}")
     print(f"reason: {report['reason']}")
     return 0
+
+
+_PROBE_PROMPT = "Refactor the storage layer and explain the trade-offs."
+
+
+def _routing_report(cfg, raw, text: str = _PROBE_PROMPT):
+    """Explain a candidate routing block using the same engine `status` uses."""
+    from agent.model_routing import explain_routing
+
+    model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+    return explain_routing(
+        raw if isinstance(raw, dict) else {}, text,
+        current=str(model_cfg.get("default") or "").strip() or None,
+        provider=str(model_cfg.get("provider") or "").strip())
+
+
+def _render_routing(report) -> str:
+    """The one renderer, matching `status` so the two can never disagree."""
+    label = "would select" if report["enabled"] else "would select if enabled"
+    return (
+        f"enabled: {str(report['enabled']).lower()}\n"
+        f"strategy: {report['settings']['strategy']} "
+        f"(stability_threshold={report['settings']['stability_threshold']})\n"
+        f"request tier: {report['request']['tier']}\n"
+        f"candidates: {report['eligible_count']} eligible from {report['candidate_source']}\n"
+        f"{label}: {report['selected'] or '(none)'}\n"
+        f"skip_reason: {report['skip_reason'] or '(switches)'}")
+
+
+def write_routing_config(changes: dict) -> dict:
+    """Apply *changes* to ``smart_model_routing`` and return the outcome.
+
+    The single writer for every interface: CLI, setup wizard and gateway all call this, so
+    there is exactly one read → merge → validate → atomic write → read-back path. Returns
+    ``{"ok": bool, "problems": [...], "saved": <block read back from disk>}``; on failure the
+    previous file is left intact and ``saved`` is the unchanged block.
+    """
+    from agent.model_routing import merge_routing_config, validate_routing_config
+    from hermes_cli.config import atomic_config_replace, get_config_path, read_user_config_raw
+
+    path = get_config_path()
+    data = dict(read_user_config_raw(path) or {})
+    old_raw = data.get("smart_model_routing")
+    new_raw = merge_routing_config(old_raw, **changes)
+
+    problems = validate_routing_config(new_raw)
+    if problems:
+        return {"ok": False, "problems": problems, "saved": old_raw, "before": old_raw,
+                "after": new_raw, "data": data}
+
+    data["smart_model_routing"] = new_raw
+    atomic_config_replace(path, data)
+    saved = (read_user_config_raw(path) or {}).get("smart_model_routing")
+    return {"ok": True, "problems": [], "saved": saved, "before": old_raw,
+            "after": new_raw, "data": data}
+
+
+def _routing_apply(*, changes: dict, assume_yes: bool) -> int:
+    """Read, merge, validate, preview, confirm, write atomically, then read back.
+
+    The single writer shared by every interface. A failed or cancelled run writes nothing.
+    """
+    from agent.model_routing import merge_routing_config
+    from hermes_cli.config import get_config_path, read_user_config_raw
+
+    try:
+        data = dict(read_user_config_raw(get_config_path()) or {})
+    except Exception as exc:
+        print(f"routing: config unreadable ({exc.__class__.__name__}: {exc})")
+        return 2
+
+    old_raw = data.get("smart_model_routing")
+    new_raw = merge_routing_config(old_raw, **changes)
+
+    before = _routing_report(data, old_raw)
+    after = _routing_report(data, new_raw)
+    print("--- before ---")
+    print(_render_routing(before))
+    print("--- after ---")
+    print(_render_routing(after))
+
+    # Enabling changes behaviour on every turn, so it always needs an explicit confirmation
+    # that includes the preview (spec: defaults are safe).
+    if new_raw.get("enabled") and not assume_yes:
+        try:
+            answer = input("Enable smart model routing? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes"):
+            print("routing: cancelled — nothing written")
+            return 0
+
+    try:
+        result = write_routing_config(changes)
+    except Exception as exc:
+        print(f"routing: write failed ({exc.__class__.__name__}: {exc}); previous config intact")
+        return 2
+    if not result["ok"]:
+        for problem in result["problems"]:
+            print(f"routing: {problem}")
+        print("routing: nothing written")
+        return 1
+
+    print("--- saved (read back from disk) ---")
+    print(_render_routing(_routing_report(data, result["saved"])))
+    print("\nverify: hermes model routing status")
+    return 0
+
+
+def cmd_model_routing_enable(args) -> int:
+    return _routing_apply(changes={"enabled": True}, assume_yes=bool(getattr(args, "yes", False)))
+
+
+def cmd_model_routing_disable(args) -> int:
+    return _routing_apply(changes={"enabled": False}, assume_yes=True)
+
+
+def cmd_model_routing_configure(args) -> int:
+    changes: dict = {}
+    if getattr(args, "strategy", None):
+        changes["strategy"] = args.strategy
+    if getattr(args, "threshold", None) is not None:
+        changes["stability_threshold"] = float(args.threshold)
+    if getattr(args, "all_eligible", False):
+        changes["models"] = []
+    elif getattr(args, "models", None) is not None:
+        raw = str(args.models).strip()
+        changes["models"] = [m.strip() for m in raw.split(",") if m.strip()] if raw else []
+    if getattr(args, "selected_only", False):
+        changes["preferred_models_only"] = True
+    if getattr(args, "allow_unknown", None) is not None:
+        changes["allow_unknown_metadata"] = bool(args.allow_unknown)
+    if getattr(args, "cost_opt", None) is not None:
+        changes["cost_optimization"] = bool(args.cost_opt)
+    if not changes:
+        print("routing: nothing to change — pass at least one option "
+              "(--strategy, --threshold, --models, --all-eligible, --selected-only, ...)")
+        return 1
+    return _routing_apply(changes=changes, assume_yes=bool(getattr(args, "yes", False)))
