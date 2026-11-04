@@ -4,7 +4,7 @@ Two Hermes deployments run two independently written routers:
 
 | | `hermes-agent-fastembed` (oklab-1) | `hermes-agent` (bro-2) |
 |---|---|---|
-| module | `agent/model_router.py` (2 444 lines) | `agent/model_routing.py` (741 lines) |
+| module | `agent/model_router.py` (2 444 lines) | `agent/model_routing.py` (853 lines) |
 | entry point | `select_model(...)` + turn-boundary wiring in `agent/agent_runtime_helpers.py` | `maybe_apply_model_routing(agent, text)` |
 | explain | `explain(decision, profile)` (+ `hermes model routing explain`) | `explain_routing(agent, ...)` (used by `hermes_cli/subcommands/model.py`) |
 | multimodal | `agent/image_routing.py` + modality fields on candidates | vision/audio/modality flags inside the router |
@@ -49,9 +49,9 @@ on the two sides** — the contract no longer pretends it is:
 - **oklab-1** (`agent/model_router.py:1087-1110`): capability, cost, reliability,
   context fit, continuity, weighted by `strategy` — `cost`:
   `0.35 / 0.55 / 0.05 / 0.05 / 0.0`; `quality`: `0.65 / 0.05 / 0.15 / 0.10 / 0.05`.
-- **bro-2** (`agent/model_routing.py:244-269`): capability minus an
+- **bro-2** (`agent/model_routing.py:307-333`): capability minus an
   unknown-capability penalty minus a cost penalty; context is a **hard gate**
-  (`:230`), not a score term; continuity is an incumbent rule, not a term.
+  (`:293`), not a score term; continuity is an incumbent rule, not a term.
 
 `reliability` is an **operator-declared preference, not a measured success rate**:
 nothing assigns `ModelCandidate.reliability`, the only source is
@@ -60,7 +60,9 @@ it is additive it can **promote** an equal-scored rival as well as demote one, s
 older "only ever demotes / only more conservative" claim was wrong. Band: maximum
 swing is `0.05` under `strategy=cost` and `0.15` under `quality`; C5 keeps the
 incumbent when `gain <= stability_threshold`, so it decides first-turn picks and
-ties, and can never alone dislodge an incumbent.
+ties. It cannot alone dislodge an incumbent **at the default `stability_threshold` of
+0.15** — that is a threshold-dependent statement, not an absolute one: any configured
+threshold below 0.15 makes the 0.15 quality-strategy swing decisive on its own.
 
 ## C5 — Stability (anti-flapping)
 The incumbent model keeps the turn unless a rival beats it by more than
@@ -69,7 +71,9 @@ its older name) **or** a hard constraint forces the switch. Ties and borderline
 wins keep the current model — a switch costs a prompt-cache invalidation.
 
 **Tie rule (total order).** Equal scores resolve on the provider-qualified key
-`provider/model`, not on declaration order and not on latency — no implementation
+`provider/model` — the joined string compared literally, not a `(provider, name)`
+tuple, which orders differently when one provider name is a prefix of another — and
+not on declaration order and not on latency; no implementation
 reads a latency field, and `ModelCandidate.latency_ms` is documented as unused. The
 same rule decides the *first* pick of a session, where no incumbent exists yet, so it
 is observable behaviour, not an implementation detail.
@@ -79,6 +83,11 @@ offered by two providers; a name-only match lets the "kept current" path report 
 provider the session is not on, and makes a cross-provider move to an identically
 named model unreachable (C8). Name-only matching is allowed **only** when the caller
 has no provider to compare with.
+
+Two falsifiers on bro-2 (`tests/agent/test_model_routing.py`): an incumbent `dup` on provider
+`b` must switch to a cheaper `dup` on provider `a` (a name-only match would stay on `b`), and
+the turn-boundary hook must call `switch_model` when only the provider changes for an
+identically named model (the name-only "unchanged" check would return early).
 
 ## C6 — `preferred_models_only`
 Restricts the *preferred pool*; it never overrides C3. A turn that needs tools
@@ -119,10 +128,15 @@ part must not select a model whose input modality excludes images, and must not 
   has test-only callers. A text-only model can win an image-output request because an
   UNKNOWN output modality passes the filter (`model_router.py:904`) and `SPEC_FIELDS`
   (`:339-353`) cannot declare image output.
-- *bro-2*: NOT IMPLEMENTED, and worse — `agent/turn_context.py:1117` passes text only,
-  and a genuine content-parts list makes `classify_request` raise `AttributeError`
-  (`model_routing.py:153`, `body.strip()`), swallowed at `:636`. Multimodal turns are
-  routing-inert **by accident**, not by design. That is a defect in its own right.
+- *bro-2*: NOT IMPLEMENTED for string prompts, but the crash is fixed. The turn boundary
+  (`agent/turn_context.py:1117-1118`) forwards the payload verbatim, and that payload can be a
+  multi-part content list — vision via the OpenAI-compatible server, per
+  `agent/agent_runtime_helpers.py:3358` — so `classify_request` used to raise `AttributeError`
+  (`body.strip()` on a list, swallowed at `model_routing.py:731`) and every such turn was
+  routing-inert by accident. It now reads text, image, audio and file parts and ORs their
+  flags with the caller's, so a list payload neither raises nor selects a text-only model for
+  an image part. Still missing: attachments delivered beside a *string* prompt are handled by
+  `image_routing.py` after selection, so the string path cannot state its modality.
 - Both: `image_routing.py` is a **separate axis applied after selection**, which cannot
   satisfy C9a.
 
@@ -142,7 +156,7 @@ yet, because the MoA path does not consult the router).
 
 **The machine surface is a dict, and it is normative.** oklab-1 calls it
 `routing_report()` (`model_router.py:2361-2455`), bro-2 calls it `explain_routing()`
-(`model_routing.py:640-721`): same shape, different name. Either name is acceptable
+(`model_routing.py:735-821`): same shape, different name. Either name is acceptable
 locally, but the dict — not any text renderer — is what automation may parse, and a
 text renderer must be derived from it so the two cannot disagree. oklab-1's
 `explain()` (`:1486-1513`) is **text only** and is not an automation surface.
@@ -176,25 +190,28 @@ well as demotes — but none may relax C1–C3 or C6.
     tests/agent/test_model_router_cross_provider.py tests/agent/test_image_routing.py \
     tests/hermes_cli/test_model_routing_cli.py -q
 
-# bro-2 (this copy): 71 passed
+# bro-2 (this copy): 85 passed
 /home/bro/hermes-venv/bin/python -m pytest tests/agent/test_model_routing.py -q
 ```
 
 ## Open reconciliation items
 
-Resolved this round (implemented on oklab-1: the doc-truth commit `1f1ab5ad32`, plus the
-incumbent-identity commit that carries this document):
+Resolved this round — oklab-1 `1f1ab5ad32` (doc truth) + `8a848064c8` (incumbent
+identity); bro-2 `5ed600a3b3` (same identity, plus the C9a content-parts fix):
 reliability reclassified as operator-declared preference (C4), tie rule and incumbent
 identity stated (C5), explain surface named with the dict normative (C10), and the
-"only more conservative" claim withdrawn.
+"only more conservative" claim withdrawn. bro-2 mirrored the incumbent identity and the
+joined tie-break key, fixed the content-parts crash, and refreshed the line references in
+the commit that carries this revision.
 
 Still open:
 
 1. **C9a wiring** — the one genuinely unimplemented clause. Both sides must derive the
    modality requirement from attachments at the turn boundary. Owner: both.
-2. **bro-2 defect** — `classify_request` raises `AttributeError` on a content-parts
-   list (`model_routing.py:153`), swallowed at `:636`; fix before C9a can be ported.
-   Owner: bro-2.
+2. **bro-2 defect — fixed, wiring still open** — `classify_request` no longer raises on a
+   content-parts list and derives the modality flags from the parts (regression tests in
+   `tests/agent/test_model_routing.py`). What remains is item 1's string-prompt path.
+   Owner: bro-2, then both.
 3. **C8 form** — self-managed switching there vs `switch_model` delegation here. Both
    are acceptable in behaviour; decide whether the delegation form becomes the shared
    contract. Owner: both.
