@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import pytest
 
+import agent.model_routing as model_routing
 from agent.model_routing import (
     TIERS, ModelOption, RequestProfile, classify_request, estimate_cost, estimate_tokens,
-    explain_routing, is_eligible, maybe_apply_model_routing, options_from_config,
-    parse_settings, score_model, select_model,
+    _exclusion_reason, explain_routing, is_eligible, maybe_apply_model_routing,
+    options_from_config, parse_settings, score_model, select_model,
 )
 
 CHEAP_WEAK = ModelOption(name="cheap", cost_in=0.1, cost_out=0.2, tier_rank=0)
@@ -398,3 +399,54 @@ class TestConfigCatalogMerge:
         option = options_from_config({"models": [{"name": "ok"}]})[0]
         assert called == []
         assert option.cost_in == 0.0 and option.supports_tools is None
+
+
+class TestValidatorFindings:
+    """Regressions for four defects found by independent validation."""
+
+    def test_preferred_models_only_without_a_list_does_not_route_the_whole_catalog(self, monkeypatch):
+        """The setting must not silently do the opposite of its name."""
+        calls = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda *a, **k: calls.append(a))
+        agent = _Agent({"smart_model_routing": {
+            "enabled": True, "preferred_models_only": True, "models": []}},
+            model="m", provider="p")
+        assert maybe_apply_model_routing(agent, "do something") is None
+        assert calls == []
+
+    def test_preferred_models_only_still_routes_within_an_explicit_list(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda *a, **k: calls.append(a))
+        agent = _Agent(model="expensive", provider="p",
+                       config={"smart_model_routing": {
+                           "enabled": True, "preferred_models_only": True,
+                           "models": [
+                               {"name": "expensive", "provider": "p", "cost_in": 5.0,
+                                "cost_out": 15.0, "tier_rank": 3},
+                               {"name": "cheap", "provider": "p", "cost_in": 0.1,
+                                "cost_out": 0.2, "tier_rank": 3}]}})
+        decision = maybe_apply_model_routing(agent, "hello")
+        assert decision is not None and decision.model == "cheap"
+
+    def test_explain_scores_do_not_collide_on_duplicate_names(self):
+        a = ModelOption(name="shared", provider="alpha", cost_in=0.1, cost_out=0.1, tier_rank=3)
+        b = ModelOption(name="shared", provider="beta", cost_in=9.0, cost_out=9.0, tier_rank=3)
+        r = explain_routing({"enabled": True}, "hello", options=[a, b])
+        scores = {c["provider"]: c["score"] for c in r["candidates"]}
+        assert scores["alpha"] != scores["beta"]
+
+    def test_strict_mode_exclusion_names_audio(self):
+        opt = ModelOption(name="no-audio-meta", tier_rank=3, supports_tools=True)
+        profile = classify_request("x", has_audio=True)
+        assert is_eligible(opt, profile, allow_unknown=False) is False
+        assert "audio" in _exclusion_reason(opt, profile, parse_settings(
+            {"allow_unknown_metadata": False}))
+
+    def test_option_building_errors_are_swallowed(self, monkeypatch):
+        """The docstring promises any failure is swallowed; options building is inside it now."""
+        agent = _Agent({"smart_model_routing": {"enabled": True}}, model="m", provider="p")
+        monkeypatch.setattr(model_routing, "options_from_config",
+                            lambda cfg: (_ for _ in ()).throw(RuntimeError("corrupt cache")))
+        assert maybe_apply_model_routing(agent, "hello") is None

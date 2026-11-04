@@ -594,14 +594,20 @@ def maybe_apply_model_routing(agent: Any, text: str) -> Optional[RoutingDecision
     st = parse_settings(cfg)
     if not st.enabled:
         return None
-    options = options_from_config(cfg)
-    if not options:
-        # No explicit list: derive candidates from the cached catalog for the current
-        # provider (cache only — a turn must never wait on a network fetch).
-        options = options_from_catalog(str(getattr(agent, "provider", "") or ""))
-    if not options:
-        return None
     try:
+        options = options_from_config(cfg)
+        if not options:
+            if st.preferred_models_only:
+                # "Preferred models only" with no preferred list means there is nothing to
+                # choose between. Falling back to the whole catalog would do the exact
+                # opposite of what the setting asks for.
+                logger.debug("model routing skipped: preferred_models_only with no models list")
+                return None
+            # No explicit list: derive candidates from the cached catalog for the current
+            # provider (cache only — a turn must never wait on a network fetch).
+            options = options_from_catalog(str(getattr(agent, "provider", "") or ""))
+        if not options:
+            return None
         profile = classify_request(text or "")
         decision = select_model(
             options, profile,
@@ -647,7 +653,9 @@ def explain_routing(
         source = "catalog"
     ranked, cheapest, fallback_cost = rank_candidates(cands, prof, st)
     decision = select_model(cands, prof, current=current, settings=st)
-    scores = {o.name: sc for sc, o in ranked}
+    # Keyed by identity: two providers can expose the same model name, and a name-keyed map
+    # made both rows print the same score.
+    scores = {id(o): sc for sc, o in ranked}
     rows = []
     for opt in cands:
         eligible = is_eligible(opt, prof, st.allow_unknown_metadata)
@@ -660,7 +668,7 @@ def explain_routing(
             "model": opt.name,
             "provider": opt.provider,
             "eligible": eligible,
-            "score": round(scores[opt.name], 4) if eligible else None,
+            "score": round(scores[id(opt)], 4) if eligible else None,
             "tier": opt.tier_rank,
             "cost_in": opt.cost_in,
             "cost_out": opt.cost_out,
@@ -721,8 +729,13 @@ def _exclusion_reason(option: ModelOption, profile: RequestProfile,
     if 3 <= profile.tier_rank <= 4 and option.tier_rank < profile.tier_rank:
         return f"tier {option.tier_rank} below required {profile.tier_rank}"
     if not st.allow_unknown_metadata:
-        for label, val in (("tools", option.supports_tools), ("vision", option.supports_vision)):
-            if val is None and ((label == "tools" and profile.needs_tools)
-                                or (label == "vision" and profile.needs_vision)):
+        needs = (
+            ("tools", option.supports_tools, profile.needs_tools),
+            ("vision", option.supports_vision, profile.needs_vision),
+            ("audio", option.supports_audio, profile.needs_audio),
+            ("structured", option.supports_structured, profile.needs_structured),
+        )
+        for label, value, required in needs:
+            if required and value is None:
                 return f"{label} capability unknown (strict mode)"
     return "not eligible"
