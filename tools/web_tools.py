@@ -115,6 +115,30 @@ def _get_backend() -> str:
     return _autodetect_backend() or _keyless_backend() or "firecrawl"  # default (backward compat)
 
 
+def _backend_reason(backend: str) -> str:
+    """Source label for *backend*, for the DEBUG resolution line only.
+
+    Derived from config + the name alone: re-running the autodetect walk here would double the
+    availability probes (and the keyless cursor read) just to label a log line.
+    """
+    if _configured_backend():
+        return "web.backend"
+    if read_selection("web") is not None:
+        return "stored shared selection"
+    if backend == "google-cse":
+        return "autodetect (keyed fallback tier)"
+    return "autodetect"
+
+
+def _log_backend_choice(capability: str, backend: str, reason: str) -> None:
+    """One stable DEBUG line per dispatch resolution: backend + why it won.
+
+    Mirrors ``agent.web_search_registry._log_resolution`` so resolution and dispatch can be
+    diffed on identical inputs across installs. Provider names only — never a credential value.
+    """
+    logger.debug("web %s backend resolved: %s (reason: %s)", capability, backend or "<none>", reason)
+
+
 def _autodetect_backend() -> Optional[str]:
     """Autodetect rungs above the keyless tier, or None. Explicit user credentials beat the managed-gateway
     probe (a Nous OAuth token's tier may not grant web access; the gateway then fails at runtime with no
@@ -126,6 +150,10 @@ def _autodetect_backend() -> Optional[str]:
         ("firecrawl", _has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")),
         ("firecrawl", _is_tool_gateway_ready()), ("searxng", _has_env("SEARXNG_URL")),
         ("brave-free", _has_env("BRAVE_SEARCH_API_KEY")), ("ddgs", _ddgs_package_importable()),
+        # Keyed fallback tier: after the legacy rungs above, before the keyless tier below
+        # (``_get_backend`` probes ``_keyless_backend()`` only once this returns None).
+        # Both credentials are required — a lone Google API key cannot address an engine.
+        ("google-cse", _has_env("GOOGLE_CSE_API_KEY") and _has_env("GOOGLE_CSE_ID")),
     )
     for backend, available in backend_candidates:
         if available:
@@ -180,15 +208,29 @@ def _get_search_backend() -> str:
     stays on Firecrawl); managed Firecrawl is the per-call fallback, see ``_memoized_search``."""
     pin = _configured_backend("search_backend")
     if pin and pin != NOUS_MANAGED_PROVIDER:
+        _log_backend_choice("search", pin, "web.search_backend")
         return pin
-    return "perplexity" if _managed_web_search() else _get_backend()
+    if _managed_web_search():
+        _log_backend_choice("search", "perplexity", "managed nous route")
+        return "perplexity"
+    backend = _get_backend()
+    _log_backend_choice("search", backend, _backend_reason(backend))
+    return backend
 
 
 def _get_extract_backend() -> str:
     """Backend for web_extract: ``web.extract_backend`` (strict, no probe) > ``web.backend`` > autodetect.
     A ``nous`` pin is managed Firecrawl; the client picks the gateway route for that capability."""
     pin = _configured_backend("extract_backend")
-    return "firecrawl" if pin == NOUS_MANAGED_PROVIDER else pin or _get_backend()
+    if pin == NOUS_MANAGED_PROVIDER:
+        _log_backend_choice("extract", "firecrawl", "managed nous route")
+        return "firecrawl"
+    if pin:
+        _log_backend_choice("extract", pin, "web.extract_backend")
+        return pin
+    backend = _get_backend()
+    _log_backend_choice("extract", backend, _backend_reason(backend))
+    return backend
 
 
 def _ddgs_package_importable() -> bool:
@@ -256,6 +298,7 @@ def _web_requires_env() -> list[str]:
     Contract: set var -> tool sees it; extras are harmless for the not-logged-in."""
     return [
         "EXA_API_KEY", "PARALLEL_API_KEY", "TAVILY_API_KEY", "PERPLEXITY_API_KEY", "KEENABLE_API_KEY", "FIRECRAWL_API_KEY",
+        "GOOGLE_CSE_API_KEY", "GOOGLE_CSE_ID",
         "FIRECRAWL_API_URL", "FIRECRAWL_GATEWAY_URL", "PERPLEXITY_GATEWAY_URL", "TOOL_GATEWAY_DOMAIN", "TOOL_GATEWAY_SCHEME",
         "TOOL_GATEWAY_USER_TOKEN",
     ]
@@ -274,7 +317,8 @@ def _ensure_web_plugins_loaded() -> None:
     that never triggered discovery (subprocess agent runs, delegate children, scripts); without it a
     configured backend yields a misleading "No web ... provider" error.
 
-    Every bundled web provider (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl, keenable)
+    Every bundled web provider (brave-free, ddgs, searxng, exa, parallel, tavily, firecrawl, keenable,
+    google-cse)
     registers itself via ``plugins/web/<vendor>/__init__.py`` during plugin discovery. Tool dispatch can be
     reached from contexts that haven't already triggered discovery — subprocess agent runs, delegate
     children, standalone scripts, certain test paths — and without it the registry is empty and
