@@ -36,6 +36,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+from pathlib import Path
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -168,6 +169,88 @@ def _estimate_tokens(text: str) -> int:
         return int(estimate_tokens_rough(text))
     except Exception:  # pragma: no cover - defensive: estimator unavailable
         return max(1, len(text) // 4)
+
+
+#: Content-part types that carry an attachment, mapped to the modality hint the
+#: request classifier understands. Anything else in a parts list contributes text
+#: (or nothing), never a modality — an unrecognised part must not invent one.
+_PART_MODALITY = {
+    "image_url": "image",
+    "image": "image",
+    "input_image": "image",
+    "input_audio": "audio",
+    "audio": "audio",
+    "video": "video",
+    "input_video": "video",
+}
+
+_FILE_SUFFIX_MODALITY = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image",
+    ".webp": "image", ".bmp": "image", ".tif": "image", ".tiff": "image",
+    ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".ogg": "audio",
+    ".flac": "audio",
+    ".pdf": "pdf",
+    ".mp4": "video", ".mov": "video", ".mkv": "video", ".webm": "video",
+}
+
+
+def _modality_of_part(part: Dict[str, Any]) -> Optional[str]:
+    kind = str(part.get("type") or "").strip().lower()
+    if kind in _PART_MODALITY:
+        return _PART_MODALITY[kind]
+    if kind == "file":
+        raw = part.get("file")
+        filename = ""
+        if isinstance(raw, dict):
+            filename = str(raw.get("filename") or raw.get("name") or "")
+        elif isinstance(raw, str):
+            filename = raw
+        suffix = Path(filename).suffix.lower() if filename else ""
+        return _FILE_SUFFIX_MODALITY.get(suffix, "pdf" if suffix == ".pdf" else None)
+    return None
+
+
+def message_text_and_attachments(user_message: Any) -> Tuple[str, Tuple[str, ...]]:
+    """Split one turn's message into the text the router classifies.
+
+    A turn can arrive as a plain string or as a list of content parts (the
+    OpenAI-compatible shape a client sends when it mixes text with images, audio
+    or files). Routing must see both halves: the text decides complexity, the
+    attachments decide the input-modality requirement (contract C9a). Coercing a
+    parts list with ``str()`` — the old behaviour — kept the text but dropped the
+    attachments, so an image turn could be routed to a model that cannot read
+    images.
+
+    Returns ``(text, attachments)`` where ``attachments`` holds modality hints
+    (``"image"``, ``"audio"``, ``"pdf"``, ``"video"``), de-duplicated, in first-seen
+    order. Unknown part types contribute nothing.
+    """
+    if user_message is None:
+        return "", ()
+    if isinstance(user_message, str):
+        return user_message, ()
+    if isinstance(user_message, dict):
+        parts: Sequence[Any] = [user_message]
+    elif isinstance(user_message, (list, tuple)):
+        parts = user_message
+    else:
+        return str(user_message), ()
+
+    chunks: List[str] = []
+    attachments: List[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            chunks.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        modality = _modality_of_part(part)
+        if modality and modality not in attachments:
+            attachments.append(modality)
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            chunks.append(text)
+    return "\n".join(chunks).strip(), tuple(attachments)
 
 
 def classify_request(
@@ -2130,6 +2213,20 @@ def _resolve_provider_runtime(
     return runtime, ""
 
 
+#: Agent attribute carrying the reason the last turn was not routed. Read by the
+#: turn log and by anything that wants to explain a turn that kept its model.
+ROUTING_SKIP_ATTR = "_last_routing_skip_reason"
+
+
+def _record_routing_skip(agent: Any, reason: str) -> None:
+    """Make a routing skip visible (contract C10). Never raises."""
+    try:
+        setattr(agent, ROUTING_SKIP_ATTR, reason)
+    except Exception:  # pragma: no cover - defensive: exotic agent objects
+        pass
+    _log.debug("model routing skipped: %s", reason)
+
+
 def route_turn(
     agent: Any,
     user_message: str,
@@ -2137,13 +2234,24 @@ def route_turn(
     attachments: Sequence[str] = (),
     conversation_tokens: int = 0,
     config: Optional[Dict[str, Any]] = None,
+    moa_active: bool = False,
 ) -> Optional[Decision]:
     """Choose the model for one turn and apply it, or return ``None``.
 
     Returns the :class:`Decision` (so callers can log/explain it) or ``None``
     when routing is off, the model is user-pinned, there is nothing to choose
     between, or no candidate qualifies.
+
+    ``moa_active`` names the caller's mixture-of-agents state. The skip has to be
+    visible (contract C10: every skip is explainable), so it is recorded on the
+    agent rather than left implicit at the call site.
     """
+    if moa_active:
+        # C10: a skip nobody can see is indistinguishable from a bug. Record the
+        # reason where a later reader (and the turn log) can find it, then leave
+        # the model alone — scoring a replacement would dismantle the fan-out.
+        _record_routing_skip(agent, "moa_active")
+        return None
     try:
         if config is None:
             # Read-only fast path: routing never mutates config, and this runs

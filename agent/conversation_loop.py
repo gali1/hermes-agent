@@ -1578,11 +1578,22 @@ def _run_conversation_turn(
     # this turn.  With ``smart_model_routing.enabled`` false (the default) this
     # is one cached config read plus a dict lookup and returns; a single-model
     # config returns after one list build.  See ``agent/model_router.route_turn``.
-    if moa_config is None and getattr(agent, "api_mode", "") != "codex_app_server":
+    if getattr(agent, "api_mode", "") != "codex_app_server":
         try:
-            from agent.model_router import route_turn
+            from agent.model_router import message_text_and_attachments, route_turn
 
-            route_turn(agent, user_message if isinstance(user_message, str) else str(user_message))
+            # The turn may be a parts list (text + images/audio/files). Routing
+            # needs both halves: the text for complexity, the attachments for the
+            # input-modality requirement (contract C9a).
+            _route_text, _route_attachments = message_text_and_attachments(user_message)
+            # The MoA skip is decided inside route_turn so the reason is recorded
+            # rather than lost at the call site (contract C10).
+            route_turn(
+                agent,
+                _route_text,
+                attachments=_route_attachments,
+                moa_active=moa_config is not None,
+            )
         except Exception as _routing_err:  # routing must never break a turn
             logger.debug("smart model routing skipped: %s", _routing_err)
 

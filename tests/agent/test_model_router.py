@@ -1410,3 +1410,70 @@ def test_ties_resolve_on_the_provider_qualified_key():
     first = mr.rank_candidates(profile, [z, a])
     second = mr.rank_candidates(profile, [a, z])
     assert first.best_key == second.best_key == "aaa/same-model"
+
+
+# ---------------------------------------------------------------------------
+# C9a — the input-modality requirement must come from the attachments at the
+# turn boundary. Before this, the loop coerced the message with str(), which kept
+# the text and dropped every attachment, so an image turn could be routed to a
+# model that cannot read images.
+# ---------------------------------------------------------------------------
+
+
+def test_parts_list_keeps_text_and_surfaces_the_image_attachment():
+    text, attachments = mr.message_text_and_attachments([
+        {"type": "text", "text": "What is wrong with this chart?"},
+        {"type": "image_url", "image_url": {"url": "https://example.test/c.png"}},
+    ])
+    assert text == "What is wrong with this chart?"
+    assert attachments == ("image",)
+
+
+def test_plain_string_turns_are_unchanged():
+    assert mr.message_text_and_attachments("hello there") == ("hello there", ())
+    assert mr.message_text_and_attachments(None) == ("", ())
+
+
+def test_file_parts_map_by_suffix_and_audio_parts_map_to_audio():
+    _, pdf = mr.message_text_and_attachments(
+        [{"type": "file", "file": {"filename": "q3-report.pdf"}}]
+    )
+    _, audio = mr.message_text_and_attachments([{"type": "input_audio", "input_audio": {}}])
+    assert pdf == ("pdf",) and audio == ("audio",)
+
+
+def test_unknown_parts_neither_crash_nor_invent_a_modality():
+    text, attachments = mr.message_text_and_attachments([
+        {"type": "mystery"}, {"type": "text", "text": "still here"}, {"nope": 1},
+    ])
+    assert text == "still here"
+    assert attachments == ()
+
+
+def test_attachment_makes_vision_a_requirement_and_excludes_non_vision_models():
+    profile = mr.classify_request("Describe this chart", attachments=["image"])
+    assert "image" in profile.input_modalities
+    assert "vision" in mr.required_capabilities(profile)
+
+    blind = mr.ModelCandidate("blind", "no-eyes", info("no-eyes", vision=False))
+    sighted = mr.ModelCandidate("sighted", "sees", info("sees", vision=True))
+    cfg = mr.RoutingConfig()
+    assert mr._exclusion_reason(blind, profile, cfg) == "unsupported_vision"
+    assert mr._exclusion_reason(sighted, profile, cfg) == ""
+
+
+def test_an_image_turn_cannot_select_a_non_vision_model():
+    profile = mr.classify_request("Describe this chart", attachments=["image"])
+    blind = mr.ModelCandidate("blind", "no-eyes", info("no-eyes", vision=False))
+    sighted = mr.ModelCandidate("sighted", "sees", info("sees", vision=True))
+    selection = mr.rank_candidates(profile, [blind, sighted])
+    assert selection.best_key == "sighted/sees"
+
+
+def test_moa_skip_is_recorded_rather_than_silent():
+    class Agent:
+        pass
+
+    agent = Agent()
+    assert mr.route_turn(agent, "hello", moa_active=True) is None
+    assert getattr(agent, mr.ROUTING_SKIP_ATTR) == "moa_active"

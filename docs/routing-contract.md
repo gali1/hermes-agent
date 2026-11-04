@@ -121,20 +121,21 @@ pool cleared, prompt-cache flags, compressor) and is verified by the same falsif
 without that, "otherwise managed in place" becomes a permanent way for one side to
 stay put.
 
-## C9 — Multimodal continuity — **NOT IMPLEMENTED, both sides (status, not contract text)**
-
-Called "settled" in an earlier revision. Measured, it is not implemented anywhere, and
-both sides fail differently.
+## C9 — Multimodal continuity — **C9a: implemented on oklab-1, partial on bro-2; C9b: nowhere**
 
 **C9a — input modality.** The requirement must be derived from the attachments present
 at the turn boundary, never from message text. Falsifier: a message carrying an image
 part must not select a model whose input modality excludes images, and must not raise.
 
-- *oklab-1*: NOT IMPLEMENTED. `agent/conversation_loop.py:1585` coerces the message with
-  `str(...)` before `route_turn`, so attachments never reach selection; `expects_image`
-  has test-only callers. A text-only model can win an image-output request because an
-  UNKNOWN output modality passes the filter (`model_router.py:904`) and `SPEC_FIELDS`
-  (`:339-353`) cannot declare image output.
+- *oklab-1*: **IMPLEMENTED.** `message_text_and_attachments()` splits a turn into text and
+  modality hints (text/image/audio/pdf/video; unknown parts contribute nothing), and the
+  loop passes both to `route_turn(..., attachments=...)`, so the modality reaches
+  classification instead of being flattened by the old `str()` coercion. An image
+  attachment makes `vision` a hard requirement: a model declaring `supports_vision: false`
+  is excluded as `unsupported_vision` and cannot win the turn. Limits that remain: an
+  UNDECLARED `supports_vision` reads as unknown and is still allowed (unknown ≠
+  unsupported), and `SPEC_FIELDS` cannot declare image *output*, so an image-edit request
+  is not yet protected on the output side (that is C9b).
 - *bro-2*: NOT IMPLEMENTED for string prompts, but the crash is fixed. The turn boundary
   (`agent/turn_context.py:1117-1118`) forwards the payload verbatim, and that payload can be a
   multi-part content list — vision via the OpenAI-compatible server, per
@@ -160,14 +161,15 @@ from one vocabulary both sides accept: `no_candidates`, `no_eligible_model`,
 `already_current`, `within_stability_threshold`, `moa_active`, `disabled`, `error`
 (oklab-1 pins the set in `SKIP_REASONS`).
 
-**`moa_active` is in the vocabulary but neither side emits it, and both are silent about
-it.** oklab-1 skips routing at the call site when a MoA config is present
-(`conversation_loop.py:1581`); bro-2 skips inside the router
-(`model_routing.py:678`) and returns `None` before any `Decision` exists. C7 is
-preserved on both sides, but C10's requirement that every skip be explainable is
-**unmet for this case** — nothing surfaces `skip_reason=moa_active` in the dict. Open
-item below; the earlier claim in this document that the MoA path "does not consult the
-router" was true of oklab-1 only and is withdrawn.
+**`moa_active` — recorded on oklab-1, still absent from any dict.** The skip used to be
+invisible on both sides (oklab-1 at the call site, bro-2 deep in the router where it
+returns `None` before a `Decision` exists). oklab-1 now delegates the decision into
+`route_turn(moa_active=...)`, which records `ROUTING_SKIP_ATTR`
+(`_last_routing_skip_reason = "moa_active"`) before returning `None`, so the reason
+survives the turn. What is still missing on **both** sides is the dict row: no
+`routing_report`/`explain_routing` output carries it yet. C7 holds everywhere; C10's
+"every skip is explainable" is satisfied for logs and agent state, not for the machine
+surface. Open item below.
 
 **The machine surface is a dict, and it is normative.** oklab-1 calls it
 `routing_report()` (`model_router.py:2361-2455`), bro-2 calls it `explain_routing()`
@@ -221,11 +223,12 @@ the commit that carries this revision.
 
 Still open:
 
-1. **C9a wiring** — the one genuinely unimplemented clause. Both sides must derive the
-   modality requirement from attachments at the turn boundary. Owner: both.
-2. **C10 `moa_active` is silent** — both sides skip routing under MoA without exposing
-   the reason; emit `skip_reason=moa_active` in the dict surface so a user can see why
-   no selection happened. Owner: both.
+1. **C9a** — oklab-1 done (`message_text_and_attachments` → hard `vision` requirement).
+   bro-2 still cannot state modality for attachments delivered beside a *string* prompt,
+   because `image_routing.py` runs after selection. Owner: bro-2, using oklab-1's helper
+   as the reference shape.
+2. **C10 `moa_active` dict row** — recorded in agent state on oklab-1, but neither side
+   surfaces it in the machine-readable report. Owner: both.
 2. **bro-2 defect — fixed, wiring still open** — `classify_request` no longer raises on a
    content-parts list and derives the modality flags from the parts (regression tests in
    `tests/agent/test_model_routing.py`). What remains is item 1's string-prompt path.
