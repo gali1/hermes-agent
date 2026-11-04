@@ -1592,6 +1592,10 @@ def _run_conversation_turn(
                 agent,
                 _route_text,
                 attachments=_route_attachments,
+                # Context fit is a hard eligibility gate: without the live
+                # conversation's size a long session can be routed onto a
+                # model whose window cannot hold it (Section 7 item 6).
+                conversation_history=conversation_history,
                 moa_active=moa_config is not None,
             )
         except Exception as _routing_err:  # routing must never break a turn

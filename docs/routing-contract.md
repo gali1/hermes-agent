@@ -98,6 +98,13 @@ worse fresh-install surprise than routing across the eligible catalog. bro-2
 already defaults to `false`; fastembed changes its default or documents `true`
 as a deliberate local override. Until then, both hosts should still set the key
 explicitly in `config.yaml` rather than relying on the default.
+**The flag — not the shape of the model list — decides whether the catalog may be
+consulted.** A non-empty `smart_model_routing.models` is the preferred pool, and
+with `true` it is the *whole* pool: a modality/tool gap must keep the incumbent,
+never reach the provider catalog. Reporting the list's key name as the pool scope
+was a real defect on oklab-1 (a strict config still widened, and the CLI preview
+disagreed with the runtime); any implementation that returns a scope value must
+return one the widening guard recognises.
 
 ## C7 — Mixture-of-agents
 If MoA is active for the turn, routing is skipped: the operator chose a

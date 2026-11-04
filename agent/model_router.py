@@ -2489,6 +2489,20 @@ def candidates_from_specs(
     return out
 
 
+def _declared_pool_scope(config: Any) -> str:
+    """The pool scope of the declared ``models``/``candidates`` list.
+
+    The list's *shape* is not what decides whether routing may look at the
+    provider catalog — ``preferred_models_only`` is.  Reporting ``"models"``
+    here (the key the list came from) used to slip past every ``== "preferred"``
+    guard, so a strict config still widened and the CLI preview, which only
+    widens on ``"preferred+catalog"``, disagreed with the runtime.
+    """
+    section = config.get("smart_model_routing") if isinstance(config, dict) else None
+    cfg = RoutingConfig.from_dict(section)
+    return "preferred" if cfg.preferred_models_only else "preferred+catalog"
+
+
 def declared_model_list(
     config: Any, provider: str, *, current_model: str = ""
 ) -> Tuple[List[str], str, str]:
@@ -2503,7 +2517,7 @@ def declared_model_list(
         names = [spec.name.strip() for spec in specs if spec.name.strip()]
         if current and current not in names:
             names.insert(0, current)
-        return names, source, source
+        return names, source, _declared_pool_scope(config)
     models, pool_scope = routing_pool(config, provider, current_model=current)
     return models, "preferred", pool_scope
 
@@ -2551,7 +2565,7 @@ def resolve_candidates(
                 if incumbent
                 else ModelCandidate(provider=provider, model=current, info=None),
             )
-        return candidates, source, source
+        return candidates, source, _declared_pool_scope(config)
 
     models, pool_scope = routing_pool(config, provider, current_model=current)
     return _candidates_from_pool(config, provider, models), "preferred", pool_scope
@@ -2716,12 +2730,46 @@ def _record_routing_skip(agent: Any, reason: str) -> None:
     _log.debug("model routing skipped: %s", reason)
 
 
+def _conversation_token_estimate(messages: Any, agent: Any = None) -> int:
+    """Rough token count for the turn's request, or ``0``.
+
+    Used only after routing is confirmed enabled, so a disabled install never
+    pays for it.  Includes the cached system prompt and the tool schemas when
+    the agent has them: 50+ tools add 20-30k tokens on their own, which is
+    exactly the difference between a model that fits and one that does not.
+    Never raises — a malformed history degrades to "unknown size".
+    """
+    if not messages:
+        return 0
+    try:
+        from agent.model_metadata import (
+            estimate_messages_tokens_rough,
+            estimate_request_tokens_rough,
+        )
+
+        system_prompt = str(getattr(agent, "_cached_system_prompt", "") or "")
+        tools = getattr(agent, "tools", None) if agent is not None else None
+        try:
+            if system_prompt or tools:
+                return int(
+                    estimate_request_tokens_rough(
+                        list(messages), system_prompt=system_prompt, tools=tools or None
+                    )
+                )
+            return int(estimate_messages_tokens_rough(list(messages)))
+        except TypeError:  # pragma: no cover - (messages)-only test seams
+            return int(estimate_messages_tokens_rough(messages))
+    except Exception:  # pragma: no cover - defensive
+        return 0
+
+
 def route_turn(
     agent: Any,
     user_message: str,
     *,
     attachments: Sequence[str] = (),
     conversation_tokens: int = 0,
+    conversation_history: Optional[Sequence[Any]] = None,
     config: Optional[Dict[str, Any]] = None,
     moa_active: bool = False,
 ) -> Optional[Decision]:
@@ -2730,6 +2778,11 @@ def route_turn(
     Returns the :class:`Decision` (so callers can log/explain it) or ``None``
     when routing is off, the model is user-pinned, there is nothing to choose
     between, or no candidate qualifies.
+
+    ``conversation_tokens`` is the size the caller already knows; when it is 0
+    and ``conversation_history`` is given, the size is estimated here (a model
+    whose context window cannot hold the live conversation must be excluded
+    before ranking, not after it fails).
 
     ``moa_active`` names the caller's mixture-of-agents state. The skip has to be
     visible (contract C10: every skip is explainable), so it is recorded on the
@@ -2756,6 +2809,11 @@ def route_turn(
             return None
         if getattr(agent, _ROUTER_PIN_ATTR, False):
             return None
+
+        if conversation_tokens <= 0 and conversation_history:
+            # Context fit is a hard gate (C3): a model whose window cannot hold
+            # the live conversation must be excluded, not selected and failed.
+            conversation_tokens = _conversation_token_estimate(conversation_history, agent)
 
         cfg = RoutingConfig.from_dict((config or {}).get("smart_model_routing") or {})
         provider = str(getattr(agent, "provider", "") or "").strip()
@@ -2795,7 +2853,7 @@ def route_turn(
             current_provider=provider, mid_session=mid_session,
         )
 
-        if selection.skip_reason == "no_eligible_model" and pool_scope != "preferred":
+        if selection.skip_reason == "no_eligible_model" and pool_scope == "preferred+catalog":
             # Nothing on the operator's preferred list can serve this request.
             # Only now — and only because preferred_models_only is false — is
             # the provider catalog consulted, so a tool/modality gap is not
