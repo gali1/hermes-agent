@@ -723,7 +723,8 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
         current_defs = []
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
-        return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
+        return ts.dispatch_tool_search(
+            args, current_tool_defs=current_defs, llm_select=ts.build_llm_selector()), None
     if function_name == ts.TOOL_DESCRIBE_NAME:
         return ts.dispatch_tool_describe(args, current_tool_defs=current_defs), None
     underlying_name, underlying_args, err = ts.resolve_underlying_call(args)
