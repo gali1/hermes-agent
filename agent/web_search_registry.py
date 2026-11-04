@@ -12,8 +12,14 @@ provider configured as ``web.extract_backend`` falls through):
 3. Legacy preference walk (``_LEGACY_PREFERENCE``) filtered by availability —
    the historic ``tools.web_tools._get_backend()`` order, so installs that never
    set a config key keep landing on the same provider.
-4. Keyless free-tier walk (``_KEYLESS_PREFERENCE``), last resort.
-5. ``None`` — the tool points the user at ``hermes tools``.
+4. Keyed fallback walk (``_FALLBACK_PREFERENCE``) filtered by availability — keyed
+   vendors that trail the legacy walk but still beat the anonymous free tier.
+5. Keyless free-tier walk (``_KEYLESS_PREFERENCE``), last resort.
+6. ``None`` — the tool points the user at ``hermes tools``.
+
+Every resolution logs the chosen backend and the reason it won at DEBUG
+(``web <capability> backend resolved: <name> (reason: <why>)``) so two installs
+can be diffed on identical inputs.
 """
 
 from __future__ import annotations
@@ -68,6 +74,12 @@ _LEGACY_PREFERENCE = ("firecrawl", "parallel", "tavily", "perplexity", "exa", "s
 # pick bypasses this walk. Disable with ``web.keyless_fallback: false``.
 _KEYLESS_PREFERENCE = ("exa", "parallel", "firecrawl", "keenable")
 
+# Keyed vendors that are eligible only AFTER the legacy walk and BEFORE the keyless
+# free tier: a keyed fallback must never pre-empt a legacy vendor, and must never be
+# reachable without credentials (an explicit ``web.backend`` pin still wins — that is
+# checked before any walk runs). Order here is the tie-break among fallback vendors.
+_FALLBACK_PREFERENCE = ("google-cse",)
+
 
 def _keyless_preference() -> tuple:
     """Keyless walk order, starting at the ring cursor in
@@ -83,14 +95,26 @@ def _keyless_preference() -> tuple:
     return _KEYLESS_PREFERENCE
 
 
+def _log_resolution(capability: str, provider: Optional[WebSearchProvider], reason: str) -> None:
+    """One stable DEBUG line per resolution: chosen backend + why it won.
+
+    Kept in a single helper (and at a single level) so two trees can be diffed on
+    identical inputs. Names only — never a credential value.
+    """
+    logger.debug(
+        "web %s backend resolved: %s (reason: %s)",
+        capability, getattr(provider, "name", None) or "<none>", reason,
+    )
+
+
 def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearchProvider]:
     """Resolve the active provider for a capability ("search" | "extract").
 
     Rules, in order (see module docstring): explicit config wins even when
     ``is_available()`` is False (the dispatcher surfaces a precise
     "X_API_KEY is not set" error instead of a silent switch); then the single
-    available capable provider; then the availability-filtered legacy walk;
-    then the keyless free-tier walk; else None.
+    available capable provider; then the availability-filtered legacy walk; then
+    the keyed fallback walk; then the keyless free-tier walk; else None.
     """
     snapshot = _registry.merged()
 
@@ -106,6 +130,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     if configured:
         provider = snapshot.get(configured)
         if provider is not None and _capable(provider):
+            _log_resolution(capability, provider, "explicit config")
             return provider
         if provider is None:
             logger.debug("web backend '%s' configured but not registered; falling back", configured)
@@ -118,11 +143,21 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
     # never becomes "active" on a fresh install.
     eligible = [p for p in snapshot.values() if _capable(p) and _available(p)]
     if len(eligible) == 1:
+        _log_resolution(capability, eligible[0], "only available provider")
         return eligible[0]
 
     for legacy in _LEGACY_PREFERENCE:
         provider = snapshot.get(legacy)
         if provider is not None and provider in eligible:
+            _log_resolution(capability, provider, "legacy preference")
+            return provider
+
+    # Keyed fallback tier: after the legacy walk, before the keyless free tier.
+    # Reaching a name here requires it to be in ``eligible``, i.e. its keys resolve.
+    for name in _FALLBACK_PREFERENCE:
+        provider = snapshot.get(name)
+        if provider is not None and provider in eligible:
+            _log_resolution(capability, provider, "keyed fallback tier")
             return provider
 
     # Keyless free tier (anonymous public MCP tiers) is last-resort only: it is
@@ -135,10 +170,12 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
                 continue
             try:
                 if provider.is_keyless_available():
+                    _log_resolution(capability, provider, "keyless tier")
                     return provider
             except Exception as exc:  # noqa: BLE001 — buggy provider skipped
                 logger.debug("provider %s.is_keyless_available() raised %s", name, exc)
 
+    _log_resolution(capability, None, "no provider available")
     return None
 
 
