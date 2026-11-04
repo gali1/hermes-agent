@@ -69,10 +69,14 @@ __all__ = [
     "resolve_candidates",
     "route_turn",
     "routing_pool",
+    "routing_preview",
     "routing_report",
+    "routing_settings",
     "score_candidate",
     "select_model",
     "specs_from_config",
+    "update_routing",
+    "validate_routing",
     "widen_pool",
 ]
 
@@ -301,6 +305,15 @@ def classify_request(
     if reasoning_hit:
         level = Complexity(min(int(level) + 1, int(Complexity.ADVANCED)))
         signals.append("reasoning-signal")
+    # One strong signal is enough to say "this is not a trivial ask", however
+    # few tokens it took to type it (spec §7: a short request can be advanced).
+    # Without this floor a short prompt could never climb past ROUTINE — every
+    # volume step starts at SIMPLE, so +1 lands on ROUTINE and stops.  MODERATE
+    # is the floor, not COMPLEX: a single keyword must not push work into an
+    # expensive reasoner, and the FACTUAL override below still wins for a
+    # plainly factual question.
+    if code_hit or reasoning_hit:
+        level = Complexity(max(int(level), int(Complexity.MODERATE)))
     # Code *and* reasoning together is advanced technical work regardless of
     # how few tokens it took to ask (spec §7: a short request can be advanced).
     if code_hit and reasoning_hit:
@@ -454,7 +467,10 @@ def _as_bool(value: Any) -> Optional[bool]:
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        return bool(value)
+        # Only a real 0/1 is a declared flag.  Anything else numeric is
+        # "not declared" so a malformed value is treated as unknown rather
+        # than as a confident true/false.
+        return bool(value) if value in (0, 1) else None
     text = str(value).strip().lower()
     if text in ("1", "true", "yes", "on"):
         return True
@@ -806,12 +822,27 @@ class RoutingConfig:
         cfg = cls()
         if not isinstance(raw, dict):
             return cfg
-        cfg.enabled = bool(raw.get("enabled", cfg.enabled))
+
+        def _flag(name: str, default: bool) -> bool:
+            """A boolean knob: only an unambiguous value can turn it on.
+
+            ``bool("no")`` is ``True``, so a quoted YAML scalar would silently
+            enable a feature the user switched off.  ``_as_bool`` is the one
+            place that knows what "true" means (and ``None`` means "unusable",
+            which falls back to the default — :func:`validate_routing` reports
+            it as an error instead of guessing).
+            """
+            if name not in raw:
+                return default
+            parsed = _as_bool(raw.get(name))
+            return default if parsed is None else parsed
+
+        cfg.enabled = _flag("enabled", cfg.enabled)
         strategy = str(raw.get("strategy", cfg.strategy) or cfg.strategy).lower()
         cfg.strategy = strategy if strategy in ("automatic", "cost", "quality") else "automatic"
-        cfg.preferred_models_only = bool(raw.get("preferred_models_only", cfg.preferred_models_only))
+        cfg.preferred_models_only = _flag("preferred_models_only", cfg.preferred_models_only)
         cfg.preferred_models_only_explicit = "preferred_models_only" in raw
-        cfg.cost_optimization = bool(raw.get("cost_optimization", cfg.cost_optimization))
+        cfg.cost_optimization = _flag("cost_optimization", cfg.cost_optimization)
         # ``stability_threshold`` is canonical; ``min_improvement`` is the
         # sibling tree's alias for the same knob.
         threshold = raw.get("stability_threshold", raw.get("min_improvement", cfg.stability_threshold))
@@ -819,9 +850,10 @@ class RoutingConfig:
             cfg.stability_threshold = max(0.0, float(threshold))
         except (TypeError, ValueError):
             pass
-        cfg.allow_unknown_metadata = bool(raw.get("allow_unknown_metadata", cfg.allow_unknown_metadata))
-        cfg.switch_on_cost = bool(raw.get("switch_on_cost", cfg.switch_on_cost))
-        cfg.llm_assisted_classification = bool(raw.get("llm_assisted_classification", cfg.llm_assisted_classification))
+        cfg.allow_unknown_metadata = _flag("allow_unknown_metadata", cfg.allow_unknown_metadata)
+        cfg.switch_on_cost = _flag("switch_on_cost", cfg.switch_on_cost)
+        cfg.llm_assisted_classification = _flag(
+            "llm_assisted_classification", cfg.llm_assisted_classification)
         weights = raw.get("weights")
         if isinstance(weights, dict):
             for name, value in weights.items():
@@ -867,8 +899,458 @@ def is_enabled(config: Any) -> bool:
         return config.enabled
     if isinstance(config, dict):
         section = config.get("smart_model_routing")
-        return bool(isinstance(section, dict) and section.get("enabled"))
+        if not isinstance(section, dict) or "enabled" not in section:
+            return False
+        # Same coercion as :meth:`RoutingConfig.from_dict`: a quoted ``"no"``
+        # must not switch routing on just because it is a non-empty string.
+        return _as_bool(section.get("enabled")) is True
     return False
+
+
+# ---------------------------------------------------------------------------
+# The config surface: one read / validate / mutate / preview path
+# ---------------------------------------------------------------------------
+#
+# ``smart_model_routing`` is deliberately absent from ``DEFAULT_CONFIG``: an
+# untouched install loads byte-identically because nothing materialises the
+# block, and ``is_enabled`` sees no section.  Everything that READS or WRITES
+# the block goes through this section, so the CLI, the setup wizard, the gateway
+# and ``validate_config_structure`` can never disagree about the schema.
+
+#: Every key a ``smart_model_routing`` block may carry.  The first group is the
+#: shared cross-tree contract; the rest are knobs :class:`RoutingConfig` already
+#: reads, so exposing them adds no new engine behaviour.
+ROUTING_KEYS: Tuple[str, ...] = (
+    "enabled",
+    "strategy",
+    "stability_threshold",
+    "models",
+    "preferred_models_only",
+    "cost_optimization",
+    "switch_on_cost",
+    "allow_unknown_metadata",
+    "llm_assisted_classification",
+    "exclude",
+    "weights",
+    "reliability",
+)
+
+#: Deprecated spellings the engine still honours.  Read and migrated, never
+#: written by :func:`update_routing`.
+ROUTING_LEGACY_KEYS: Tuple[str, ...] = ("candidates", "min_improvement")
+
+#: Accepted ``strategy`` values (see :class:`RoutingConfig`).
+ROUTING_STRATEGIES: Tuple[str, ...] = ("automatic", "cost", "quality")
+
+_BOOLEAN_ROUTING_KEYS: Tuple[str, ...] = (
+    "enabled",
+    "preferred_models_only",
+    "cost_optimization",
+    "switch_on_cost",
+    "allow_unknown_metadata",
+    "llm_assisted_classification",
+)
+
+
+def _routing_section_raw(config: Any) -> Dict[str, Any]:
+    """The raw ``smart_model_routing`` mapping of *config* (``{}`` when absent)."""
+    if not isinstance(config, dict):
+        return {}
+    section = config.get("smart_model_routing")
+    return section if isinstance(section, dict) else {}
+
+
+def _routing_block_from_disk(config: Any = None) -> Dict[str, Any]:
+    """The block to read: *config* when given, else the on-disk config.
+
+    Total by construction — an unreadable or absent config is an absent block,
+    which means "off", never an exception.
+    """
+    if config is not None:
+        return _routing_section_raw(config)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        return _routing_section_raw(load_config_readonly())
+    except Exception:  # pragma: no cover - defensive: reading config never raises here
+        return {}
+
+
+def _model_names(block: Dict[str, Any]) -> List[str]:
+    """Model ids declared by a block, canonical ``models`` first, legacy second."""
+    for key in ("models", "candidates"):
+        entries = block.get(key)
+        if not isinstance(entries, (list, tuple)):
+            continue
+        names: List[str] = []
+        for entry in entries:
+            if isinstance(entry, str):
+                name = entry.strip()
+            elif isinstance(entry, dict):
+                name = str(entry.get("name") or entry.get("model") or "").strip()
+            else:
+                name = ""
+            if name and name not in names:
+                names.append(name)
+        if names:
+            return names
+    return []
+
+
+def routing_settings(config: Any = None) -> Dict[str, Any]:
+    """The normalised effective ``smart_model_routing`` block.
+
+    *config* is a whole config mapping; ``None`` reads the live config from
+    disk.  An absent (or malformed) block yields the disabled defaults — this
+    function never raises, because every report and status path calls it.
+    """
+    block = _routing_block_from_disk(config)
+    cfg = RoutingConfig.from_dict(block)
+    return {
+        "enabled": bool(cfg.enabled),
+        "strategy": cfg.strategy,
+        "stability_threshold": float(cfg.stability_threshold),
+        "models": _model_names(block),
+        "preferred_models_only": bool(cfg.preferred_models_only),
+        "cost_optimization": bool(cfg.cost_optimization),
+        "switch_on_cost": bool(cfg.switch_on_cost),
+        "allow_unknown_metadata": bool(cfg.allow_unknown_metadata),
+        "llm_assisted_classification": bool(cfg.llm_assisted_classification),
+        "exclude": list(cfg.exclude),
+        "weights": dict(cfg.weights),
+        "reliability": dict(cfg.reliability),
+    }
+
+
+def validate_routing(block: Any) -> List[str]:
+    """Every reason *block* is not a usable ``smart_model_routing`` section.
+
+    ``[]`` means valid.  Each message names the offending key, so a caller can
+    print the list as-is and the user knows which line to fix.  An absent block
+    (``None`` / ``{}``) is valid: absence means "off".
+
+    This validates the block's *shape and values* only — it never scores, never
+    resolves candidates and never touches the network, so
+    ``validate_config_structure`` can call it on every startup.
+    """
+    problems: List[str] = []
+    if block is None:
+        return problems
+    if not isinstance(block, dict):
+        return [f"smart_model_routing must be a mapping, got {type(block).__name__}"]
+
+    known = set(ROUTING_KEYS) | set(ROUTING_LEGACY_KEYS)
+    for key in block:
+        if str(key) not in known:
+            problems.append(
+                f"smart_model_routing.{key} is not a recognised routing option "
+                f"(known: {', '.join(ROUTING_KEYS)})")
+
+    for key in _BOOLEAN_ROUTING_KEYS:
+        if key in block and _as_bool(block[key]) is None:
+            problems.append(
+                f"smart_model_routing.{key} must be true or false, got {block[key]!r}")
+
+    if "strategy" in block:
+        strategy = block["strategy"]
+        if not isinstance(strategy, str) or strategy.strip().lower() not in ROUTING_STRATEGIES:
+            problems.append(
+                f"smart_model_routing.strategy must be one of "
+                f"{', '.join(ROUTING_STRATEGIES)}, got {strategy!r}")
+
+    thresholds = [key for key in ("stability_threshold", "min_improvement") if key in block]
+    if len(thresholds) == 2:
+        problems.append(
+            "smart_model_routing.stability_threshold and smart_model_routing.min_improvement "
+            "are the same knob — set only stability_threshold")
+    for key in thresholds:
+        value = block[key]
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            problems.append(
+                f"smart_model_routing.{key} must be a number between 0 and 1, got {value!r}")
+            continue
+        if not (0.0 <= number <= 1.0):
+            problems.append(
+                f"smart_model_routing.{key} must be between 0 and 1, got {value!r}")
+
+    for key in ("models", "candidates", "exclude"):
+        if key not in block:
+            continue
+        entries = block[key]
+        if not isinstance(entries, (list, tuple)):
+            problems.append(
+                f"smart_model_routing.{key} must be a YAML list, got {type(entries).__name__}")
+            continue
+        for index, entry in enumerate(entries):
+            if key == "exclude":
+                if not isinstance(entry, str) or not entry.strip():
+                    problems.append(
+                        f"smart_model_routing.exclude[{index}] must be a model name, got {entry!r}")
+                continue
+            if isinstance(entry, str):
+                if not entry.strip():
+                    problems.append(f"smart_model_routing.{key}[{index}] is an empty model name")
+                continue
+            if not isinstance(entry, dict):
+                problems.append(
+                    f"smart_model_routing.{key}[{index}] must be a model name or a mapping, "
+                    f"got {type(entry).__name__}")
+                continue
+            name = entry.get("name", entry.get("model"))
+            if not isinstance(name, str) or not name.strip():
+                problems.append(
+                    f"smart_model_routing.{key}[{index}].name is required for a mapping entry")
+            for field_name in entry:
+                if str(field_name) not in SPEC_FIELDS and str(field_name) != "model":
+                    problems.append(
+                        f"smart_model_routing.{key}[{index}].{field_name} is not a declared "
+                        f"model field (known: {', '.join(SPEC_FIELDS)})")
+
+    if "weights" in block:
+        weights = block["weights"]
+        if not isinstance(weights, dict):
+            problems.append(
+                f"smart_model_routing.weights must be a mapping, got {type(weights).__name__}")
+        else:
+            total = 0.0
+            for name, value in weights.items():
+                if str(name) not in _DEFAULT_WEIGHTS:
+                    problems.append(
+                        f"smart_model_routing.weights.{name} is not a scoring dimension "
+                        f"(known: {', '.join(_DEFAULT_WEIGHTS)})")
+                    continue
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    problems.append(
+                        f"smart_model_routing.weights.{name} must be a number, got {value!r}")
+                    continue
+                if number < 0:
+                    problems.append(
+                        f"smart_model_routing.weights.{name} must not be negative, got {value!r}")
+                    continue
+                total += number
+            if total <= 0:
+                problems.append("smart_model_routing.weights must have at least one positive value")
+
+    if "reliability" in block:
+        reliability = block["reliability"]
+        if not isinstance(reliability, dict):
+            problems.append(
+                f"smart_model_routing.reliability must be a mapping of model → rate, "
+                f"got {type(reliability).__name__}")
+        else:
+            for name, value in reliability.items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    problems.append(
+                        f"smart_model_routing.reliability.{name} must be a rate between 0 and 1, "
+                        f"got {value!r}")
+                    continue
+                if not (0.0 <= number <= 1.0):
+                    problems.append(
+                        f"smart_model_routing.reliability.{name} must be between 0 and 1, "
+                        f"got {value!r}")
+    return problems
+
+
+def _jsonable(value: Any) -> Any:
+    """*value* with tuples turned into lists, so a returned block is JSON-clean."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def update_routing(
+    changes: Dict[str, Any], *, config: Any = None, dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Change ``smart_model_routing``: validate → mutate → atomic save → read back.
+
+    *changes* is the subset of keys to set.  Nothing is written unless the
+    merged block validates: an invalid value raises :class:`ValueError` naming
+    the offending key and leaves config.yaml byte-identical.  The returned
+    ``settings`` are read back **from disk** after the write, so a caller that
+    prints them cannot print its own optimism.
+
+    Any mapping, list and scalar outside ``smart_model_routing`` is preserved
+    (the write is a re-serialisation of the raw file through ``save_config``,
+    which keeps comments and env-var templates).
+
+    ``config`` is for read-only callers (tests, previews): when it is passed the
+    base block comes from *config* and **nothing is written**, exactly as with
+    ``dry_run=True``.  The CLI and the gateway pass ``config=None``.
+    """
+    if not isinstance(changes, dict) or not changes:
+        raise ValueError("update_routing expects a non-empty mapping of smart_model_routing keys")
+
+    explicit_base = config is not None
+    read_only = bool(dry_run) or explicit_base
+
+    from hermes_cli import config as hermes_config
+
+    path = None if explicit_base else hermes_config.get_config_path()
+    if explicit_base:
+        base_raw: Dict[str, Any] = {}
+        base_block = _routing_block_from_disk(config)
+    else:
+        # Fail closed: an unreadable/unparseable file must not be replaced by a
+        # lone routing block (the read-then-write collapse-to-empty trap).
+        base_raw = hermes_config.require_readable_config_before_write(path)
+        base_block = _routing_section_raw(base_raw)
+
+    merged = dict(base_block)
+    for key, value in changes.items():
+        merged[str(key)] = value
+
+    stale_unknown = {
+        key for key in base_block
+        if str(key) not in ROUTING_KEYS and str(key) not in ROUTING_LEGACY_KEYS}
+
+    problems = [
+        problem for problem in validate_routing(merged)
+        if not any(problem.startswith(f"smart_model_routing.{key} is not a recognised")
+                   for key in stale_unknown)]
+    if problems:
+        raise ValueError("invalid smart_model_routing: " + "; ".join(problems))
+
+    warnings = [
+        f"smart_model_routing.{key} is not a recognised routing option; left untouched"
+        for key in sorted(stale_unknown)]
+
+    changed = sorted(
+        str(key) for key in changes if _jsonable(base_block.get(key)) != _jsonable(merged.get(key)))
+
+    result: Dict[str, Any] = {
+        "dry_run": read_only,
+        "written": False,
+        "changed": changed,
+        "warnings": warnings,
+        "settings": routing_settings({"smart_model_routing": merged}),
+        "block": _jsonable(merged),
+        "path": "",
+    }
+    if read_only:
+        return result
+
+    base_raw["smart_model_routing"] = merged
+    hermes_config.save_config(base_raw)
+
+    # Read the file back rather than trusting the object we just wrote: the
+    # stripper, the env-ref template pass and the YAML round-trip all get a say.
+    try:
+        on_disk = hermes_config.read_user_config_raw(path)
+    except Exception:  # pragma: no cover - defensive
+        on_disk = {}
+    if "smart_model_routing" not in on_disk:
+        on_disk = hermes_config.read_raw_config()
+    written = _routing_section_raw(on_disk)
+    result.update({
+        "written": True,
+        "settings": routing_settings({"smart_model_routing": written}),
+        "block": _jsonable(written),
+        "path": str(path),
+    })
+    return result
+
+
+def routing_preview(
+    prompt: str,
+    config: Any = None,
+    *,
+    attachments: Sequence[str] = (),
+    conversation_tokens: int = 0,
+    provider: str = "",
+    current_model: str = "",
+    candidates: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """What routing would do for *prompt*, and why — one scoring pass.
+
+    Reuses :func:`_preview_selection` (the same pass behind ``explain`` and
+    ``status --json``) and :func:`explain` for the prose, so a preview can never
+    disagree with the turn it describes.  Read-only and total: any failure is
+    reported as ``skip_reason: "error"``, never raised.
+
+    ``config`` defaults to the live config on disk.  A disabled block still
+    previews the hypothetical choice, with ``skip_reason: "disabled"``.
+    """
+    source = config if config is not None else None
+    cfg = _routing_block_from_disk(source)
+    settings = routing_settings({"smart_model_routing": cfg})
+    enabled = bool(settings["enabled"])
+
+    doc: Dict[str, Any] = {
+        "prompt": prompt or "",
+        "enabled": enabled,
+        "settings": settings,
+        "request": {},
+        "candidates": [],
+        "models": [],
+        "selected": "",
+        "selected_provider": "",
+        "reason": "",
+        "skip_reason": "",
+        "kept_current": False,
+        "eligible_count": 0,
+        "explanation": "",
+    }
+    try:
+        full_config: Any = source if source is not None else _load_config_for_preview()
+        selection, models = _preview_selection(
+            full_config if isinstance(full_config, dict) else {},
+            prompt or "",
+            attachments=attachments,
+            conversation_tokens=conversation_tokens,
+            provider=provider,
+            current_model=current_model,
+            candidates=candidates,
+        )
+    except Exception as err:  # pragma: no cover - defensive: a preview never breaks a CLI
+        doc["reason"] = f"routing preview failed: {err}"
+        doc["skip_reason"] = "error"
+        return doc
+
+    profile = selection.profile
+    decision = selection.decision()
+    doc.update({
+        "request": {
+            "tier": profile.complexity.label,
+            "est_input_tokens": profile.est_input_tokens,
+            "est_output_tokens": profile.est_output_tokens,
+            "needs_tools": profile.needs_tools,
+            "needs_reasoning": profile.needs_reasoning,
+            "reasons": list(profile.signals),
+        },
+        "candidates": [record.as_dict() for record in selection.records],
+        "models": list(models),
+        "eligible_count": selection.eligible_count,
+        "kept_current": bool(selection.kept_current),
+        "selected": decision.model if decision else "",
+        "selected_provider": decision.provider if decision else "",
+        "reason": decision.reason if decision else selection.reason,
+        "skip_reason": selection.skip_reason or "",
+        "explanation": explain(decision, profile),
+    })
+    if not enabled:
+        # Same convention as ``routing_report``: the hypothetical choice is
+        # shown, but the machine field says it would not be applied.
+        doc["skip_reason"] = "disabled"
+    return doc
+
+
+def _load_config_for_preview() -> Dict[str, Any]:
+    """The live config for previews (``{}`` when it cannot be read)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        loaded = load_config_readonly()
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:  # pragma: no cover - defensive
+        return {}
 
 
 # ---------------------------------------------------------------------------

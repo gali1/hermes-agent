@@ -1174,6 +1174,31 @@ def _validate_quoted_containers(config: Dict[str, Any], issues: List[ConfigIssue
                    "or remove the quotes in config.yaml")
 
 
+def _validate_smart_model_routing(config: Dict[str, Any], issues: List["ConfigIssue"]) -> None:
+    """A ``smart_model_routing`` block is validated by the routing engine's own validator.
+
+    One schema, one message set: the CLI's ``configure``, the setup wizard and
+    this function all call :func:`agent.model_router.validate_routing`, so a
+    block the engine would reject can never look healthy here (and vice versa).
+    Absent block ⇒ nothing to say: absence means "off", which is the shipped
+    state and must stay silent.
+    """
+    if "smart_model_routing" not in config:
+        return
+    try:
+        from agent.model_router import validate_routing
+    except Exception:  # pragma: no cover - the routing engine is part of the tree
+        return
+    try:
+        problems = validate_routing(config.get("smart_model_routing"))
+    except Exception as exc:  # pragma: no cover - defensive: a validator never breaks startup
+        problems = [f"smart_model_routing could not be validated: {exc}"]
+    hint = ("Fix the named key, or rewrite the block with `hermes model routing configure`. "
+            "An absent smart_model_routing block means routing is off.")
+    for message in problems:
+        _issue(issues, "error", message, hint)
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return detected issues (accepts a pre-loaded dict).
     Catches common YAML mistakes that otherwise surface as confusing runtime errors."""
@@ -1214,6 +1239,7 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
 
     _validate_web_backends(config, issues)
     _validate_quoted_containers(config, issues)
+    _validate_smart_model_routing(config, issues)
     return issues
 
 
@@ -1291,6 +1317,47 @@ def _ask_yes_no(prompt: str) -> bool:
     return answer in {"y", "yes"}
 
 
+def _migrate_smart_model_routing(results: Dict[str, Any], quiet: bool) -> None:
+    """Accept a legacy/partial ``smart_model_routing`` block.
+
+    Only ever RENAMES user data: the sibling tree's ``min_improvement`` alias
+    becomes the canonical ``stability_threshold``, and the pre-contract
+    ``candidates`` list becomes ``models``.  A canonical block is left
+    byte-identical, a config with no block is not given one (absence means
+    "off", and materialising ``enabled: false`` would turn a choice the user
+    never made into a setting they cannot see they made), and nothing here can
+    turn routing on.  Partial blocks (``{enabled: true}`` with no strategy) are
+    valid as-is — every other key has a default in ``RoutingConfig``.
+    """
+    config = read_raw_config()
+    block = config.get("smart_model_routing")
+    if not isinstance(block, dict) or not block:
+        return
+
+    changed: List[str] = []
+    if "min_improvement" in block and "stability_threshold" not in block:
+        block = dict(block)
+        block["stability_threshold"] = block.pop("min_improvement")
+        changed.append("smart_model_routing.min_improvement → stability_threshold")
+    if (
+        "candidates" in block
+        and "models" not in block
+        and isinstance(block.get("candidates"), (list, tuple))
+    ):
+        block = dict(block)
+        block["models"] = list(block.pop("candidates"))
+        changed.append("smart_model_routing.candidates → models")
+    if not changed:
+        return
+
+    config["smart_model_routing"] = block
+    _persist_migration(config)
+    results.setdefault("config_added", []).extend(changed)
+    if not quiet:
+        for line in changed:
+            print(f"  ✓ {line}")
+
+
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
     """Migrate config to latest version, prompting for new required fields."""
     results = {"env_added": [], "config_added": [], "warnings": []}
@@ -1328,6 +1395,10 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             print(f"  ⚠ {msg}")
     else:
         run_migrations(current_ver, results, quiet, unversioned=not has_explicit_version)
+        # The routing block has no schema version of its own: normalise a legacy
+        # or partial `smart_model_routing` section on every migration run
+        # instead of bumping the whole config ladder for one rename.
+        _migrate_smart_model_routing(results, quiet)
 
     _disable_suspicious_mcp_servers(results, quiet)
     _warn_invalid_platform_toolsets(results, quiet)
