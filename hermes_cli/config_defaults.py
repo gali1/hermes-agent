@@ -2073,6 +2073,22 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,
+            # --- AnyTool enhancements (TASK-2). Both are OPT-IN and OFF by default:
+            # a false/absent key is a strict no-op (no store read, no model call).
+            # Re-rank the hits the lexical gate already admitted using each tool's
+            # RECENT call outcomes (newest 8000 message rows, 30-day window). The
+            # multiplier is 0.2..1.0, neutral with <3 calls or a >=40% success rate,
+            # and is applied AFTER admission, so it only reorders: the candidate set
+            # and the returned match count never shrink.
+            "reliability_rerank": False,
+            # When lexical search returns NOTHING, make ONE bounded model pass over a
+            # capped catalog listing (names + one-line descriptions) to propose
+            # candidates, then keep only proposals that exist in the real catalog.
+            # Silent on failure (error/timeout/unparsable): the empty result stands.
+            "zero_match_llm": False,
+            # Wall-clock cap in seconds for that single pass (0.05..15). The call runs
+            # on a worker thread that is abandoned, not extended, when it expires.
+            "zero_match_llm_timeout": 4.0,
             # Tools replaced by the bridge by default. This list intentionally includes cold,
             # event-triggered built-ins; an explicit list replaces it wholesale and [] keeps every
             # tool eager. The runtime fallback in tools/tool_search.py derives from this value.

@@ -36,6 +36,9 @@ logger = logging.getLogger("tools.tool_search")
 # maps to one gateway request. Describe has no such remote limit.
 _MAX_QUERIES_PER_CALL = 7
 _MAX_DESCRIBE_NAMES_PER_CALL = 10
+# Zero-match model passes per tool_search call. A batch of empty queries must not
+# multiply the fallback latency (each pass has its own wall-clock cap).
+_MAX_ZERO_MATCH_PASSES = 3
 
 
 @dataclass(frozen=True)
@@ -51,6 +54,11 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # Opt-in, both OFF by default (a disabled key is a strict no-op: no store read,
+    # no model call). See tools/tool_search_reliability.py and tool_search_zero_match.py.
+    reliability_rerank: bool = False  # re-rank admitted hits by recent call outcomes
+    zero_match_llm: bool = False  # one bounded model pass when lexical search is empty
+    zero_match_llm_timeout: float = 4.0  # wall-clock cap for that single pass, seconds
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -81,7 +89,11 @@ class ToolSearchConfig:
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
-                         if isinstance(defer_raw, (list, tuple, set)) else None))
+                         if isinstance(defer_raw, (list, tuple, set)) else None),
+            reliability_rerank=_flag(raw.get("reliability_rerank")),
+            zero_match_llm=_flag(raw.get("zero_match_llm")),
+            zero_match_llm_timeout=_clamped_float(
+                raw.get("zero_match_llm_timeout"), 4.0, 0.05, 15.0))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}
@@ -107,6 +119,27 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _clamped_float(value: Any, fallback: float, lo: float, hi: float) -> float:
+    """``float(value)`` (or ``fallback`` when unparseable) clamped to ``[lo, hi]``."""
+    return max(lo, min(hi, _safe_float(value, fallback)))
+
+
+_FLAG_TRUE = frozenset({"1", "true", "on", "yes", "y", "enabled"})
+
+
+def _flag(value: Any) -> bool:
+    """Strict opt-in boolean: only an explicit true-ish value enables a feature.
+
+    ``None``/absent/unknown -> ``False``, so a config typo can never turn on a
+    behaviour that reads a store or spends a model call.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value).strip().lower() in _FLAG_TRUE
 
 
 def _config_from_loader(loader_name: str) -> ToolSearchConfig:
@@ -442,9 +475,50 @@ def _string_list_arg(args: Dict[str, Any], key: str, *, dedupe: bool, max_items:
     return out, None
 
 
+def _reliability_multipliers(config: ToolSearchConfig) -> Optional[Dict[str, float]]:
+    """Per-tool re-rank multipliers from the recent outcome window, or None.
+
+    Strict no-op when the key is off: nothing is imported, nothing is read.
+    Fail-open on any error (missing DB, old schema, junk row) — None means the
+    ranking is exactly the pre-TASK-2 ranking.
+    """
+    if not config.reliability_rerank:
+        return None
+    try:
+        from tools.tool_search_reliability import load_reliability_multipliers
+        return load_reliability_multipliers() or None
+    except Exception as exc:  # noqa: BLE001 - ranking must never fail a search
+        logger.debug("tool_search reliability re-rank unavailable: %s", exc)
+        return None
+
+
+def _zero_match_hits(query: str, catalog: List[CatalogEntry], corpus: List[CatalogEntry],
+                     limit: int, config: ToolSearchConfig,
+                     proposer: Optional[Any] = None) -> List[CatalogEntry]:
+    """One bounded LLM proposal pass for a query the lexical arm could not answer.
+
+    Returns [] on any failure (model error, timeout, unparsable answer, nothing
+    real proposed), which leaves the caller's empty result exactly as it was.
+    Proposals are filtered against ``corpus`` first, so a hallucinated name is
+    dropped rather than returned.
+    """
+    if not catalog:
+        return []
+    try:
+        from tools.tool_search_zero_match import propose_entries
+        return propose_entries(
+            query, catalog, corpus, call=proposer,
+            timeout=config.zero_match_llm_timeout, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - degrade silently to the empty result
+        logger.debug("tool_search zero-match fallback failed (%s: %s); returning the "
+                     "empty lexical result", type(exc).__name__, exc)
+        return []
+
+
 def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
                          config: Optional[ToolSearchConfig] = None,
-                         connector_search: Optional[Any] = None) -> str:
+                         connector_search: Optional[Any] = None,
+                         zero_match_proposer: Optional[Any] = None) -> str:
     config = config or load_config()
     queries, err = _string_list_arg(args, "queries", dedupe=False, max_items=_MAX_QUERIES_PER_CALL,
                                     retry_hint="Retry with fewer, more targeted queries.")
@@ -454,6 +528,7 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     limit = (config.search_default_limit if raw_limit is None
              else _clamped_int(raw_limit, config.search_default_limit, 1, config.max_search_limit))
     catalog = build_catalog(_deferrable_in(current_tool_defs))
+    multipliers = _reliability_multipliers(config)
     remote_entries: List[List[CatalogEntry]] = [[] for _ in queries]
     hosted_failure: Optional[str] = None
     if connections_in_scope(current_tool_defs):
@@ -462,9 +537,15 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
     available_sources = _available_source_summary(catalog)
+    fallback_passes = 0
     for position, query in enumerate(queries):
         corpus = catalog + remote_entries[position]
-        hits = search_catalog(corpus, query, limit=limit)
+        hits = search_catalog(corpus, query, limit=limit, multipliers=multipliers)
+        if (not hits and config.zero_match_llm
+                and fallback_passes < _MAX_ZERO_MATCH_PASSES):
+            fallback_passes += 1
+            hits = _zero_match_hits(query, catalog, corpus, limit, config,
+                                    proposer=zero_match_proposer)
         for h in hits:
             tools_map.setdefault(h.name, _shared_tool_record(h))
         matches = [h.name for h in hits]

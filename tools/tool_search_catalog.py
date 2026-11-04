@@ -175,7 +175,8 @@ def _required_term_coverage(answerable_term_count: int) -> int:
 
 
 def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
-                   corpus_stats: Optional[_CorpusStats] = None) -> List[CatalogEntry]:
+                   corpus_stats: Optional[_CorpusStats] = None,
+                   multipliers: Optional[Dict[str, float]] = None) -> List[CatalogEntry]:
     """Top-``limit`` catalog entries for ``query`` by BM25 (exact name match ranks first).
 
     Admission is by the query's rarest token (:func:`_gate_token`), not by ``score > 0``:
@@ -183,7 +184,13 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
     ``score > 0`` admits one-token matches and fills every slot with them (measured: "send
     gmail email" returned 5 incident tools that only shared ``email``). A token no document
     carries admits nothing; the caller's empty-group hint tells the model to retry without it.
-    Long queries additionally need :func:`_required_term_coverage` of their answerable terms."""
+    Long queries additionally need :func:`_required_term_coverage` of their answerable terms.
+
+    ``multipliers`` (tool name -> value in 0.2..1.0, see
+    ``tools.tool_search_reliability``) re-weights the ADMITTED and scored candidates
+    immediately before truncation. It is a pure permutation of the candidate list: the
+    admission gate has already run, so the set of candidates considered is identical with
+    and without multipliers and no hit is ever filtered out — only their order changes."""
     query_tokens = _tokenize(query) if catalog and limit > 0 else []
     if not query_tokens:
         return []
@@ -206,6 +213,9 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
          else _bm25_score(query_tokens, entry._tokens, *corpus_stats), entry)
         for entry in catalog if _admitted(entry)]
     scored.sort(key=lambda x: x[0], reverse=True)
+    if multipliers:
+        from tools.tool_search_reliability import rerank_scored
+        scored = rerank_scored(scored, multipliers)
     return [e for _, e in scored[:limit]]
 
 
