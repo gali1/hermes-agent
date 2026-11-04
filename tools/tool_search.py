@@ -12,17 +12,18 @@ import functools
 import json
 import logging
 import math
+import re
 from collections import Counter
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from tools.registry import tool_error
 from toolsets import CLIENT_SURFACE_TOOLSETS, TOOLSET_SESSION_PLATFORMS
 from tools.tool_search_catalog import (
     BRIDGE_TOOL_NAMES, CHARS_PER_TOKEN, TOOL_CALL_NAME, TOOL_DESCRIBE_NAME, TOOL_SEARCH_NAME,
-    CatalogEntry, _fn, _listing_group_label, _registry_entry, _registry_toolset,
-    build_catalog, build_catalog_listing_with_form, search_catalog)
+    CatalogEntry, _corpus_stats, _fn, _listing_group_label, _registry_entry, _registry_toolset,
+    build_catalog, build_catalog_listing_with_form, load_tool_reliability, search_catalog)
 from tools.tool_search_validation import (
     local_batch_error, normalize_tool_call_entries, not_deferrable_error, validate_deferred_call_args)
 from tools.connectors import CONNECTOR_BATCH_SENTINEL, is_connector_name
@@ -51,6 +52,15 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # Opt-in: re-order already-admitted hits by recorded tool success (see
+    # load_tool_reliability). Off by default — ranking stays purely lexical until asked for,
+    # and because the factor is applied after the admission gate it can never hide a hit.
+    reliability: bool = False
+    # Opt-in: on a zero-match query, make ONE bounded model call over the catalog listing to
+    # recover candidates whose names are recognisable but whose descriptions did not match.
+    # Off by default; steady-state cost is unchanged because it only fires when lexical
+    # search returns nothing (see the AnyTool gap analysis, item 2).
+    zero_match_llm: bool = False
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -81,7 +91,11 @@ class ToolSearchConfig:
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
-                         if isinstance(defer_raw, (list, tuple, set)) else None))
+                         if isinstance(defer_raw, (list, tuple, set)) else None),
+            reliability=str(raw.get("reliability", "")).strip().lower()
+                        in ("1", "true", "yes", "on"),
+            zero_match_llm=str(raw.get("zero_match_llm", "")).strip().lower()
+                        in ("1", "true", "yes", "on"))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}
@@ -444,7 +458,8 @@ def _string_list_arg(args: Dict[str, Any], key: str, *, dedupe: bool, max_items:
 
 def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
                          config: Optional[ToolSearchConfig] = None,
-                         connector_search: Optional[Any] = None) -> str:
+                         connector_search: Optional[Any] = None,
+                         llm_select: Optional[Callable[[str, str], Sequence[str]]] = None) -> str:
     config = config or load_config()
     queries, err = _string_list_arg(args, "queries", dedupe=False, max_items=_MAX_QUERIES_PER_CALL,
                                     retry_hint="Retry with fewer, more targeted queries.")
@@ -462,13 +477,27 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     results: List[Dict[str, Any]] = []
     tools_map: Dict[str, Dict[str, Any]] = {}
     available_sources = _available_source_summary(catalog)
+    # BM25 corpus statistics depend only on the catalog, not on the query. Remote entries are
+    # per-query, so the base stats are reused whenever a query contributed none (the common
+    # case) instead of recomputing document lengths and frequencies for every query in a batch.
+    base_stats = _corpus_stats(catalog) if catalog else None
+    # Loaded once per dispatch, never inside the loop; None keeps ranking purely lexical.
+    reliability_map = load_tool_reliability() if config.reliability else None
     for position, query in enumerate(queries):
         corpus = catalog + remote_entries[position]
-        hits = search_catalog(corpus, query, limit=limit)
+        stats = base_stats if not remote_entries[position] else None
+        hits = search_catalog(corpus, query, limit=limit, corpus_stats=stats,
+                              reliability=reliability_map)
         for h in hits:
             tools_map.setdefault(h.name, _shared_tool_record(h))
         matches = [h.name for h in hits]
         group: Dict[str, Any] = {"query": query, "matches": matches}
+        if not matches and corpus and config.zero_match_llm and llm_select is not None:
+            recovered = _zero_match_candidates(corpus, query, llm_select, limit)
+            if recovered:
+                matches = recovered
+                group["matches"] = recovered
+                group["match_mode"] = "llm_name_pass"
         if not matches and available_sources:
             group["available_sources"] = available_sources
             group["hint"] = (
@@ -595,3 +624,107 @@ __all__ = [
     "dispatch_tool_describe", "resolve_underlying_call", "scoped_deferrable_names",
     "out_of_scope_reason", "validate_deferred_call_args", "normalize_tool_call_entries",
     "CONNECTOR_BATCH_SENTINEL", "is_connector_name"]
+
+
+def _zero_match_candidates(corpus: List["CatalogEntry"], query: str,
+                           llm_select: Callable[[str, str], Sequence[str]],
+                           limit: int) -> List[str]:
+    """One bounded model pass over the catalog listing, used only when lexical search failed.
+
+    The selector receives ``(query, listing)`` and returns candidate tool names. Anything it
+    returns is filtered against the real corpus, so a hallucinated name can never leak into a
+    result, and the output is capped at ``limit``. Any failure returns ``[]`` — this is a
+    recovery path, never a reason for a search to raise.
+    """
+    try:
+        deferrable = [e.schema for e in corpus]
+        listing, form = build_catalog_listing_with_form(deferrable)
+        if not listing:
+            return []
+        names = {e.name for e in corpus}
+        proposed = llm_select(query, listing) or ()
+        out: List[str] = []
+        for name in proposed:
+            name = str(name).strip()
+            if name in names and name not in out:
+                out.append(name)
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:
+        logger.debug("zero-match LLM pass failed", exc_info=True)
+        return []
+
+
+_ZERO_MATCH_PROMPT = (
+    "You are choosing tools for a search that returned no lexical matches.\n"
+    "Pick at most {n} tool names from the catalog below that could plausibly serve the "
+    "request. Reply with ONLY a JSON array of exact tool names, e.g. [\"a\",\"b\"]. "
+    "If none apply, reply [].\n\nRequest: {query}\n\nCatalog:\n{listing}"
+)
+
+
+def _response_text(response: Any) -> str:
+    """Pull text out of whatever the provider client returned. Never raises."""
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    try:
+        if isinstance(response, dict):
+            choices = response.get("choices") or []
+            if choices:
+                msg = choices[0].get("message") or {}
+                return str(msg.get("content") or "")
+            return str(response.get("content") or response.get("text") or "")
+        choices = getattr(response, "choices", None)
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            if msg is not None:
+                return str(getattr(msg, "content", "") or "")
+            return str(getattr(choices[0], "text", "") or "")
+        return str(getattr(response, "content", "") or getattr(response, "text", "") or "")
+    except Exception:
+        return ""
+
+
+def _parse_name_list(text: str) -> List[str]:
+    """Parse a JSON array of names, falling back to identifier-like tokens."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        start, end = text.find("["), text.rfind("]")
+        if start != -1 and end > start:
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+    except (ValueError, TypeError):
+        pass
+    # Fallback: bare identifiers, which the caller filters against the real corpus anyway.
+    return re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text)
+
+
+def build_llm_selector(*, task: Optional[str] = None, max_tokens: int = 200,
+                       timeout: float = 20.0, max_listing_chars: int = 6000,
+                       max_names: int = 5) -> Callable[[str, str], List[str]]:
+    """Build the zero-match selector backed by the existing auxiliary LLM client.
+
+    Injected rather than imported at module scope: tool dispatch must not depend on a provider
+    client being importable, and tests need to swap it. The import is lazy so importing
+    ``tools.tool_search`` stays cheap and side-effect free.
+    """
+    def _select(query: str, listing: str) -> List[str]:
+        from agent.auxiliary_client import call_llm
+        prompt = _ZERO_MATCH_PROMPT.format(
+            n=max_names, query=query, listing=(listing or "")[:max_listing_chars])
+        response = call_llm(
+            task=task,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+        return _parse_name_list(_response_text(response))
+
+    return _select

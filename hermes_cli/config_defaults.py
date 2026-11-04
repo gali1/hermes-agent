@@ -2096,6 +2096,13 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,
+            # Opt-in: re-order the hits a query already admitted by each tool's recorded success
+            # rate (newest calls only; neutral below 3 calls and at >=40% success). Applied after
+            # admission, so it can never hide a hit — lexical ranking until this is set.
+            "reliability": False,
+            # Opt-in: when lexical search matches nothing, make ONE bounded model call over the
+            # catalog listing to recover tools by name. Steady-state cost is unchanged.
+            "zero_match_llm": False,
             # Tools replaced by the bridge by default. This list intentionally includes cold,
             # event-triggered built-ins; an explicit list replaces it wholesale and [] keeps every
             # tool eager. The runtime fallback in tools/tool_search.py derives from this value.
