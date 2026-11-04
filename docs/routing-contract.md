@@ -229,6 +229,16 @@ Canonical key first, explicit legacy alias second, and **no silent ignores**:
 Unknown keys under a routing/tool-search section produce one warning naming the
 key and stating it is not in effect.
 
+## C12 — One applier per setting, whatever the input surface
+A routing setting is applied by exactly one function. Text (`/model-routing 3`), a
+numbered reply, and an inline button must reach the same applier and the same writer
+(`update_routing`); a button is an input method, never a second code path. Platforms that
+render buttons are an optimisation: where an adapter exposes no picker (or a send fails),
+the command must still work as the numbered text flow, and no setting may exist only
+behind a button. Correspondingly, a button flow applies nothing until the final
+confirmation, and its result text is the block read back from disk — not the caller's
+optimistic echo.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

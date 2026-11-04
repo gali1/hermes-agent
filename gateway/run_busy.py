@@ -1631,11 +1631,13 @@ class GatewayBusySessionMixin:
                      "back or cancel.")
         return "\n".join(lines)
 
-    async def _handle_model_routing_command(self, event: MessageEvent) -> str:
+    async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
         """`/model-routing` + `/model_routing`: view and change smart routing in chat.
 
         One handler serves both spellings: ``_command_handler_table`` maps ``-`` to
         ``_``, and the registry carries ``model_routing`` as an alias.
+
+        Returns ``None`` when a button picker was sent (the adapter owns the reply then).
         """
         from agent import model_router as mr
 
@@ -1685,8 +1687,13 @@ class GatewayBusySessionMixin:
             state = flow or start("menu")
             state["step"] = "menu"
             touch(state)
-            return (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
+            text = (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
                     + self._model_routing_menu_text(settings, state.get("changes") or {}))
+            # Section 6.3: platforms with buttons get the same actions as a keyboard; the
+            # numbered text above stays the fallback (and the only form on text-only platforms).
+            if await self._try_send_routing_menu(event, report, settings, note=expired_note):
+                return None
+            return text
 
         if token in self._MODEL_ROUTING_CANCEL_WORDS or (
             flow is not None and flow.get("step") == "confirm" and token in {"no", "n"}
@@ -1886,3 +1893,143 @@ class GatewayBusySessionMixin:
         for warning in result.get("warnings") or []:
             lines.append(f"⚠️ {warning}")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # /model-routing — inline-button surface
+    # ------------------------------------------------------------------
+    # Section 6.3: on a platform that can render buttons, the same actions are offered
+    # as a keyboard; the numbered text flow above remains the fallback and the only form
+    # where the adapter has no picker. Every button path funnels into the same appliers
+    # and the same ``update_routing`` writer as the typed flow, so the two cannot diverge.
+
+    async def _try_send_routing_menu(self, event, report: Dict[str, Any],
+                                     settings: Dict[str, Any], note: str = "") -> bool:
+        """Send the six entry actions as a button picker; False means "render text instead"."""
+        title = (note + self._model_routing_state_text(report, settings)
+                 + "\n\nWhat would you like to do?")
+        choices = [
+            {"value": "1", "label": "✅ Enable routing"},
+            {"value": "2", "label": "⏸ Disable routing"},
+            {"value": "3", "label": "🎛 Change models"},
+            {"value": "4", "label": "⚙ Preferences"},
+            {"value": "5", "label": "🔀 Single-model mode"},
+            {"value": "6", "label": "✖ Close"},
+        ]
+        return await self._try_send_routing_picker(event, title, choices)
+
+    async def _try_send_routing_picker(self, event, title: str, choices: list) -> bool:
+        """Flat one-tap picker whose taps land in ``_model_routing_button_action``."""
+        async def _on_action(_chat_id: str, value: str) -> str:
+            return await self._model_routing_button_action(event, value)
+        return await self._try_send_choice_picker(
+            event, self._model_routing_flow_key(event), title=title, choices=choices,
+            on_choice_selected=_on_action)
+
+    async def _try_send_routing_model_select(self, event, candidates: List[str],
+                                             current: List[str], on_done) -> bool:
+        """Toggle list of candidate models when the adapter type supports multi-select."""
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None or getattr(type(adapter), "send_multi_select_picker", None) is None:
+            return False
+        options = [{"value": str(m), "label": str(m)} for m in candidates if m]
+        if not options:
+            return False
+        known = {o["value"] for o in options}
+        try:
+            result = await adapter.send_multi_select_picker(
+                chat_id=event.source.chat_id,
+                title=("Models routing may choose from — tap to toggle; the order shown is used "
+                       "as the priority order:"),
+                options=options,
+                selected=[str(m) for m in current if str(m) in known],
+                session_key=self._model_routing_flow_key(event),
+                on_selection_done=on_done,
+                metadata=self._reply_metadata(event),
+            )
+            return bool(getattr(result, "success", False))
+        except Exception as exc:  # a failed button send must never swallow the flow
+            logger.warning("model-routing: send_multi_select_picker failed: %s", exc)
+            return False
+
+    async def _model_routing_confirm_buttons(self, event, cfg: Dict[str, Any], settings: Dict[str, Any],
+                                             changes: Dict[str, Any]) -> str:
+        """Send (or render) the final confirmation — nothing is written before Save."""
+        from agent import model_router as mr
+
+        flows = self._model_routing_flows()
+        key = self._model_routing_flow_key(event)
+        flows[key] = {"step": "confirm", "changes": dict(changes), "ts": time.time()}
+        confirm = self._model_routing_confirm_text(
+            settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+        sent = await self._try_send_routing_picker(
+            event, confirm,
+            [{"value": "save", "label": "✅ Save"}, {"value": "discard", "label": "✖ Discard"}])
+        return "Confirmation below ↓ — nothing is saved until you tap Save." if sent else confirm
+
+    async def _model_routing_models_picked(self, event, picked: list, changes: Dict[str, Any]) -> str:
+        """Multi-select Done: record the priority-ordered list, then confirm."""
+        from agent import model_router as mr
+
+        cfg = self._model_routing_load_config()
+        settings = mr.routing_settings(cfg)
+        changes = dict(changes or {})
+        changes["models"] = [str(m) for m in (picked or [])]
+        # Section 4 semantics, identical to the typed step: a non-empty list means
+        # "only these"; an empty list means "the whole eligible catalog".
+        changes["preferred_models_only"] = bool(changes["models"])
+        return await self._model_routing_confirm_buttons(event, cfg, settings, changes)
+
+    async def _model_routing_button_action(self, event, token: str) -> str:
+        """Apply one button action; returns the text that replaces the tapped message."""
+        from agent import model_router as mr
+
+        token = (token or "").strip().lower()
+        cfg = self._model_routing_load_config()
+        settings = mr.routing_settings(cfg)
+        report = mr.routing_report(cfg, "")
+        flows = self._model_routing_flows()
+        key = self._model_routing_flow_key(event)
+        flow = flows.get(key) or {}
+        changes: Dict[str, Any] = dict(flow.get("changes") or {})
+
+        if token in self._MODEL_ROUTING_CANCEL_WORDS or token == "6":
+            flows.pop(key, None)
+            return (self._model_routing_state_text(report, settings)
+                    + "\n\nCancelled — nothing applied.")
+
+        if token in self._MODEL_ROUTING_YES_WORDS:
+            # The side-effect boundary: a button tap carries no session of its own.
+            if not self._model_routing_authorized(getattr(event, "source", None)):
+                return ("🔒 Model routing changes model selection for the whole profile, so it is "
+                        "limited to authorized users. Nothing was written.")
+            flows.pop(key, None)
+            return await self._model_routing_commit(changes)
+
+        if token in {"1", "enable", "on"}:
+            changes["enabled"] = True
+        elif token in {"2", "disable", "off", "5", "single"}:
+            changes["enabled"] = False
+            if token in {"5", "single"}:
+                changes.pop("models", None)
+                changes["preferred_models_only"] = False
+        elif token in {"3", "models"}:
+            candidates = [str(c) for c in (flow.get("candidates") or []) if c] or [
+                str(c.get("model")) for c in (report.get("candidates") or []) if c.get("model")]
+            current = changes.get("models") or settings.get("models") or []
+            if await self._try_send_routing_model_select(
+                    event, candidates, list(current),
+                    lambda _chat_id, picked: self._model_routing_models_picked(event, picked, changes)):
+                flows[key] = {"step": "models", "changes": changes, "ts": time.time(),
+                              "candidates": candidates, "settings": dict(settings)}
+                return ("Model selection below ↓ — tap models to toggle, then Done. "
+                        "Nothing is saved until you confirm.")
+            # No multi-select support: fall back to the numbered list the typed flow uses.
+            state = {"step": "models", "changes": changes, "ts": time.time(), "page": 0,
+                     "candidates": candidates, "settings": dict(settings)}
+            flows[key] = state
+            return self._model_routing_models_page(state)
+        elif token in {"4", "preferences", "prefs"}:
+            flows[key] = {"step": "prefs", "changes": changes, "ts": time.time()}
+            return self._model_routing_prefs_text(settings, changes)
+
+        return await self._model_routing_confirm_buttons(event, cfg, settings, changes)
