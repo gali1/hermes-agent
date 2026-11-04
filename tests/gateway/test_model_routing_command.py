@@ -17,13 +17,20 @@ from gateway.slash_commands_model import GatewayModelCommandsMixin
 class _FakeEvent:
     def __init__(self, args: str):
         self._args = args
+        self.source = "test-source"
 
     def get_command_args(self) -> str:
         return self._args
 
 
 class _Runner(GatewayModelCommandsMixin):
-    """The mixin is self-contained for this command; no gateway state is needed."""
+    """The mixin is self-contained for this command; authorization is stubbed."""
+
+    def __init__(self, authorized: bool = True):
+        self._authorized = authorized
+
+    def _is_user_authorized_for_source(self, source) -> bool:
+        return self._authorized
 
 
 @pytest.fixture
@@ -36,8 +43,8 @@ def cfgfile(tmp_path, monkeypatch):
     return path
 
 
-def _run(args: str) -> str:
-    return asyncio.run(_Runner()._handle_model_routing_command(_FakeEvent(args)))
+def _run(args: str, *, authorized: bool = True) -> str:
+    return asyncio.run(_Runner(authorized)._handle_model_routing_command(_FakeEvent(args)))
 
 
 def test_status_shows_disabled_by_default(cfgfile):
@@ -87,3 +94,11 @@ def test_both_spellings_resolve_to_the_routing_handler():
     # /model is untouched and still resolves to its own handler.
     assert hasattr(GatewayModelCommandsMixin, "_handle_model_command")
     assert "model" in GatewayBusySessionMixin._IDLE_COMMANDS
+
+
+def test_unauthorized_user_is_refused_and_nothing_is_written(cfgfile):
+    """This command writes config, so it must fail closed rather than trust the dispatcher."""
+    before = cfgfile.read_text()
+    out = _run("on confirm", authorized=False)
+    assert "not authorized" in out
+    assert cfgfile.read_text() == before

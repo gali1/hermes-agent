@@ -878,6 +878,16 @@ class GatewayModelCommandsMixin:
         from hermes_cli.subcommands.model import (
             _render_routing, _routing_report, write_routing_config)
 
+        # Config-changing command: fail closed. The dispatch path already drops unauthorized
+        # senders, but this handler writes the user's config, so it re-checks rather than
+        # trusting that the caller did.
+        try:
+            authorized = self._is_user_authorized_for_source(event.source)
+        except Exception:
+            authorized = False
+        if not authorized:
+            return "routing: not authorized."
+
         try:
             args = event.get_command_args().strip().lower().split()
         except Exception:
