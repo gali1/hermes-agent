@@ -149,6 +149,13 @@ def build_model_parser(
             "provider's catalog instead of keeping an incapable model"
         ),
     )
+    _enable.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        default=False,
+        help="Skip the confirmation prompt (for scripts and cron)",
+    )
 
     routing_sub.add_parser(
         "disable", help="Turn dynamic model selection off (persists to config.yaml)"

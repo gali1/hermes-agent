@@ -1920,8 +1920,13 @@ def _routing_section(config: dict) -> dict:
     return section
 
 
-def _print_routing_status(config: dict) -> None:
-    """Print the resolved routing settings and what they can choose from."""
+def _print_routing_status(config: dict, *, saved_note: bool = True) -> None:
+    """Print the resolved routing settings and what they can choose from.
+
+    ``saved_note=False`` is for previews of a state that is not on disk yet —
+    saying "Saved in: config.yaml" there would claim a write that has not
+    happened.
+    """
     from agent import model_router as router
 
     section = config.get("smart_model_routing")
@@ -1968,7 +1973,10 @@ def _print_routing_status(config: dict) -> None:
             f"        providers.{provider or '<provider>'}.models (or model.preferred_models)\n"
             "        to give it something to choose between."
         )
-    print("  Saved in: config.yaml (smart_model_routing)\n")
+    if saved_note:
+        print("  Saved in: config.yaml (smart_model_routing)\n")
+    else:
+        print()
 
 
 # ---------------------------------------------------------------------------
@@ -2449,7 +2457,6 @@ def cmd_model_routing(args):
 
     if action in ("enable", "disable"):
         section = _routing_section(config)
-        section["enabled"] = action == "enable"
         if action == "enable":
             strategy = getattr(args, "strategy", None)
             if strategy:
@@ -2461,6 +2468,22 @@ def cmd_model_routing(args):
                 section["switch_on_cost"] = True
             if getattr(args, "all_models", False):
                 section["preferred_models_only"] = False
+
+        # Turning routing ON is the one routing action that changes behaviour on
+        # every later turn, so a human present at a terminal must see what it
+        # would work from and say yes first (directive §3.7).  Scripts, cron and
+        # the gateway are never prompted — they cannot answer, and a prompt there
+        # would hang instead of doing what was asked.  ``--yes`` is the same
+        # assume-yes flag the rest of the CLI exposes.
+        enabling = action == "enable" and not router.is_enabled(config)
+        if enabling and _routing_is_tty() and not bool(getattr(args, "yes", False)):
+            print("\n  Turning dynamic selection ON lets every turn be routed to a")
+            print("  different model. It would work from:")
+            _print_routing_status(config, saved_note=False)
+            if not _routing_confirm("Enable dynamic model selection?", default=False):
+                return _routing_cancelled()
+
+        section["enabled"] = action == "enable"
         save_config(config)
         label = "enabled" if action == "enable" else "disabled"
         print(f"\n  ✓ Dynamic model selection: {label}")

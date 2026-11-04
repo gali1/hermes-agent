@@ -239,6 +239,22 @@ behind a button. Correspondingly, a button flow applies nothing until the final
 confirmation, and its result text is the block read back from disk — not the caller's
 optimistic echo.
 
+## C13 — Consent before routing is switched on
+`enabled` is the one routing key that changes behaviour on every later turn, so the write
+that sets it to true needs the operator's agreement on any surface a human is driving:
+* The CLI's `enable` verb prints the resolved settings and candidate pool (the same
+  `_print_routing_status` renderer `status` uses) and asks before writing. `-y/--yes` is
+  the assume-yes escape hatch, matching `configure`.
+* A caller with no terminal — a script, cron, the gateway — is never prompted: it cannot
+  answer, and a prompt there would hang instead of doing what was asked. Its behaviour is
+  unchanged from before this contract.
+* Turning it off never prompts. Disabling restores the single-model path, so there is
+  nothing to warn about, and a gate there would only make recovery slower.
+* Asking to enable something already enabled is not a state change and is not prompted.
+* A preview is not a write: the renderer is called with `saved_note=False` before the
+  question, so the "Saved in: config.yaml" line can never appear on a state that is not
+  on disk.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
