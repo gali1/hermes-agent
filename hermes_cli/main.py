@@ -1971,6 +1971,440 @@ def _print_routing_status(config: dict) -> None:
     print("  Saved in: config.yaml (smart_model_routing)\n")
 
 
+# ---------------------------------------------------------------------------
+# `hermes model routing configure` — the one interactive/scripted editor
+# ---------------------------------------------------------------------------
+#
+# Every read is `routing_settings()`, every validation is `validate_routing()`
+# (via `update_routing`) and every write is `update_routing()`.  Nothing here
+# keeps its own copy of the schema, so the CLI, the setup wizard and the
+# gateway cannot disagree about what a knob means or what is on disk.
+#
+# Interactive when stdin is a TTY and no change flags were given; otherwise the
+# flag path.  Either way NOTHING is written until the final confirmation, so
+# cancelling at any prompt leaves config.yaml byte-identical.
+
+#: Neutral prompt for the summary's `routing_preview()` — enough text to land in
+#: a real tier, short enough to stay honest about being a sample.
+_ROUTING_PREVIEW_PROMPT = "Summarise the current task and list the next steps."
+
+_STRATEGY_CHOICES = (
+    ("automatic", "automatic — capability first, then cost"),
+    ("cost", "cost — cheapest model that can still serve the request"),
+    ("quality", "quality — strongest capable model"),
+)
+
+
+def _routing_is_tty() -> bool:
+    """True when a human can actually answer a prompt on both ends."""
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _routing_cancelled() -> int:
+    """Report a user cancellation.  Zero changes, exit 0 (nothing went wrong)."""
+    print("\n  Cancelled — no changes.\n")
+    return 0
+
+
+def _routing_ask_choice(question, choices, default=0):
+    """Single-select through the existing setup menu; ``None`` = cancelled.
+
+    Wraps ``hermes_cli.setup._curses_prompt_choice`` so the routing flow inherits
+    the picker's keybindings, its numbered fallback and its ESC-to-cancel
+    semantics instead of inventing a second prompt style.
+    """
+    from hermes_cli.setup import _curses_prompt_choice
+
+    try:
+        idx = _curses_prompt_choice(question, choices, default=default)
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if idx is None or idx < 0:
+        return None
+    return idx
+
+
+def _routing_ask_text(question: str, default: str = "") -> str | None:
+    """One line of free text; ``None`` = cancelled, ``""`` = keep *default*."""
+    from hermes_cli.cli_output import line_input
+
+    try:
+        raw = line_input(question)
+    except (KeyboardInterrupt, EOFError):
+        return None
+    return (raw or "").strip() or default
+
+
+def _routing_pick_model(models, current: str = ""):
+    """One model through the existing single-model picker; ``None`` = cancelled.
+
+    Multi-select is this prompt in a loop (see ``_routing_configure_interactive``)
+    — the same curses list, search and numbered fallback the user already knows,
+    not a second model picker.
+    """
+    from hermes_cli.auth_model_picker import _prompt_model_selection
+
+    return _prompt_model_selection(list(models), current_model=current)
+
+
+def _routing_confirm(question: str, *, default: bool = False) -> bool:
+    from hermes_cli.setup import prompt_yes_no
+
+    try:
+        return bool(prompt_yes_no(question, default=default))
+    except (KeyboardInterrupt, EOFError):
+        return False
+
+
+def _routing_provider(config: dict) -> str:
+    """Provider slug from ``model.provider`` — the same source status renders."""
+    section = config.get("model") if isinstance(config, dict) else None
+    if not isinstance(section, dict):
+        return ""
+    return str(section.get("provider") or "").strip()
+
+
+def _routing_known_models(config: dict, provider: str) -> tuple[list[str], str]:
+    """Model ids this provider is known to serve, and where the list came from.
+
+    The provider's own list first (``providers.<p>.models``, ``model.default``),
+    then anything already declared for routing, then the cached provider catalog
+    — cache-only, so a configure run never goes to the network.  Used to reject
+    typos before anything is written; the list never shrinks just because an
+    earlier run narrowed the routing list.
+    """
+    from agent import model_router as router
+
+    models: list[str] = []
+
+    def _add(candidates) -> None:
+        for candidate in candidates or []:
+            name = str(candidate).strip()
+            if name and name not in models:
+                models.append(name)
+
+    source = ""
+    try:
+        _add(router.configured_models(config, provider))
+        declared, source, _scope = router.declared_model_list(config, provider)
+        _add(declared)
+        _add(router.widen_pool(provider, models))
+    except Exception:
+        pass
+    return models, source
+
+
+def _parse_model_flag(values) -> list[str]:
+    """``--models a,b --models c`` → ``["a", "b", "c"]`` (order kept, deduped)."""
+    out: list[str] = []
+    for chunk in values or []:
+        for part in str(chunk).split(","):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def _print_routing_settings(label: str, settings: dict) -> None:
+    """One compact state block, for the before/after summary."""
+    mode = "only selected models" if settings.get("preferred_models_only") else "all eligible models"
+    models = settings.get("models") or []
+    listed = ", ".join(models) if models else "(none — whole eligible catalog)"
+    print(f"  {label}")
+    print(f"    enabled:             {'ON' if settings.get('enabled') else 'OFF'}")
+    print(f"    strategy:            {settings.get('strategy')}")
+    print(f"    stability threshold: {settings.get('stability_threshold')}")
+    print(f"    cost optimization:   {'yes' if settings.get('cost_optimization') else 'no'}")
+    print(f"    models:              {mode}")
+    print(f"    list ({len(models)}):              {listed}")
+
+
+def _print_routing_preview(preview: dict) -> None:
+    """The summary's "would select" line, from ``routing_preview()`` itself."""
+    request = preview.get("request") or {}
+    selected = preview.get("selected") or ""
+    skip = preview.get("skip_reason") or ""
+    print(f"  Preview for {_ROUTING_PREVIEW_PROMPT!r}:")
+    print(f"    tier:            {request.get('tier') or '(unknown)'}")
+    print(f"    would select:    {selected or '(nothing)'}")
+    if skip:
+        print(f"    skip reason:     {skip}")
+    if len(preview.get("models") or []) <= 1:
+        print("    note:            fewer than two candidate models, so routing stays inert")
+
+
+def _routing_configure_common(args, config):
+    """Apply the flag path's changes through the shared writer.  Returns an exit code."""
+    from agent import model_router as router
+
+    models_flag = getattr(args, "models", None)
+    all_models = bool(getattr(args, "all_models", False))
+    if models_flag and all_models:
+        print("✗ --models and --all-models are different modes; pass only one.",
+              file=sys.stderr)
+        return 2
+
+    changes: dict = {}
+    if bool(getattr(args, "enable", False)):
+        changes["enabled"] = True
+    if bool(getattr(args, "disable", False)):
+        changes["enabled"] = False
+
+    if models_flag:
+        requested = _parse_model_flag(models_flag)
+        if not requested:
+            print("✗ --models needs at least one model id.", file=sys.stderr)
+            return 2
+        provider = _routing_provider(config)
+        known, _source = _routing_known_models(config, provider) if provider else ([], "")
+        unknown = [m for m in requested if known and m not in known]
+        if unknown:
+            print(
+                f"✗ unknown model(s) for provider {provider or '(none)'}: {', '.join(unknown)}\n"
+                f"  known models: {', '.join(known)}\n"
+                f"  Add the model under providers.{provider or '<provider>'}.models first, "
+                "or use --all-models.",
+                file=sys.stderr,
+            )
+            return 2
+        changes["models"] = requested
+        changes["preferred_models_only"] = True
+    elif all_models:
+        changes["models"] = []
+        changes["preferred_models_only"] = False
+
+    if getattr(args, "strategy", None):
+        changes["strategy"] = args.strategy
+    threshold = getattr(args, "stability_threshold", None)
+    if threshold is not None:
+        changes["stability_threshold"] = float(threshold)
+    cost_optimization = getattr(args, "cost_optimization", None)
+    if cost_optimization is not None:
+        changes["cost_optimization"] = bool(cost_optimization)
+
+    as_json = bool(getattr(args, "json", False))
+    if not changes:
+        # Nothing to change: report the state and stay read-only (no lone-block
+        # write, no empty `update_routing` call).
+        settings = router.routing_settings(config)
+        if as_json:
+            import json as _json
+
+            print(_json.dumps(
+                {"written": False, "changed": [], "settings": settings},
+                indent=2, sort_keys=True))
+            return 0
+        _print_routing_status(config)
+        print(
+            "  Nothing to change. Pass --enable/--disable, --models/--all-models,\n"
+            "  --strategy or --stability-threshold, or run `hermes model routing\n"
+            "  configure` with no flags in a terminal for the interactive flow.\n"
+        )
+        return 0
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    try:
+        result = router.update_routing(changes, dry_run=dry_run)
+    except ValueError as err:
+        # The validator's own message: it names the offending key.
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    except Exception as err:  # pragma: no cover - unreadable/unwritable config
+        print(f"✗ could not save smart_model_routing: {err}", file=sys.stderr)
+        return 2
+
+    if as_json:
+        import json as _json
+
+        print(_json.dumps(result, indent=2, sort_keys=True))
+        return 0
+
+    before = router.routing_settings(config)
+    _print_routing_settings("before:", before)
+    _print_routing_settings("after:", result.get("settings") or {})
+    if not result.get("changed"):
+        print("\n  No change — config.yaml already says that.\n")
+        return 0
+    if dry_run:
+        print(f"\n  Dry run: would write {', '.join(result.get('changed') or [])} "
+              "to config.yaml (nothing written).\n")
+        return 0
+    print("\n  ✓ Saved to config.yaml")
+    print(f"  changed: {', '.join(result.get('changed') or [])}\n")
+    # Read the file back — never print the object we hoped we wrote.
+    from hermes_cli.config import load_config
+
+    _print_routing_status(load_config())
+    print("  Verify with: hermes model routing status\n")
+    return 0
+
+
+def _routing_configure_interactive(args, config) -> int:
+    """The prompt-by-prompt flow; identical steps to the gateway's version."""
+    from agent import model_router as router
+
+    from hermes_cli.config import load_config
+
+    provider = _routing_provider(config)
+    before = router.routing_settings(config)
+
+    # 1. Show the current state, and say plainly when routing cannot apply.
+    _print_routing_status(config)
+    if not provider:
+        print(
+            "  No model provider is configured, so dynamic selection has nothing\n"
+            "  to choose between. Run `hermes model` first.\n"
+        )
+        return 0
+    known, source = _routing_known_models(config, provider)
+
+    # 2. Enable or disable.
+    state = "ON" if before["enabled"] else "OFF"
+    idx = _routing_ask_choice(
+        f"Dynamic model selection is {state}. What should it be?",
+        ["Keep it off" if before["enabled"] else "Keep it on", "Enable", "Disable"],
+        default=0,
+    )
+    if idx is None:
+        return _routing_cancelled()
+    changes: dict = {}
+    if idx == 1:
+        changes["enabled"] = True
+    elif idx == 2:
+        changes["enabled"] = False
+
+    # 3. Mode: whole eligible catalog, or only the user's list.
+    mode_default = 1 if before["preferred_models_only"] else 0
+    idx = _routing_ask_choice(
+        "Route across:",
+        ["All eligible models", "Only my selected models"],
+        default=mode_default,
+    )
+    if idx is None:
+        return _routing_cancelled()
+
+    # 4. Selected models: the existing picker, repeated until the user is done.
+    if idx == 1:
+        selected = [m for m in (before["models"] or []) if not known or m in known]
+        while True:
+            pool = known or selected
+            if not pool:
+                print(
+                    f"\n  No models are declared for provider {provider}, so there is\n"
+                    f"  nothing to select. List them under providers.{provider}.models\n"
+                    "  (or model.preferred_models) and run configure again.\n"
+                )
+                return 0
+            pick = _routing_pick_model(pool, current=selected[0] if selected else "")
+            if pick is None:
+                return _routing_cancelled()
+            if pick not in selected:
+                selected.append(pick)
+            idx = _routing_ask_choice(
+                f"Selected ({len(selected)}): {', '.join(selected)}",
+                ["Add another model", "Done"],
+                default=1,
+            )
+            if idx is None:
+                return _routing_cancelled()
+            if idx == 1:
+                break
+        changes["models"] = selected
+        changes["preferred_models_only"] = True
+    else:
+        changes["models"] = []
+        changes["preferred_models_only"] = False
+
+    # 5. Preferences — only knobs the engine actually reads.
+    strategies = [key for key, _label in _STRATEGY_CHOICES]
+    current_strategy = before["strategy"] if before["strategy"] in strategies else "automatic"
+    idx = _routing_ask_choice(
+        "Selection strategy:",
+        [label for _key, label in _STRATEGY_CHOICES],
+        default=strategies.index(current_strategy),
+    )
+    if idx is None:
+        return _routing_cancelled()
+    changes["strategy"] = strategies[idx]
+
+    raw = _routing_ask_text(
+        f"Stability threshold 0-1 (Enter keeps {before['stability_threshold']}): "
+    )
+    if raw is None:
+        return _routing_cancelled()
+    if raw:
+        try:
+            changes["stability_threshold"] = float(raw)
+        except ValueError:
+            print(f"\n✗ smart_model_routing.stability_threshold must be a number "
+                  f"between 0 and 1, got {raw!r}\n", file=sys.stderr)
+            return 1
+
+    idx = _routing_ask_choice(
+        "Cost-versus-performance preference:",
+        ["Prefer cheaper capable models", "Prefer the strongest capable model"],
+        default=0 if before["cost_optimization"] else 1,
+    )
+    if idx is None:
+        return _routing_cancelled()
+    changes["cost_optimization"] = idx == 0
+
+    # 6. Summary: before, after, and the same preview `explain`/`status` use.
+    base_block = config.get("smart_model_routing")
+    merged = dict(base_block) if isinstance(base_block, dict) else {}
+    merged.update(changes)
+    after = router.routing_settings({"smart_model_routing": merged})
+    print("\n  ── Summary ──\n")
+    _print_routing_settings("before:", before)
+    print()
+    _print_routing_settings("after:", after)
+    print()
+    try:
+        preview = router.routing_preview(
+            _ROUTING_PREVIEW_PROMPT, {"smart_model_routing": merged}, provider=provider
+        )
+    except Exception as err:  # pragma: no cover - preview is total by contract
+        preview = {"request": {}, "selected": "", "reason": f"preview failed: {err}"}
+    _print_routing_preview(preview)
+    if source:
+        print(f"  candidate source: {source}")
+
+    # Validate + diff against the ORIGINAL block, before touching the file: a
+    # value the validator rejects fails here with its own message, and a pass
+    # that changes nothing never rewrites config.yaml.
+    try:
+        probe = router.update_routing(changes, config=config, dry_run=True)
+    except ValueError as err:
+        print(f"\n✗ {err}\n", file=sys.stderr)
+        return 1
+    if not probe.get("changed"):
+        print("\n  No change — config.yaml already says that.\n")
+        return 0
+
+    # 7. Confirm.
+    print()
+    if not bool(getattr(args, "yes", False)):
+        if not _routing_confirm("Save these settings?", default=False):
+            return _routing_cancelled()
+
+    # 8. Save through the shared writer, then report what landed on disk.
+    try:
+        result = router.update_routing(changes)
+    except ValueError as err:
+        print(f"\n✗ {err}\n", file=sys.stderr)
+        return 1
+    except Exception as err:  # pragma: no cover - unreadable/unwritable config
+        print(f"\n✗ could not save smart_model_routing: {err}\n", file=sys.stderr)
+        return 2
+    print(
+        f"\n  ✓ Saved to config.yaml"
+        f"{' — changed: ' + ', '.join(result.get('changed') or []) if result.get('changed') else ''}\n"
+    )
+    _print_routing_status(load_config())
+    print("  Verify with: hermes model routing status\n")
+    return 0
+
+
 def cmd_model_routing(args):
     """Inspect or change dynamic model selection (``smart_model_routing``).
 
@@ -1990,6 +2424,28 @@ def cmd_model_routing(args):
         # reported honestly, and silently inventing defaults would be a lie.
         print(f"✗ could not read config.yaml: {err}", file=sys.stderr)
         return 2
+
+    if action == "configure":
+        # Interactive only when a human is actually there to answer: a TTY and
+        # no explicit change flags.  Every scripted invocation (no TTY, or any
+        # flag) takes the deterministic flag path.
+        wants_flags = any(
+            (
+                getattr(args, "models", None),
+                getattr(args, "all_models", False),
+                getattr(args, "enable", False),
+                getattr(args, "disable", False),
+                getattr(args, "strategy", None),
+                getattr(args, "stability_threshold", None) is not None,
+                getattr(args, "cost_optimization", None) is not None,
+                getattr(args, "dry_run", False),
+                getattr(args, "json", False),
+            )
+        )
+        interactive = not wants_flags and _routing_is_tty()
+        if interactive:
+            return _routing_configure_interactive(args, config)
+        return _routing_configure_common(args, config)
 
     if action in ("enable", "disable"):
         section = _routing_section(config)
