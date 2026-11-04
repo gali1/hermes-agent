@@ -911,6 +911,9 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
+        # Routing changes only affect the NEXT turn (route_turn reads the block per turn), so
+        # configuring it mid-run is safe and useful.
+        "model-routing",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (
@@ -918,7 +921,7 @@ class GatewayBusySessionMixin:
         "approvals", "model", "codex-runtime", "personality", "suggestions", "save", "retry",
         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
-        "loop", "refine", "review", "voice",
+        "loop", "refine", "review", "voice", "model-routing",
     )
 
     def _command_handler_table(self, names) -> Dict[str, Any]:
@@ -1418,3 +1421,468 @@ class GatewayBusySessionMixin:
         except Exception:
             return {}
         return cfg if isinstance(cfg, dict) else {}
+
+    # ------------------------------------------------------------------
+    # /model-routing — the shared routing contract, surfaced in chat
+    # ------------------------------------------------------------------
+    #
+    # Everything this flow reads and writes goes through ``agent.model_router``'s
+    # contract (``routing_settings`` / ``routing_report`` / ``routing_preview`` /
+    # ``update_routing``): there is no second config store, no second status
+    # renderer and no gateway-local business logic.  The flow is deliberately
+    # argument-driven (``/model-routing 3``) rather than hijacking bare replies:
+    # a plain "1" in chat must keep reaching the agent, and every platform can
+    # carry a command with args, buttons or not.
+
+    #: An abandoned flow applies nothing after this long.
+    _MODEL_ROUTING_FLOW_TTL = 900.0
+    #: Candidate rows per page in the model step.
+    _MODEL_ROUTING_PAGE_SIZE = 10
+    #: Words that discard the pending flow without applying anything.
+    _MODEL_ROUTING_CANCEL_WORDS = frozenset({"cancel", "close", "exit", "quit", "abort", "discard"})
+    _MODEL_ROUTING_YES_WORDS = frozenset({"yes", "y", "apply", "confirm", "save", "doit", "do-it"})
+    _MODEL_ROUTING_STRATEGIES = ("automatic", "cost", "quality")
+
+    def _model_routing_flows(self) -> Dict[str, Dict[str, Any]]:
+        """Per chat+user flow state (``platform:chat:user`` → flow), lazily created."""
+        flows = getattr(self, "_model_routing_flow_state", None)
+        if not isinstance(flows, dict):
+            flows = {}
+            self._model_routing_flow_state = flows
+        return flows
+
+    @staticmethod
+    def _model_routing_flow_key(event) -> str:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", "") or ""
+        chat = str(getattr(source, "chat_id", "") or "")
+        user = str(getattr(source, "user_id", "") or "")
+        return f"{platform}:{chat}:{user}"
+
+    def _model_routing_authorized(self, source) -> bool:
+        """The same gate every other authorized action uses (``_is_user_authorized``).
+
+        The inbound path already refuses unauthorized senders; this is the
+        side-effect boundary, because a routing write changes model selection for
+        the whole profile.  A runner stub without the mixin method is trusted —
+        there is nobody to ask and no live config to protect.
+        """
+        checker = getattr(self, "_is_user_authorized", None)
+        if not callable(checker) or source is None:
+            return True
+        try:
+            return bool(checker(source))
+        except Exception:  # pragma: no cover - defensive: an erroring gate denies
+            logger.debug("model-routing: authorization check failed", exc_info=True)
+            return False
+
+    @staticmethod
+    def _model_routing_load_config() -> Dict[str, Any]:
+        """The live user config through the per-turn reader ``route_turn`` uses.
+
+        ``load_config_readonly`` is cached on the file signature, so a write from
+        any interface (CLI, another chat, a text editor) is visible to the very
+        next read with no gateway restart.
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+            cfg = load_config_readonly()
+        except Exception:
+            logger.debug("model-routing: config read failed", exc_info=True)
+            return {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    @classmethod
+    def _model_routing_scope_text(cls, settings: Dict[str, Any]) -> str:
+        models = [str(m) for m in (settings.get("models") or [])]
+        if not models:
+            return "all eligible models"
+        listed = ", ".join(models[:6]) + (f" (+{len(models) - 6} more)" if len(models) > 6 else "")
+        if settings.get("preferred_models_only"):
+            return f"only these, in priority order: {listed}"
+        return f"prefer {listed}, widening to the catalog when a task needs it"
+
+    @classmethod
+    def _model_routing_state_text(cls, report: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> str:
+        """Current state, rendered from the shared report (never recomputed here)."""
+        settings = settings if settings is not None else (report.get("settings") or {})
+        request = report.get("request") or {}
+        on = bool(settings.get("enabled"))
+        lines = [f"🧭 Model routing: {'ON' if on else 'OFF'}"]
+        if not on:
+            lines.append("   Routing is not applied to turns; the selection below is hypothetical.")
+        lines.append(
+            f"   Strategy: {settings.get('strategy', 'automatic')} · stability threshold "
+            f"{settings.get('stability_threshold', 0.15)} · cost optimisation "
+            f"{'on' if settings.get('cost_optimization', True) else 'off'}"
+        )
+        lines.append(f"   Models: {cls._model_routing_scope_text(settings)}")
+        candidates = report.get("candidates") or []
+        lines.append(
+            f"   Candidates: {report.get('eligible_count', 0)} eligible of {len(candidates)} considered"
+        )
+        tier = request.get("tier") or "unknown"
+        selected = report.get("selected") or ""
+        reason = (report.get("reason") or "").strip()
+        would = f"would select {selected}" if selected else "would select nothing"
+        suffix = f" — {reason}" if reason else ""
+        lines.append(f"   This prompt: tier {tier} → {would}{suffix}")
+        skip = report.get("skip_reason") or ""
+        if skip and skip != "disabled":
+            lines.append(f"   Skipped: {skip}")
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_pending_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
+        """``key: before → after`` for the keys the flow wants to write."""
+        order = ("enabled", "strategy", "stability_threshold", "models", "preferred_models_only",
+                 "cost_optimization", "switch_on_cost", "llm_assisted_classification")
+        rows = []
+        for key in order:
+            if key not in changes:
+                continue
+            before, after = settings.get(key), changes[key]
+            if before == after:
+                continue
+            rows.append(f"   {key}: {cls._model_routing_value_text(key, before)} → "
+                        f"{cls._model_routing_value_text(key, after)}")
+        return "\n".join(rows)
+
+    @staticmethod
+    def _model_routing_value_text(key: str, value: Any) -> str:
+        if key == "models":
+            models = [str(m) for m in (value or [])]
+            return "all eligible" if not models else ", ".join(models)
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        return str(value)
+
+    @classmethod
+    def _model_routing_menu_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
+        pending = cls._model_routing_pending_text(settings, changes)
+        lines = ["What would you like to do?",
+                 "  1 Enable routing",
+                 "  2 Disable routing",
+                 "  3 Change models",
+                 "  4 Change preferences",
+                 "  5 Switch to single-model mode (same as disable)",
+                 "  6 Close"]
+        if pending:
+            lines += ["", "Pending (not saved yet):", pending]
+        lines += ["", "Reply /model-routing <number> — nothing is saved until you confirm."]
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_prefs_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
+        def mark(key: str) -> str:
+            return " *" if key in changes else ""
+        pending = cls._model_routing_pending_text(settings, changes)
+        lines = [
+            "Preferences (reply /model-routing <number>; * = pending change):",
+            f"  1 Strategy — {settings.get('strategy', 'automatic')}{mark('strategy')}",
+            f"  2 Stability threshold — {settings.get('stability_threshold', 0.15)}{mark('stability_threshold')}",
+            f"  3 Cost optimisation — {'on' if settings.get('cost_optimization', True) else 'off'}"
+            f"{mark('cost_optimization')}",
+            f"  4 Mid-session cost downgrade — {'on' if settings.get('switch_on_cost') else 'off'}"
+            f"{mark('switch_on_cost')}",
+            f"  5 LLM-assisted classification — "
+            f"{'on' if settings.get('llm_assisted_classification') else 'off'}"
+            f"{mark('llm_assisted_classification')}",
+            f"  6 Route only among my selected models — "
+            f"{'yes' if settings.get('preferred_models_only') else 'no (widen when needed)'}"
+            f"{mark('preferred_models_only')}",
+            "  7 Back to the main menu",
+        ]
+        if pending:
+            lines += ["", "Pending (not saved yet):", pending]
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_confirm_text(cls, settings: Dict[str, Any], changes: Dict[str, Any],
+                                    preview: Dict[str, Any]) -> str:
+        diff = cls._model_routing_pending_text(settings, changes) or "   (no effective change)"
+        selected = preview.get("selected") or "nothing"
+        reason = (preview.get("reason") or "").strip()
+        lines = [
+            "Save these routing changes?",
+            diff,
+            "",
+            f"Preview for a sample prompt: tier {((preview.get('request') or {}).get('tier') or 'unknown')} "
+            f"→ would select {selected}" + (f" — {reason}" if reason else ""),
+            "",
+            "Reply /model-routing yes to save, or /model-routing cancel to discard.",
+        ]
+        return "\n".join(lines)
+
+    def _model_routing_models_page(self, flow: Dict[str, Any]) -> str:
+        candidates = flow.get("candidates") or []
+        page = int(flow.get("page") or 0)
+        size = self._MODEL_ROUTING_PAGE_SIZE
+        pages = max(1, (len(candidates) + size - 1) // size)
+        page = max(0, min(page, pages - 1))
+        flow["page"] = page
+        window = candidates[page * size:(page + 1) * size]
+        lines = [f"Models routing may choose from (page {page + 1}/{pages}):"]
+        for offset, name in enumerate(window):
+            lines.append(f"  {page * size + offset + 1} {name}")
+        if pages > 1:
+            lines.append("Reply /model-routing next or /model-routing prev to page.")
+        lines.append("Reply /model-routing 1,3 (numbers, first = highest priority), all, none, "
+                     "back or cancel.")
+        return "\n".join(lines)
+
+    async def _handle_model_routing_command(self, event: MessageEvent) -> str:
+        """`/model-routing` + `/model_routing`: view and change smart routing in chat.
+
+        One handler serves both spellings: ``_command_handler_table`` maps ``-`` to
+        ``_``, and the registry carries ``model_routing`` as an alias.
+        """
+        from agent import model_router as mr
+
+        source = getattr(event, "source", None)
+        if not self._model_routing_authorized(source):
+            return ("🔒 Model routing changes model selection for the whole profile, so it is "
+                    "limited to authorized users. Ask the operator to allowlist you, or run "
+                    "`hermes model routing status` on the host.")
+
+        args = (event.get_command_args() or "").strip()
+        token = args.lower()
+        cfg = self._model_routing_load_config()
+        settings = mr.routing_settings(cfg)
+        report = mr.routing_report(cfg, "")
+
+        flows = self._model_routing_flows()
+        key = self._model_routing_flow_key(event)
+        flow = flows.get(key)
+        now = time.time()
+        expired = False
+        if flow is not None and now - float(flow.get("ts") or 0) > self._MODEL_ROUTING_FLOW_TTL:
+            flows.pop(key, None)
+            flow = None
+            expired = True
+
+        def start(step: str, **extra) -> Dict[str, Any]:
+            state = {"step": step, "changes": {}, "ts": now, "page": 0,
+                     "candidates": [str(c.get("model")) for c in (report.get("candidates") or [])
+                                    if c.get("model")],
+                     "settings": dict(settings)}
+            state.update(extra)
+            flows[key] = state
+            return state
+
+        def touch(state: Dict[str, Any]) -> None:
+            state["ts"] = now
+            flows[key] = state
+
+        def finish() -> None:
+            flows.pop(key, None)
+
+        expired_note = "⌛ That routing session timed out — nothing was applied.\n\n" if expired else ""
+
+        # Bare ``/model-routing``: show the state and the actions, keeping any pending
+        # (unsaved) changes.  This is also how a user re-anchors after a wrong keypress.
+        if not token:
+            state = flow or start("menu")
+            state["step"] = "menu"
+            touch(state)
+            return (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
+                    + self._model_routing_menu_text(settings, state.get("changes") or {}))
+
+        if token in self._MODEL_ROUTING_CANCEL_WORDS or (
+            flow is not None and flow.get("step") == "confirm" and token in {"no", "n"}
+        ):
+            finish()
+            return (expired_note + self._model_routing_state_text(report, settings)
+                    + "\n\nCancelled — nothing applied.")
+
+        if flow is None:
+            if token in {"1", "enable", "on", "2", "disable", "off", "3", "models",
+                         "4", "preferences", "prefs", "5", "single"}:
+                # A one-shot action typed without opening the menu first.
+                flow = start("menu")
+            else:
+                return (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
+                        + self._model_routing_menu_text(settings, {})
+                        + "\n(Unknown option — start with /model-routing on its own.)")
+
+        touch(flow)
+        step = flow.get("step") or "menu"
+        changes: Dict[str, Any] = flow.setdefault("changes", {})
+
+        if step == "menu":
+            if token in {"1", "enable", "on"}:
+                changes["enabled"] = True
+            elif token in {"2", "disable", "off", "5", "single"}:
+                changes["enabled"] = False
+                if token in {"5", "single"}:
+                    changes.pop("models", None)
+                    changes["preferred_models_only"] = False
+            elif token in {"3", "models"}:
+                flow["step"] = "models"
+                flow["page"] = 0
+                touch(flow)
+                return self._model_routing_state_text(report, settings) + "\n\n" + self._model_routing_models_page(flow)
+            elif token in {"4", "preferences", "prefs"}:
+                flow["step"] = "prefs"
+                touch(flow)
+                return self._model_routing_prefs_text(settings, changes)
+            elif token in {"6", "close", "done"}:
+                finish()
+                return self._model_routing_state_text(report, settings) + "\n\nClosed — nothing applied."
+            else:
+                return (self._model_routing_state_text(report, settings) + "\n\n"
+                        + self._model_routing_menu_text(settings, changes))
+            flow["step"] = "confirm"
+            touch(flow)
+            return self._model_routing_confirm_text(
+                settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+
+        if step == "models":
+            candidates = flow.get("candidates") or []
+            if token in {"next", "n"}:
+                flow["page"] = int(flow.get("page") or 0) + 1
+                touch(flow)
+                return self._model_routing_models_page(flow)
+            if token in {"prev", "previous", "p"}:
+                flow["page"] = max(0, int(flow.get("page") or 0) - 1)
+                touch(flow)
+                return self._model_routing_models_page(flow)
+            if token in {"back", "menu"}:
+                flow["step"] = "menu"
+                touch(flow)
+                return self._model_routing_menu_text(settings, changes)
+            if not candidates:
+                finish()
+                return ("No eligible models were reported for the current provider, so there is "
+                        "nothing to pick from here. Run `hermes model routing configure` on the host.")
+            if token in {"all", "none"}:
+                chosen = candidates if token == "all" else []
+            else:
+                picked: List[str] = []
+                for raw in args.replace(" ", ",").split(","):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    if not raw.isdigit():
+                        picked = []
+                        break
+                    index = int(raw) - 1
+                    if not (0 <= index < len(candidates)):
+                        picked = []
+                        break
+                    if candidates[index] not in picked:
+                        picked.append(candidates[index])
+                if not picked and token not in {"none"}:
+                    return ("Could not read that selection. Reply with numbers from the list "
+                            "(e.g. /model-routing 1,3), all, none, back or cancel.\n\n"
+                            + self._model_routing_models_page(flow))
+                chosen = picked
+            changes["models"] = list(chosen)
+            # Section 4 semantics: an explicit list means "only these"; an empty list means
+            # "the whole eligible catalog", which needs the flag explicitly off.
+            changes["preferred_models_only"] = bool(chosen)
+            flow["step"] = "confirm"
+            touch(flow)
+            return self._model_routing_confirm_text(
+                settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+
+        if step == "prefs":
+            if token in {"1", "strategy"}:
+                flow["step"] = "prefs_strategy"
+                touch(flow)
+                return ("Which strategy? Reply /model-routing automatic, /model-routing cost or "
+                        "/model-routing quality (or cancel).")
+            if token in {"2", "threshold"}:
+                flow["step"] = "prefs_threshold"
+                touch(flow)
+                return ("Stability threshold: how much better a rival must score before it takes "
+                        "the turn (0–1, default 0.15). Reply /model-routing 0.2 (or cancel).")
+            if token in {"3", "cost"}:
+                changes["cost_optimization"] = not bool(settings.get("cost_optimization", True))
+            elif token in {"4", "downgrade"}:
+                changes["switch_on_cost"] = not bool(settings.get("switch_on_cost"))
+            elif token in {"5", "llm"}:
+                changes["llm_assisted_classification"] = not bool(
+                    settings.get("llm_assisted_classification"))
+            elif token in {"6", "scope"}:
+                changes["preferred_models_only"] = not bool(settings.get("preferred_models_only"))
+            elif token in {"7", "back", "menu"}:
+                flow["step"] = "menu"
+                touch(flow)
+                return self._model_routing_menu_text(settings, changes)
+            else:
+                return self._model_routing_prefs_text(settings, changes)
+            touch(flow)
+            return self._model_routing_prefs_text(settings, changes)
+
+        if step == "prefs_strategy":
+            if token not in self._MODEL_ROUTING_STRATEGIES:
+                return (f"Strategy must be one of {', '.join(self._MODEL_ROUTING_STRATEGIES)} — "
+                        "reply /model-routing automatic|cost|quality, or cancel.")
+            changes["strategy"] = token
+            flow["step"] = "prefs"
+            touch(flow)
+            return self._model_routing_prefs_text(settings, changes)
+
+        if step == "prefs_threshold":
+            try:
+                value = float(token)
+            except ValueError:
+                return ("Stability threshold must be a number between 0 and 1 — reply "
+                        "/model-routing 0.2, or cancel.")
+            if not 0.0 <= value <= 1.0:
+                return "Stability threshold must be between 0 and 1 — reply /model-routing 0.2, or cancel."
+            changes["stability_threshold"] = value
+            flow["step"] = "prefs"
+            touch(flow)
+            return self._model_routing_prefs_text(settings, changes)
+
+        if step == "confirm":
+            if token not in self._MODEL_ROUTING_YES_WORDS:
+                return (self._model_routing_confirm_text(
+                    settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+                    + "\n(Reply /model-routing yes to save or /model-routing cancel to discard.)")
+            finish()
+            return await self._model_routing_commit(changes)
+
+        finish()
+        return self._model_routing_state_text(report, settings)
+
+    @staticmethod
+    def _model_routing_hypothetical(cfg: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any]:
+        """*cfg* with *changes* merged into ``smart_model_routing`` — for preview only."""
+        block = dict(cfg.get("smart_model_routing") or {}) if isinstance(cfg, dict) else {}
+        block.update(changes or {})
+        hypothetical = dict(cfg) if isinstance(cfg, dict) else {}
+        hypothetical["smart_model_routing"] = block
+        return hypothetical
+
+    async def _model_routing_commit(self, changes: Dict[str, Any]) -> str:
+        """Write through ``update_routing`` and report the block read back from disk."""
+        from agent import model_router as mr
+
+        try:
+            result = mr.update_routing(dict(changes))
+        except ValueError as err:
+            return (f"❌ Not saved — the change was rejected: {err}\nNothing was written; "
+                    "the previous configuration is intact.")
+        except Exception as err:  # pragma: no cover - defensive: I/O failure
+            logger.warning("model-routing: update_routing failed: %s", err, exc_info=True)
+            return (f"❌ Not saved — {type(err).__name__}: {err}\n"
+                    "The previous configuration is intact.")
+
+        # Read back from disk, not from the write result: routing_settings() with no argument
+        # loads config.yaml, so this cannot echo the caller's optimism.
+        saved = mr.routing_settings()
+        report = mr.routing_report(self._model_routing_load_config(), "")
+        changed = ", ".join(result.get("changed") or []) or "nothing"
+        lines = [f"✅ Saved smart_model_routing (changed: {changed}).",
+                 "Read back from config.yaml:"]
+        lines.append(self._model_routing_state_text(report, saved))
+        lines.append("")
+        lines.append("Takes effect on the next turn — the running gateway re-reads "
+                     "smart_model_routing per turn, so no gateway restart is needed.")
+        lines.append("Verify from the host: hermes model routing status")
+        for warning in result.get("warnings") or []:
+            lines.append(f"⚠️ {warning}")
+        return "\n".join(lines)
