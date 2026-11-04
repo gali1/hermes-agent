@@ -261,7 +261,128 @@ def cmd_model_routing_configure(args) -> int:
     if getattr(args, "cost_opt", None) is not None:
         changes["cost_optimization"] = bool(args.cost_opt)
     if not changes:
-        print("routing: nothing to change — pass at least one option "
-              "(--strategy, --threshold, --models, --all-eligible, --selected-only, ...)")
-        return 1
+        import sys
+        from hermes_cli.setup import is_noninteractive
+
+        if is_noninteractive() or not sys.stdin.isatty():
+            print("routing: nothing to change — pass at least one option "
+                  "(--strategy, --threshold, --models, --all-eligible, --selected-only, ...)")
+            return 1
+        return _routing_interactive()
     return _routing_apply(changes=changes, assume_yes=bool(getattr(args, "yes", False)))
+
+
+def _routing_interactive() -> int:
+    """The interactive routing flow: state → action → options → summary → confirm → write.
+
+    Every prompt comes from ``hermes_cli.setup`` so keybindings, cancel semantics and the
+    non-interactive fallbacks match the provider/model pickers. Cancelling at any step returns
+    without writing.
+    """
+    from agent.model_routing import merge_routing_config, options_from_catalog
+    from hermes_cli.config import get_config_path, read_user_config_raw
+    from hermes_cli.setup import is_noninteractive, prompt_choice, prompt_multi_choice, prompt_yes_no
+
+    if is_noninteractive():
+        print("routing: no interactive terminal available — use `hermes model routing configure "
+              "--strategy/--threshold/--models`")
+        return 1
+
+    try:
+        data = dict(read_user_config_raw(get_config_path()) or {})
+    except Exception as exc:
+        print(f"routing: config unreadable ({exc.__class__.__name__}: {exc})")
+        return 2
+
+    model_cfg = data.get("model") if isinstance(data.get("model"), dict) else {}
+    provider = str(model_cfg.get("provider") or "").strip()
+    old_raw = data.get("smart_model_routing")
+    block = old_raw if isinstance(old_raw, dict) else {}
+
+    print("--- current ---")
+    print(_render_routing(_routing_report(data, block)))
+    print()
+
+    if not provider:
+        print("routing: no provider configured — run `hermes model` first")
+        return 1
+
+    changes: dict = {}
+    actions = ["Enable routing", "Disable routing", "Choose models", "Preferences", "Cancel"]
+    choice = prompt_choice("What do you want to change?", actions, default=4)
+
+    if choice == 4:
+        print("routing: cancelled — nothing written")
+        return 0
+
+    if choice == 0:
+        changes["enabled"] = True
+    elif choice == 1:
+        changes["enabled"] = False
+    elif choice == 2:
+        mode = prompt_choice(
+            "Which models may routing use?",
+            ["All eligible models", "Only my selected models"], default=0)
+        if mode == 0:
+            changes["models"] = []
+            changes["preferred_models_only"] = False
+        else:
+            candidates = options_from_catalog(provider)
+            names = [o.name for o in candidates]
+            if not names:
+                print(f"routing: no catalog models found for provider {provider!r}")
+                return 1
+            if len(names) > 50:
+                print(f"  {len(names)} models available — type 'all', 'none', or numbers.")
+            preselected = [names.index(m) for m in block.get("models") or [] if m in names]
+            picked = prompt_multi_choice("Select models (priority = list order)",
+                                         names, preselected=preselected)
+            if picked is None:
+                print("routing: cancelled — nothing written")
+                return 0
+            if not picked:
+                print("routing: no models selected — nothing written")
+                return 0
+            changes["models"] = [names[i] for i in picked]
+            changes["preferred_models_only"] = True
+    elif choice == 3:
+        strategies = ["automatic", "cost", "quality"]
+        current = str(block.get("strategy") or "automatic")
+        idx = prompt_choice("Strategy?", strategies,
+                            default=strategies.index(current) if current in strategies else 0)
+        changes["strategy"] = strategies[idx]
+        try:
+            raw_threshold = input(
+                f"stability_threshold [{block.get('stability_threshold', 0.15)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raw_threshold = ""
+        if raw_threshold:
+            try:
+                changes["stability_threshold"] = float(raw_threshold)
+            except ValueError:
+                print(f"routing: {raw_threshold!r} is not a number — nothing written")
+                return 1
+
+    new_raw = merge_routing_config(old_raw, **changes)
+    print("\n--- after ---")
+    print(_render_routing(_routing_report(data, new_raw)))
+
+    if not prompt_yes_no("Save these changes?", default=False):
+        print("routing: cancelled — nothing written")
+        return 0
+
+    try:
+        result = write_routing_config(changes)
+    except Exception as exc:
+        print(f"routing: write failed ({exc.__class__.__name__}: {exc}); previous config intact")
+        return 2
+    if not result["ok"]:
+        for problem in result["problems"]:
+            print(f"routing: {problem}")
+        print("routing: nothing written")
+        return 1
+
+    print("\n--- saved (read back from disk) ---")
+    print(_render_routing(_routing_report(data, result["saved"])))
+    print("\nverify: hermes model routing status")
+    return 0
