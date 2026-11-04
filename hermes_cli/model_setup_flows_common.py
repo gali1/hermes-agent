@@ -418,6 +418,11 @@ def _print_routing_readback(result: dict) -> None:
         print(f"    models ({len(models)}): {', '.join(models)}")
     print(f"    saved in: {result.get('path') or 'config.yaml'}")
     print("    verify with: hermes model routing status")
+    # The wizard covers the opt-in and the model scope.  Everything else the
+    # engine reads (exclude, unknown metadata, weights, reliability) lives in
+    # `configure` and in /model-routing's preferences, not in a first-run flow —
+    # say where, so nobody has to hand-edit config.yaml to find it.
+    print("    tune further with: hermes model routing configure")
 
 
 def offer_model_routing(*, provider_id: str, model_list=(), current_model: str = "",
