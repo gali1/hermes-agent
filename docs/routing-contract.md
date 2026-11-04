@@ -60,7 +60,9 @@ it is additive it can **promote** an equal-scored rival as well as demote one, s
 older "only ever demotes / only more conservative" claim was wrong. Band: maximum
 swing is `0.05` under `strategy=cost` and `0.15` under `quality`; C5 keeps the
 incumbent when `gain <= stability_threshold`, so it decides first-turn picks and
-ties, and can never alone dislodge an incumbent.
+ties. It cannot alone dislodge an incumbent **at the default `stability_threshold` of
+0.15** — that is a threshold-dependent statement, not an absolute one: any configured
+threshold below 0.15 makes the 0.15 quality-strategy swing decisive on its own.
 
 ## C5 — Stability (anti-flapping)
 The incumbent model keeps the turn unless a rival beats it by more than
@@ -106,37 +108,54 @@ A switch may cross providers, but must resolve credentials through the target
 provider's existing profile and rebuild credential pools, prompt-cache flags and
 the compressor exactly as a manual switch does. Provider pools are never mixed:
 a cross-provider move clears the previous provider's pool rather than borrowing
-from it. fastembed performs the re-resolution itself at the turn boundary;
-bro-2 delegates to the agent's existing `switch_model`, which rebuilds the pools,
-prompt-cache flags and compressor exactly as a manual switch would (verified in
-`agent/model_routing.py: maybe_apply_model_routing`). Neither side may switch by
-mutating the model name alone.
+from it. Neither side may switch by mutating the model name alone.
 
-## C9 — Multimodal continuity — **NOT IMPLEMENTED, both sides (status, not contract text)**
+**Mechanism — delegation first (agreed with bro-2).** The switch is delegated to the
+runtime's model-swap entry point (`agent.switch_model`) whenever one exists, because
+that is the seam that re-resolves endpoint and credentials by construction and the
+seam both sides' falsifiers already exercise. In-place re-resolution is the
+**fallback**, not a parallel design, and it is allowed only when `switch_model` is
+absent — the implementation must name that absence in the reason it reports. The
+fallback must satisfy the same postconditions (target-profile credentials, previous
+pool cleared, prompt-cache flags, compressor) and is verified by the same falsifier;
+without that, "otherwise managed in place" becomes a permanent way for one side to
+stay put.
 
-Called "settled" in an earlier revision. Measured, it is not implemented anywhere, and
-both sides fail differently.
+## C9 — Multimodal continuity — **C9a: implemented on both; C9b: nowhere**
 
 **C9a — input modality.** The requirement must be derived from the attachments present
 at the turn boundary, never from message text. Falsifier: a message carrying an image
 part must not select a model whose input modality excludes images, and must not raise.
 
-- *oklab-1*: NOT IMPLEMENTED. `agent/conversation_loop.py:1585` coerces the message with
-  `str(...)` before `route_turn`, so attachments never reach selection; `expects_image`
-  has test-only callers. A text-only model can win an image-output request because an
-  UNKNOWN output modality passes the filter (`model_router.py:904`) and `SPEC_FIELDS`
-  (`:339-353`) cannot declare image output.
-- *bro-2*: NOT IMPLEMENTED for string prompts, but the crash is fixed. The turn boundary
-  (`agent/turn_context.py:1117-1118`) forwards the payload verbatim, and that payload can be a
-  multi-part content list — vision via the OpenAI-compatible server, per
-  `agent/agent_runtime_helpers.py:3358` — so `classify_request` used to raise `AttributeError`
-  (`body.strip()` on a list, swallowed at `model_routing.py:731`) and every such turn was
-  routing-inert by accident. It now reads text, image, audio and file parts and ORs their
-  flags with the caller's, so a list payload neither raises nor selects a text-only model for
-  an image part. Still missing: attachments delivered beside a *string* prompt are handled by
-  `image_routing.py` after selection, so the string path cannot state its modality.
-- Both: `image_routing.py` is a **separate axis applied after selection**, which cannot
-  satisfy C9a.
+- *oklab-1*: **IMPLEMENTED.** `message_text_and_attachments()` splits a turn into text and
+  modality hints (text/image/audio/pdf/video; unknown parts contribute nothing), and the
+  loop passes both to `route_turn(..., attachments=...)`, so the modality reaches
+  classification instead of being flattened by the old `str()` coercion. An image
+  attachment makes `vision` a hard requirement: a model declaring `supports_vision: false`
+  is excluded as `unsupported_vision` and cannot win the turn. Limits that remain: an
+  UNDECLARED `supports_vision` reads as unknown and is still allowed (unknown ≠
+  unsupported), and `SPEC_FIELDS` cannot declare image *output*, so an image-edit request
+  is not yet protected on the output side (that is C9b).
+- *bro-2*: **IMPLEMENTED.** [`agent/model_routing.py:212`] `classify_request` reads a
+  multi-part content list *and* asks `image_routing.extract_image_refs` about a **string**
+  prompt, so an image named in the payload — the same reference that later becomes an
+  `image_url` part — sets `needs_vision` before selection. This mirrors oklab-1's helper
+  without importing it: the requirement is derived from what will be attached, never from the
+  words, and a path that is not a file is prose. An image attachment makes `vision` a hard
+  requirement: a model declaring `supports_vision: false` is excluded (bro-2's prose
+  `excluded_reason` is `no vision input`; oklab-1's machine token is `unsupported_vision`) and
+  cannot win the turn. An UNDECLARED `supports_vision` reads as unknown and is still allowed on
+  both sides (unknown ≠ unsupported). Falsifiers:
+  `test_string_prompt_with_image_path_requires_vision`,
+  `test_string_prompt_with_missing_path_does_not_require_vision`,
+  `test_explain_agrees_with_selection_on_string_image_path`.
+  Limit that remains: with `image_input_mode: text` the image is described up-front by
+  `vision_analyze`, so the hard requirement is stricter than that turn strictly needs —
+  conservative, never wrong.
+- **Shared limit.** `image_routing.build_native_content_parts` still runs *after* selection on
+  both sides; what moved before selection is the *requirement*, not the part construction. And
+  `SPEC_FIELDS` cannot declare image *output*, so an image-edit request is not yet protected on
+  the output side (that is C9b).
 
 **C9b — output modality and attachment continuity.** An image-edit follow-up must keep
 the original attachment and require image-output capability. Neither side records a
@@ -149,12 +168,22 @@ dropping the attachment.
 Every decision carries a human-readable reason and a machine `skip_reason`, drawn
 from one vocabulary both sides accept: `no_candidates`, `no_eligible_model`,
 `already_current`, `within_stability_threshold`, `moa_active`, `disabled`, `error`
-(oklab-1 pins the set in `SKIP_REASONS`; `moa_active` is reserved — nothing emits it
-yet, because the MoA path does not consult the router).
+(oklab-1 pins the set in `SKIP_REASONS`).
+
+**`moa_active` — implemented on oklab-1, still absent on bro-2.** The skip used to be
+invisible on both sides (oklab-1 at the call site, bro-2 deep in the router where it
+returns `None` before a `Decision` exists). oklab-1 now (a) delegates the decision into
+`route_turn(moa_active=...)`, which records `ROUTING_SKIP_ATTR`
+(`_last_routing_skip_reason`) before returning `None`, and (b) emits it in the machine
+surface: `routing_report(..., moa_active=True)` returns `skip_reason: "moa_active"`,
+`selected: null`, `kept_current: true` and a human `reason`, while keeping the
+candidate rows so "what would routing have chosen" stays answerable — a skip must not
+look like an empty catalog. bro-2 still returns `None` before any decision exists, so no
+dict there can carry the reason. C10 is satisfied on oklab-1 and open on bro-2.
 
 **The machine surface is a dict, and it is normative.** oklab-1 calls it
 `routing_report()` (`model_router.py:2361-2455`), bro-2 calls it `explain_routing()`
-(`model_routing.py:735-821`): same shape, different name. Either name is acceptable
+(`model_routing.py:757-844`): same shape, different name. Either name is acceptable
 locally, but the dict — not any text renderer — is what automation may parse, and a
 text renderer must be derived from it so the two cannot disagree. oklab-1's
 `explain()` (`:1486-1513`) is **text only** and is not an automation surface.
@@ -188,31 +217,36 @@ well as demotes — but none may relax C1–C3 or C6.
     tests/agent/test_model_router_cross_provider.py tests/agent/test_image_routing.py \
     tests/hermes_cli/test_model_routing_cli.py -q
 
-# bro-2 (this copy): 85 passed
+# bro-2 (this copy): 88 passed
 /home/bro/hermes-venv/bin/python -m pytest tests/agent/test_model_routing.py -q
 ```
 
 ## Open reconciliation items
 
-Resolved this round (implemented on oklab-1: the doc-truth commit `1f1ab5ad32`, plus the
-incumbent-identity commit that carries this document):
+Resolved this round — oklab-1 `1f1ab5ad32` (doc truth) + `8a848064c8` (incumbent
+identity); bro-2 `5ed600a3b3` (same identity, plus the C9a content-parts fix):
 reliability reclassified as operator-declared preference (C4), tie rule and incumbent
 identity stated (C5), explain surface named with the dict normative (C10), and the
 "only more conservative" claim withdrawn. bro-2 mirrored the incumbent identity and the
 joined tie-break key, fixed the content-parts crash, and refreshed the line references in
 the commit that carries this revision.
 
+Resolved next round — bro-2 `0cca5df303` (C9a string path): `classify_request` now derives
+`needs_vision` from `image_routing.extract_image_refs` for a string payload, with three
+falsifiers, so C9a is implemented on both hosts and bro-2's content-parts defect is closed
+end to end. Helpers stay per-host (`message_text_and_attachments` vs `_string_image_refs` +
+`extract_image_refs`); the contract fixes the behaviour, not the function name.
+
 Still open:
 
-1. **C9a wiring** — the one genuinely unimplemented clause. Both sides must derive the
-   modality requirement from attachments at the turn boundary. Owner: both.
-2. **bro-2 defect — fixed, wiring still open** — `classify_request` no longer raises on a
-   content-parts list and derives the modality flags from the parts (regression tests in
-   `tests/agent/test_model_routing.py`). What remains is item 1's string-prompt path.
-   Owner: bro-2, then both.
-3. **C8 form** — self-managed switching there vs `switch_model` delegation here. Both
-   are acceptable in behaviour; decide whether the delegation form becomes the shared
-   contract. Owner: both.
-4. **Name collision to document** — C4 `reliability` (routing preference) and the tool
+1. **C10 `moa_active` dict row** — done on oklab-1 (`routing_report(moa_active=True)`);
+   bro-2 returns before a decision object exists, so it needs the same early-skip record.
+   bro-2's `explain_routing()` already carries `skip_reason` / `selected` / `kept_current` /
+   `reason` / `candidates` as top-level keys — the skip is decision-level, not a candidate
+   row — so the record is the only missing piece. Owner: bro-2.
+2. **C9b modality on the decision** — neither side records image-output capability on
+   `Decision`, so an image-edit follow-up cannot be protected yet. Owner: both, after C10.
+3. **Name collision to document** — C4 `reliability` (routing preference) and the tool
    search's `reliability_rerank` (call-outcome re-rank) are unrelated knobs with similar
    names; never let one config imply the other.
+4. **C8 form (closed)** — delegation-first agreed; see C8 above.
