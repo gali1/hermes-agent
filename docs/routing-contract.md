@@ -255,6 +255,25 @@ that sets it to true needs the operator's agreement on any surface a human is dr
   question, so the "Saved in: config.yaml" line can never appear on a state that is not
   on disk.
 
+## C14 — A refresh is a cache operation, and the footer is a claim about the file
+Two small truths that the CLI surface must keep:
+
+* **Catalog refresh reuses the engine's cache.** `hermes model routing refresh`
+  force-refreshes the same `agent.models_dev` registry that `_catalog_models` resolves
+  candidates from — no second cache, no second network path, and selection itself never
+  fetches (C1). A refresh writes the catalog cache only: `smart_model_routing` is not
+  touched, so a refresh can never enable, narrow or widen a pool by itself. When the
+  catalog cannot be fetched the verb says so and exits non-zero rather than reporting a
+  success it did not have; the cached copy keeps being used either way.
+* **"Saved in: config.yaml" is a statement about the file.** The renderer prints that
+  footer only when the loaded config actually contains a `smart_model_routing` section
+  (`saved_note=None` means *ask the file*). An absent section is off-by-default, not
+  saved — printing the footer there would describe a block the operator does not have.
+  `saved_note=False` remains the pre-write preview form (C13).
+* **Bare `hermes model routing` follows `hermes model`.** With a terminal it opens the
+  interactive flow; with no terminal it prints the read-only status instead of blocking.
+  `status` stays reachable as its own verb in both cases.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

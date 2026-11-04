@@ -200,6 +200,30 @@ def build_model_parser(
         help="Size of the running context, added to the input estimate",
     )
 
+    _refresh = routing_sub.add_parser(
+        "refresh",
+        help="Refresh the model catalog dynamic selection chooses from",
+        description=(
+            "Force-refresh the models.dev catalog that routing resolves candidates\n"
+            "from — the same cache agent.models_dev already serves (no second\n"
+            "cache, no per-message fetch).\n\n"
+            "Read-only with respect to config.yaml: this touches the catalog cache,\n"
+            "never smart_model_routing. Useful after a provider adds models, when\n"
+            "`status` still shows the old pool."
+        ),
+    )
+    _refresh.add_argument(
+        "--provider",
+        default=None,
+        help="Report this provider's pool (default: model.provider from config)",
+    )
+    _refresh.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit the result as JSON (refreshed/providers/models/candidates/elapsed_ms)",
+    )
+
     _configure = routing_sub.add_parser(
         "configure",
         help="Review and change every routing setting (interactive, or with flags)",

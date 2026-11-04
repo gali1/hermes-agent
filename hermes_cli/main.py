@@ -1920,14 +1920,19 @@ def _routing_section(config: dict) -> dict:
     return section
 
 
-def _print_routing_status(config: dict, *, saved_note: bool = True) -> None:
+def _print_routing_status(config: dict, *, saved_note: bool | None = None) -> None:
     """Print the resolved routing settings and what they can choose from.
 
     ``saved_note=False`` is for previews of a state that is not on disk yet —
     saying "Saved in: config.yaml" there would claim a write that has not
-    happened.
+    happened.  ``saved_note=None`` (the default) asks the file: the footer is a
+    claim about ``config.yaml``, so it is printed only when the block is
+    actually there.  An absent section is *off by default*, not saved.
     """
     from agent import model_router as router
+
+    if saved_note is None:
+        saved_note = isinstance(config, dict) and "smart_model_routing" in config
 
     section = config.get("smart_model_routing")
     cfg = router.RoutingConfig.from_dict(section)
@@ -2270,7 +2275,7 @@ def _routing_configure_interactive(args, config) -> int:
     state = "ON" if before["enabled"] else "OFF"
     idx = _routing_ask_choice(
         f"Dynamic model selection is {state}. What should it be?",
-        ["Keep it off" if before["enabled"] else "Keep it on", "Enable", "Disable"],
+        [("Keep it on" if before["enabled"] else "Keep it off"), "Enable", "Disable"],
         default=0,
     )
     if idx is None:
@@ -2413,6 +2418,84 @@ def _routing_configure_interactive(args, config) -> int:
     return 0
 
 
+def _routing_refresh(args) -> int:
+    """Force-refresh the catalog dynamic selection resolves candidates from.
+
+    Directive §5.1: reuse the existing catalog refresh and cache mechanism, do
+    not add a second cache.  ``agent.models_dev`` is exactly what
+    ``model_router._catalog_models`` reads (cache-only), so this refreshes that
+    registry in place — no new cache, no new network path, and no per-message
+    fetch anywhere in the selection path.
+
+    Read-only with respect to config.yaml: the only thing written is the
+    catalog cache under the Hermes home.
+    """
+    import json as _json
+    import time as _time
+
+    from agent import model_router as router
+    from agent import models_dev
+    from hermes_cli.config import load_config
+
+    as_json = bool(getattr(args, "json", False))
+    provider = str(getattr(args, "provider", None) or "").strip()
+    if not provider:
+        try:
+            provider = _routing_provider(load_config())
+        except Exception:  # pragma: no cover - config read is guarded upstream
+            provider = ""
+
+    started = _time.monotonic()
+    try:
+        registry = models_dev.fetch_models_dev(force_refresh=True) or {}
+    except Exception:  # pragma: no cover - the fetcher is total by contract
+        registry = {}
+    elapsed_ms = round((_time.monotonic() - started) * 1000.0, 1)
+    refreshed = bool(registry)
+
+    models: list = []
+    pool: list = []
+    if refreshed and provider:
+        models = models_dev.list_provider_models(provider, allow_network=False) or []
+        pool = router.widen_pool(provider, [])
+
+    if as_json:
+        print(_json.dumps(
+            {
+                "refreshed": refreshed,
+                "source": "models.dev",
+                "providers": len(registry),
+                "provider": provider,
+                "models": len(models),
+                "candidates": len(pool),
+                "elapsed_ms": elapsed_ms,
+                "config_written": False,
+            },
+            indent=2,
+            sort_keys=True,
+        ))
+        return 0 if refreshed else 1
+
+    if not refreshed:
+        print("✗ could not refresh the model catalog (models.dev unreachable).", file=sys.stderr)
+        print(
+            "  Any cached copy is still used — selection never fetches per message,\n"
+            "  so routing keeps working. Try again when the network is back.\n",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"\n  ✓ Model catalog refreshed from models.dev ({elapsed_ms:.0f} ms)")
+    print(f"  providers:  {len(registry)}")
+    if provider:
+        print(f"  provider:   {provider} ({len(models)} models listed)")
+        print(f"  candidates: {len(pool)} (the pool routing can widen to)")
+    else:
+        print("  provider:   (none configured — nothing to resolve a pool against)")
+    print("  config.yaml not modified.\n")
+    return 0
+
+
 def cmd_model_routing(args):
     """Inspect or change dynamic model selection (``smart_model_routing``).
 
@@ -2424,7 +2507,13 @@ def cmd_model_routing(args):
     from agent import model_router as router
     from hermes_cli.config import load_config, save_config
 
-    action = getattr(args, "routing_command", None) or "status"
+    action = getattr(args, "routing_command", None)
+    if not action:
+        # Bare `hermes model routing` follows the `hermes model` convention: a
+        # human at a terminal gets the interactive flow.  With no terminal there
+        # is nobody to answer, so the read-only status is printed rather than
+        # blocking (unlike bare `hermes model`, status has something to say).
+        action = "configure" if _routing_is_tty() else "status"
     try:
         config = load_config()
     except Exception as err:
@@ -2454,6 +2543,9 @@ def cmd_model_routing(args):
         if interactive:
             return _routing_configure_interactive(args, config)
         return _routing_configure_common(args, config)
+
+    if action == "refresh":
+        return _routing_refresh(args)
 
     if action in ("enable", "disable"):
         section = _routing_section(config)

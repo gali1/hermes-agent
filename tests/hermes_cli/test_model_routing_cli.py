@@ -500,3 +500,163 @@ def test_status_json_exits_zero_for_a_misconfigured_but_readable_config(
     assert set(report) == REPORT_KEYS
     assert report["settings"]["strategy"] == "automatic"
     assert report["settings"]["stability_threshold"] == pytest.approx(0.15)
+
+
+# ---------------------------------------------------------------------------
+# catalog refresh (directive 5.1: reuse the existing cache, never a second one)
+# ---------------------------------------------------------------------------
+
+def test_refresh_verb_reaches_the_routing_handler():
+    parser, _picker, routing = _build()
+    ns = parser.parse_args(["model", "routing", "refresh"])
+    assert ns.func is routing
+    assert ns.routing_command == "refresh"
+
+
+def test_refresh_force_refreshes_the_engine_catalog_and_writes_no_config(
+    home, monkeypatch, capsys
+):
+    """The refresh must hit the SAME registry the engine reads, and only that."""
+    import agent.models_dev as models_dev
+    from hermes_cli.main import cmd_model_routing
+
+    before = (home / "config.yaml").read_bytes()
+    seen = []
+
+    def _fake_fetch(force_refresh=False, **kwargs):
+        seen.append(force_refresh)
+        return {"prov": {"models": {}}, "other": {"models": {}}}
+
+    monkeypatch.setattr(models_dev, "fetch_models_dev", _fake_fetch)
+    monkeypatch.setattr(
+        models_dev, "list_provider_models",
+        lambda provider, **kw: ["model-a", "model-c"] if provider == "prov" else [],
+    )
+
+    assert cmd_model_routing(_ns(routing_command="refresh")) == 0
+    out = capsys.readouterr().out
+    assert seen == [True], "refresh must force a catalog fetch, not serve the cache"
+    assert "providers:  2" in out
+    assert "2 models listed" in out
+    assert (home / "config.yaml").read_bytes() == before, "refresh is not a config write"
+
+
+def test_refresh_says_so_when_the_catalog_cannot_be_fetched(home, monkeypatch, capsys):
+    """An unreachable catalog is reported, never dressed up as a success."""
+    import agent.models_dev as models_dev
+    from hermes_cli.main import cmd_model_routing
+
+    monkeypatch.setattr(
+        models_dev, "fetch_models_dev", lambda force_refresh=False, **kw: {}
+    )
+    rc = cmd_model_routing(_ns(routing_command="refresh"))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "could not refresh" in captured.err
+    assert "✓" not in captured.out
+
+
+def test_refresh_json_reports_the_same_facts(home, monkeypatch, capsys):
+    import json
+
+    import agent.models_dev as models_dev
+    from hermes_cli.main import cmd_model_routing
+
+    monkeypatch.setattr(
+        models_dev, "fetch_models_dev",
+        lambda force_refresh=False, **kw: {"prov": {"models": {}}},
+    )
+    monkeypatch.setattr(
+        models_dev, "list_provider_models", lambda provider, **kw: ["model-a"]
+    )
+    assert cmd_model_routing(_ns(routing_command="refresh", json=True)) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["refreshed"] is True
+    assert payload["source"] == "models.dev"
+    assert payload["provider"] == "prov"
+    assert payload["models"] == 1
+    assert payload["config_written"] is False
+
+
+# ---------------------------------------------------------------------------
+# bare `hermes model routing` — the `hermes model` convention
+# ---------------------------------------------------------------------------
+
+def test_bare_routing_is_interactive_when_a_human_is_present(home, monkeypatch):
+    import hermes_cli.main as main
+
+    called = []
+    monkeypatch.setattr(main, "_routing_is_tty", lambda: True)
+    monkeypatch.setattr(
+        main, "_routing_configure_interactive",
+        lambda args, config: called.append(config) or 0,
+    )
+    monkeypatch.setattr(
+        main, "_routing_configure_common",
+        lambda args, config: pytest.fail("bare routing must not take the flag path"),
+    )
+    assert main.cmd_model_routing(_ns()) == 0
+    assert len(called) == 1
+
+
+def test_bare_routing_prints_status_when_nobody_can_answer(home, monkeypatch, capsys):
+    import hermes_cli.main as main
+
+    monkeypatch.setattr(main, "_routing_is_tty", lambda: False)
+    monkeypatch.setattr(
+        main, "_routing_configure_interactive",
+        lambda args, config: pytest.fail("no TTY, so no prompt"),
+    )
+    assert main.cmd_model_routing(_ns()) == 0
+    assert "Dynamic model selection" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# the renderer must not claim a write, and the offer must name the real state
+# ---------------------------------------------------------------------------
+
+def test_status_never_claims_a_saved_block_that_is_not_in_the_file(home, capsys):
+    """No block in config.yaml ⇒ no 'Saved in' footer (it would be a false claim)."""
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="status")) == 0
+    assert "Saved in:" not in capsys.readouterr().out
+
+
+def test_status_reports_the_block_once_the_file_has_one(home, capsys):
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(_ns(routing_command="enable")) == 0
+    capsys.readouterr()
+    assert cmd_model_routing(_ns(routing_command="status")) == 0
+    assert "Saved in: config.yaml (smart_model_routing)" in capsys.readouterr().out
+
+
+def test_interactive_offer_names_the_current_state_not_its_opposite(home, monkeypatch):
+    """The 'keep it as it is' option must read as the state the user is in."""
+    import hermes_cli.main as main
+    from hermes_cli.config import load_config
+
+    seen = []
+
+    def _choice(question, choices, default=0):
+        seen.append((question, list(choices)))
+        return None  # cancel at the first prompt: nothing may be written
+
+    monkeypatch.setattr(main, "_routing_ask_choice", _choice)
+
+    main._routing_configure_interactive(_ns(), load_config())
+    assert seen[0][1][0] == "Keep it off", seen[0]
+
+    import hermes_cli.config as cfg
+
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    from agent import model_router as router
+
+    router.update_routing({"enabled": True})
+    cfg._LOAD_CONFIG_CACHE.clear()
+    cfg._RAW_CONFIG_CACHE.clear()
+    seen.clear()
+    main._routing_configure_interactive(_ns(), load_config())
+    assert seen[0][1][0] == "Keep it on", seen[0]
