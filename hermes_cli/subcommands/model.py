@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from typing import Callable
 
+from hermes_cli.subcommands._shared import add_yes_flag
+
 
 def build_model_parser(
     subparsers, *, cmd_model: Callable, cmd_model_routing: Callable | None = None
 ) -> None:
     """Attach the ``model`` subcommand to ``subparsers``."""
     model_parser = subparsers.add_parser(
-        "model", help="Select default model and provider",
-        description="Interactively select your inference provider and default model")
+        "model", help="Select default model and provider, or configure dynamic model routing",
+        description=(
+            "Interactively select your inference provider and default model.\n\n"
+            "`hermes model routing` inspects or changes dynamic model selection\n"
+            "(smart_model_routing); `hermes model routing configure` edits it."
+        ))
     model_parser.add_argument(
         "--refresh", action="store_true",
         help="Wipe the model picker disk cache and re-fetch every provider's live /v1/models list.")
@@ -186,5 +192,79 @@ def build_model_parser(
         metavar="N",
         help="Size of the running context, added to the input estimate",
     )
+
+    _configure = routing_sub.add_parser(
+        "configure",
+        help="Review and change every routing setting (interactive, or with flags)",
+        description=(
+            "Review the resolved settings and change them.\n\n"
+            "In a terminal with no flags this runs the interactive flow: current\n"
+            "state, enable/disable, all eligible models vs only your selected\n"
+            "models, model selection through the normal picker, preferences,\n"
+            "before/after summary with a preview, then confirmation.\n\n"
+            "With flags it is fully scriptable and needs no TTY.  Nothing is\n"
+            "written until the end, so cancelling leaves config.yaml unchanged.\n"
+            "Every write goes through agent.model_router.update_routing and is\n"
+            "read back from disk.  Verify afterwards with:\n"
+            "  hermes model routing status"
+        ),
+    )
+    _configure.add_argument(
+        "--models",
+        action="append",
+        default=None,
+        metavar="M1,M2,...",
+        help=(
+            "Route only among these model ids, in priority order "
+            "(comma-separated; repeat the flag to add more)"
+        ),
+    )
+    _configure.add_argument(
+        "--all-models",
+        action="store_true",
+        default=False,
+        help="Route across the whole eligible provider catalog (clears the selected list)",
+    )
+    _configure_mode = _configure.add_mutually_exclusive_group()
+    _configure_mode.add_argument(
+        "--enable", action="store_true", default=False,
+        help="Turn dynamic model selection on")
+    _configure_mode.add_argument(
+        "--disable", action="store_true", default=False,
+        help="Turn dynamic model selection off")
+    _configure.add_argument(
+        "--strategy",
+        choices=["automatic", "cost", "quality"],
+        default=None,
+        help="Selection bias (default: automatic — capability first, then cost)",
+    )
+    _configure.add_argument(
+        "--stability-threshold",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Score a rival must beat the current model by before switching (0-1)",
+    )
+    _configure.add_argument(
+        "--cost-optimization",
+        dest="cost_optimization",
+        action="store_true",
+        default=None,
+        help="Prefer cheaper models that can still serve the request",
+    )
+    _configure.add_argument(
+        "--no-cost-optimization",
+        dest="cost_optimization",
+        action="store_false",
+        help="Prefer capability over price",
+    )
+    _configure.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Validate and show what would change without writing config.yaml")
+    _configure.add_argument(
+        "--json", action="store_true", default=False,
+        help="Print the writer's result (settings read back from disk) as JSON")
+    add_yes_flag(
+        _configure, "Assume yes: skip the final confirmation prompt")
 
     routing_parser.set_defaults(func=routing_handler)

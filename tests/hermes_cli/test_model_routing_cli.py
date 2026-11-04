@@ -50,6 +50,7 @@ def _build():
         ["model", "routing", "enable"],
         ["model", "routing", "disable"],
         ["model", "routing", "explain", "what", "is", "2+2"],
+        ["model", "routing", "configure"],
     ],
 )
 def test_routing_verbs_reach_the_routing_handler(argv):
@@ -195,6 +196,67 @@ def test_enable_writes_a_config_validating_section(home):
     issues = validate_config_structure(load_config())
     offending = [i.message for i in issues if "smart_model_routing" in i.message]
     assert not offending, f"the written section must validate: {offending}"
+
+
+# ---------------------------------------------------------------------------
+# `configure` — the scripted (no-TTY) path shares this module's writer
+# ---------------------------------------------------------------------------
+#
+# The deeper configure contracts live in test_model_routing_configure.py; what
+# is pinned here is that the new verb lands in the SAME section, is visible to
+# the existing status renderers, and does not widen the older verbs' surface.
+
+def test_configure_flag_path_lands_in_the_status_contract(home, capsys):
+    from hermes_cli.main import cmd_model_routing
+
+    assert cmd_model_routing(
+        _ns(
+            routing_command="configure",
+            models=["model-b"],
+            strategy="quality",
+            enable=True,
+            yes=True,
+        )
+    ) == 0
+    assert _routing_section(home).get("models") == ["model-b"]
+    capsys.readouterr()
+
+    # status --json is untouched: same key set, and it sees the new state.
+    assert cmd_model_routing(
+        _ns(routing_command="status", json=True, provider="prov")
+    ) == 0
+    report = _parse(capsys.readouterr().out)
+    assert set(report) == REPORT_KEYS
+    assert report["enabled"] is True
+    assert report["settings"]["strategy"] == "quality"
+    assert report["settings"]["preferred_models_only"] is True
+    assert report["skip_reason"] != "disabled"
+
+
+def test_configure_help_row_is_listed_under_routing():
+    parser, _picker, _routing = _build()
+    model_parser = next(
+        action for action in parser._subparsers._group_actions  # noqa: SLF001
+    ).choices["model"]
+    routing_parser = next(
+        action for action in model_parser._subparsers._group_actions  # noqa: SLF001
+    ).choices["routing"]
+    configure = next(
+        action for action in routing_parser._subparsers._group_actions  # noqa: SLF001
+    ).choices["configure"]
+    assert "configure" in routing_parser.format_help()
+    assert configure.description
+
+
+def test_configure_flags_do_not_widen_the_older_verbs():
+    parser, _picker, _routing = _build()
+    for argv in (
+        ["model", "routing", "status", "--models", "a"],
+        ["model", "routing", "enable", "--models", "a"],
+        ["model", "routing", "disable", "--yes"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
