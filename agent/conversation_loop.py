@@ -573,6 +573,21 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
+    #
+    # Model routing runs first, once per turn and before the system prompt is
+    # restored/built, so the prompt describes the model that will actually
+    # serve this turn.  With ``smart_model_routing.enabled`` false (the
+    # default) this is one cached config read plus a dict lookup and returns;
+    # a single-model config returns after one list build.  See
+    # ``agent/model_router.route_turn``.
+    if moa_config is None and getattr(agent, "api_mode", "") != "codex_app_server":
+        try:
+            from agent.model_router import route_turn
+
+            route_turn(agent, user_message)
+        except Exception as _routing_err:  # routing must never break a turn
+            logging.debug("smart model routing skipped: %s", _routing_err)
+
     _ctx = build_turn_context(
         agent,
         user_message,

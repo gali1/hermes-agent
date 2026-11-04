@@ -1724,7 +1724,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode='', user_initiated=True):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -1733,10 +1733,10 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     swap: rebuilding clients, updating caching flags, and refreshing
     the context compressor.
 
-    The implementation mirrors ``_try_activate_fallback()`` for the
-    client-swap logic but also updates ``_primary_runtime`` so the
-    change persists across turns (unlike fallback which is
-    turn-scoped).
+    ``user_initiated`` records whether a human asked for this switch.  A
+    user choice pins the session: ``agent/model_router.route_turn`` honours
+    ``agent._model_routing_pinned`` and will never auto-switch over it.  The
+    router's own calls pass ``user_initiated=False``.
     """
     from hermes_cli.providers import determine_api_mode
 
@@ -2058,6 +2058,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
     )
+
+    # A human-driven switch pins the session so smart model routing cannot
+    # undo it on the next turn (the router's own swaps pass
+    # ``user_initiated=False`` and therefore never pin).
+    if user_initiated:
+        agent._model_routing_pinned = True
 
     # ── Persist billing route to session DB ──
     # The agent's _session_db / session_id may not be set in all contexts
