@@ -66,6 +66,40 @@ class TestClassification:
         assert classify_request("```code```").reasons
 
 
+class TestMultimodalPayload:
+    """A content-parts list must not raise, and must not be read as prompt text.
+
+    It used to raise ``AttributeError: 'list' object has no attribute 'strip'`` inside a
+    swallowed ``except``, so every multimodal turn silently kept the current model.
+    """
+
+    def test_content_parts_list_does_not_raise(self):
+        parts = [{"type": "text", "text": "hello"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        profile = classify_request(parts)
+        assert profile.tier == "specialized"
+        assert profile.needs_vision is True
+        # The image payload is a modality, not prose: it must not inflate the token estimate.
+        assert profile.est_input_tokens < 20
+
+    def test_audio_part_sets_audio_requirement(self):
+        assert classify_request([{"type": "input_audio", "input_audio": {"data": "AA"}}]).needs_audio
+
+    def test_file_part_sets_file_requirement(self):
+        profile = classify_request([{"type": "file", "file": {"file_id": "f1"}}])
+        assert profile.tier == "specialized" and profile.reasons == ("modality required",)
+
+    def test_multimodal_envelope_is_unwrapped(self):
+        envelope = {"_multimodal": True, "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "input_image", "image_url": "x"}]}
+        profile = classify_request(envelope)
+        assert profile.needs_vision is True and profile.tier == "specialized"
+
+    def test_explicit_flag_survives_parts(self):
+        assert classify_request([{"type": "text", "text": "hi"}], has_images=True).needs_vision
+
+
 class TestEligibility:
     def test_vision_required_excludes_explicit_text_only(self):
         profile = classify_request("describe", has_images=True)
@@ -147,6 +181,51 @@ class TestSelection:
         assert select_model([CHEAP_WEAK, STRONG, MID], classify_request("hi")).candidates == 3
 
 
+class TestIncumbentIdentity:
+    """C5: the incumbent is ``(provider, model)``; name-only is only for callers without one."""
+
+    CHEAP_DUP = ModelOption(name="dup", provider="a", cost_in=1.0, cost_out=1.0, tier_rank=3)
+    PRICEY_DUP = ModelOption(name="dup", provider="b", cost_in=100.0, cost_out=100.0, tier_rank=3)
+
+    @staticmethod
+    def _settings():
+        return parse_settings({"enabled": True, "strategy": "cost"})
+
+    def test_same_name_other_provider_is_not_the_incumbent(self):
+        """A move to an identically named model on another provider must stay reachable."""
+        decision = select_model([self.CHEAP_DUP, self.PRICEY_DUP], classify_request("hello"),
+                                current="dup", current_provider="b", settings=self._settings())
+        assert (decision.model, decision.provider) == ("dup", "a")
+        assert decision.skip_reason == ""
+
+    def test_incumbent_on_its_own_provider_is_reported_with_that_provider(self):
+        decision = select_model([self.CHEAP_DUP, self.PRICEY_DUP], classify_request("hello"),
+                                current="dup", current_provider="a", settings=self._settings())
+        assert decision.provider == "a"
+        assert decision.skip_reason == "already_current"
+
+    def test_no_provider_falls_back_to_name_only(self):
+        decision = select_model([self.CHEAP_DUP, self.PRICEY_DUP], classify_request("hello"),
+                                current="dup", settings=self._settings())
+        assert decision.skip_reason == "already_current" and decision.provider == "a"
+
+    def test_wiring_switches_provider_for_identically_named_model(self, monkeypatch):
+        """The early \"unchanged\" return must compare (provider, model), not the name."""
+        switched = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda a, m, p: switched.append((m, p)))
+        agent = _Agent({"smart_model_routing": {
+            "enabled": True, "strategy": "cost",
+            "models": [
+                {"name": "dup", "provider": "a", "cost_in": 1.0, "cost_out": 1.0, "tier_rank": 3},
+                {"name": "dup", "provider": "b", "cost_in": 100.0, "cost_out": 100.0,
+                 "tier_rank": 3},
+            ]}}, model="dup", provider="b")
+        decision = maybe_apply_model_routing(agent, "hello")
+        assert decision is not None and decision.provider == "a"
+        assert switched == [("dup", "a")]
+
+
 class TestConfigParsing:
     def test_malformed_entries_skipped(self):
         opts = options_from_config({"models": [{"name": "ok"}, {"nope": 1}, "junk", {"name": ""}]})
@@ -199,6 +278,23 @@ class TestMaybeApply:
 
         monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", _boom)
         assert maybe_apply_model_routing(agent, "hello") is None
+
+    def test_multimodal_list_routes_instead_of_going_inert(self, monkeypatch):
+        """An image part must not be swallowed by the exception handler (C9a, bro-2 side)."""
+        switched = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda a, m, p: switched.append((m, p)))
+        agent = _Agent({"smart_model_routing": {"enabled": True, "models": [
+            {"name": "text-only", "provider": "p", "cost_in": 0.1, "cost_out": 0.1,
+             "tier_rank": 5, "supports_vision": False},
+            {"name": "vision", "provider": "p", "cost_in": 1.0, "cost_out": 1.0,
+             "tier_rank": 5, "supports_vision": True},
+        ]}}, model="text-only", provider="p")
+        parts = [{"type": "text", "text": "what is this"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+        decision = maybe_apply_model_routing(agent, parts)
+        assert decision is not None and decision.model == "vision"
+        assert switched == [("vision", "p")]
 
     def test_single_model_pool_is_noop_without_explicit_key(self, monkeypatch):
         """One preferred model is not a choice: no catalog scan, no routing decision."""
@@ -297,6 +393,11 @@ class TestExplain:
         row = r["candidates"][0]
         assert row["eligible"] is False
         assert row["excluded_reason"]
+
+    def test_excluded_reason_is_empty_string_when_eligible(self):
+        """One row per candidate, and the field is always a string (C10)."""
+        r = explain_routing({"enabled": True}, "hello", options=[CHEAP_WEAK])
+        assert r["candidates"][0]["excluded_reason"] == ""
 
     def test_unpriced_model_reported_as_median(self):
         r = explain_routing({"enabled": True}, "hello",

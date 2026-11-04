@@ -131,8 +131,67 @@ def estimate_tokens(text: str) -> int:
         return max(1, min(len(text) // _CHARS_PER_TOKEN, 2_000_000))
 
 
+def _content_parts(payload: Any) -> Tuple[str, bool, bool, bool]:
+    """Split a message payload into ``(text, has_images, has_audio, has_files)``.
+
+    A turn boundary may hand over a multi-part content list rather than a string — vision on
+    the OpenAI-compatible server, attachments on the API/gateway path. Calling ``str()`` on
+    that list would count an image payload as prompt text; refusing it raised
+    ``AttributeError: 'list' object has no attribute 'strip'`` inside a swallowed ``except``,
+    which made every multimodal turn routing-inert by accident. So the parts are read here and
+    the modality flags come from what is actually attached, never from the words around it.
+    """
+    if payload is None:
+        return "", False, False, False
+    if isinstance(payload, str):
+        return payload, False, False, False
+
+    flags = {"image": False, "audio": False, "file": False}
+    chunks: List[str] = []
+
+    def _walk(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, str):
+            chunks.append(value)
+            return
+        if isinstance(value, dict):
+            # Tool results arrive in this envelope; the parts are inside ``content``.
+            if value.get("_multimodal") is True and isinstance(value.get("content"), list):
+                _walk(value["content"])
+                return
+            kind = str(value.get("type") or "").lower()
+            if kind in {"text", "input_text", "output_text"}:
+                chunk = value.get("text")
+                if isinstance(chunk, str):
+                    chunks.append(chunk)
+                return
+            if kind in {"image_url", "input_image", "image"}:
+                flags["image"] = True
+                return
+            if kind in {"input_audio", "audio"}:
+                flags["audio"] = True
+                return
+            if kind in {"file", "input_file", "document"}:
+                flags["file"] = True
+                return
+            # Generic envelope ({"content": [...]}, {"parts": [...]}) or a bare {"text": ...}.
+            for key in ("text", "content", "parts"):
+                if key in value:
+                    _walk(value[key])
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _walk(item)
+            return
+        chunks.append(str(value))
+
+    _walk(payload)
+    return "\n".join(c for c in chunks if c), flags["image"], flags["audio"], flags["file"]
+
+
 def classify_request(
-    text: str,
+    text: Any,
     *,
     has_images: bool = False,
     has_audio: bool = False,
@@ -143,9 +202,13 @@ def classify_request(
 
     Length is a weak signal on its own — a short question can need deep reasoning and a long
     one can be a copy-paste — so the tier comes from the strongest signal present, and length
-    only breaks ties.
+    only breaks ties. ``text`` may be a string or a content-parts list; modality flags found
+    in the parts are OR'd with the caller's explicit flags.
     """
-    body = text or ""
+    body, part_images, part_audio, part_files = _content_parts(text)
+    has_images = has_images or part_images
+    has_audio = has_audio or part_audio
+    has_files = has_files or part_files
     tokens = estimate_tokens(body)
     reasons: List[str] = []
     tier = 1  # routine
@@ -269,6 +332,15 @@ def score_model(option: ModelOption, profile: RequestProfile, cheapest: float,
     return capability - unknown - cost_penalty
 
 
+def _candidate_key(option: ModelOption) -> str:
+    """Provider-qualified sort key, spelled exactly as the other host's ``ModelCandidate.key``.
+
+    Sorting on the joined string (not on a ``(provider, name)`` tuple) matters: when one
+    provider name is a prefix of another the delimiter orders the two lists differently, so
+    the tuple form and the string form would disagree on the same tie.
+    """
+    return f"{option.provider}/{option.name}"
+
 
 def rank_candidates(
     options: Sequence[ModelOption],
@@ -288,7 +360,10 @@ def rank_candidates(
     fallback_cost = statistics.median(costs) if costs else 0.0
     ranked = sorted(
         ((score_model(o, profile, cheapest, fallback_cost, cost_weight), o) for o in eligible),
-        key=lambda pair: (-pair[0], pair[1].name))
+        # Total order on the provider-qualified key: same score and same model name from two
+        # providers must still resolve the same way on both hosts. No latency term:
+        # ``latency_ms`` is not read anywhere.
+        key=lambda pair: (-pair[0], _candidate_key(pair[1])))
     return ranked, cheapest, fallback_cost
 
 
@@ -297,6 +372,7 @@ def select_model(
     profile: RequestProfile,
     *,
     current: Optional[str] = None,
+    current_provider: Optional[str] = None,
     min_improvement: float = 0.15,
     settings: Optional["RoutingSettings"] = None,
 ) -> RoutingDecision:
@@ -316,20 +392,27 @@ def select_model(
     best_score, best = ranked[0]
     if current:
         for rank_score, option in ranked:
-            if option.name == current:
-                if option.name == best.name:
-                    return RoutingDecision(
-                        model=current, provider=option.provider,
-                        reason="current model is already the best for this request",
-                        score=rank_score, profile=profile, candidates=len(ranked),
-                        skip_reason=SKIP_ALREADY_CURRENT)
-                if rank_score >= best_score - threshold:
-                    return RoutingDecision(
-                        model=current, provider=option.provider,
-                        reason=f"keeping current model (within {threshold:.2f} of best)",
-                        score=rank_score, profile=profile, candidates=len(ranked),
-                        skip_reason=SKIP_WITHIN_THRESHOLD)
-                break
+            if option.name != current:
+                continue
+            # Incumbent identity is (provider, model). One model id can be offered by two
+            # providers, and a name-only match both reports a provider the session is not on
+            # and hides a cross-provider move to an identically named model. Name-only is the
+            # fallback for callers that cannot tell us the provider.
+            if current_provider and option.provider and option.provider != current_provider:
+                continue
+            if option is best:
+                return RoutingDecision(
+                    model=current, provider=option.provider,
+                    reason="current model is already the best for this request",
+                    score=rank_score, profile=profile, candidates=len(ranked),
+                    skip_reason=SKIP_ALREADY_CURRENT)
+            if rank_score >= best_score - threshold:
+                return RoutingDecision(
+                    model=current, provider=option.provider,
+                    reason=f"keeping current model (within {threshold:.2f} of best)",
+                    score=rank_score, profile=profile, candidates=len(ranked),
+                    skip_reason=SKIP_WITHIN_THRESHOLD)
+            break
     reason = (f"best of {len(ranked)} eligible for {profile.tier}"
               + (f" ({', '.join(profile.reasons)})" if profile.reasons else ""))
     return RoutingDecision(
@@ -582,8 +665,11 @@ def moa_active(agent: Any) -> bool:
     return False
 
 
-def maybe_apply_model_routing(agent: Any, text: str) -> Optional[RoutingDecision]:
+def maybe_apply_model_routing(agent: Any, text: Any) -> Optional[RoutingDecision]:
     """Apply routing for one turn when enabled. Returns the decision, or None if inert.
+
+    ``text`` is normally a string but may be a multi-part content list (vision via the
+    OpenAI-compatible server), so it is passed through unmodified rather than coerced.
 
     Switches through the agent's existing ``switch_model`` so credential pools, prompt-cache
     flags and the compressor are rebuilt exactly as a manual switch would rebuild them. Any
@@ -620,10 +706,18 @@ def maybe_apply_model_routing(agent: Any, text: str) -> Optional[RoutingDecision
         if not options:
             return None
         profile = classify_request(text or "")
+        current_provider = getattr(agent, "provider", None)
         decision = select_model(
             options, profile,
-            current=getattr(agent, "model", None), settings=st)
-        if not decision.model or decision.model == getattr(agent, "model", None):
+            current=getattr(agent, "model", None),
+            current_provider=current_provider, settings=st)
+        # Same identity rule as the selector: switching to an identically named model on a
+        # different provider is a real switch, so the name alone is not "unchanged".
+        same_identity = (
+            decision.model == getattr(agent, "model", None)
+            and (not current_provider or not decision.provider
+                 or decision.provider == current_provider))
+        if not decision.model or same_identity:
             if decision.skip_reason:
                 logger.debug("model routing: keeping %s (%s)", getattr(agent, "model", None),
                              decision.skip_reason)
@@ -639,7 +733,7 @@ def maybe_apply_model_routing(agent: Any, text: str) -> Optional[RoutingDecision
 
 def explain_routing(
     config: Dict[str, Any],
-    text: str,
+    text: Any,
     *,
     current: Optional[str] = None,
     provider: str = "",
@@ -663,7 +757,7 @@ def explain_routing(
         cands = options_from_catalog(provider)
         source = "catalog"
     ranked, cheapest, fallback_cost = rank_candidates(cands, prof, st)
-    decision = select_model(cands, prof, current=current, settings=st)
+    decision = select_model(cands, prof, current=current, current_provider=provider, settings=st)
     # Keyed by identity: two providers can expose the same model name, and a name-keyed map
     # made both rows print the same score.
     scores = {id(o): sc for sc, o in ranked}
@@ -686,9 +780,13 @@ def explain_routing(
             "priced": priced,
             "charged_as": ("published" if priced else "median_unknown"),
             "unknown_capabilities": unknown,
-            "excluded_reason": None if eligible else _exclusion_reason(opt, prof, st),
+            # "" when eligible, so the field is always a string (contract: one row per
+            # candidate, excluded_reason empty when eligible).
+            "excluded_reason": "" if eligible else _exclusion_reason(opt, prof, st),
         })
-    rows.sort(key=lambda r: (not r["eligible"], -(r["score"] or -99), r["model"]))
+    rows.sort(key=lambda r: (not r["eligible"],
+                             -(r["score"] if r["score"] is not None else -99),
+                             f"{r['provider']}/{r['model']}"))
     return {
         "enabled": st.enabled,
         "settings": {
@@ -715,7 +813,9 @@ def explain_routing(
         # section reports "disabled" even though the hypothetical selection is still computed.
         "skip_reason": decision.skip_reason if st.enabled else SKIP_DISABLED,
         "current": current,
-        "kept_current": bool(decision.model and decision.model == current),
+        "kept_current": bool(
+            decision.model and decision.model == current
+            and (not provider or not decision.provider or decision.provider == provider)),
         "eligible_count": len(ranked),
         "candidates": rows,
     }
