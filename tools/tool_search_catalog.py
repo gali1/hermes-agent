@@ -20,7 +20,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import snowballstemmer
+try:  # optional: pure Python, but absent from lean/3.12 installs
+    import snowballstemmer
+except ImportError:  # no stemmer -> raw tokens still index and match
+    snowballstemmer = None
 
 from tools.delegate_tool_results import _looks_like_error_output
 
@@ -57,8 +60,11 @@ def _stem(token: str) -> str:
     """Stem one token, memoized across stateless catalog rebuilds. Snowball stemmers carry
     mutable parsing state and bridge dispatch runs on parallel tool-call threads, so the
     stemmer is one-per-thread, created lazily."""
+    stemmer_mod = snowballstemmer  # local: narrows cleanly for type checkers
+    if stemmer_mod is None:  # no stemmer installed: the raw token is the key
+        return token
     if getattr(_thread_local, "stemmer", None) is None:
-        _thread_local.stemmer = snowballstemmer.stemmer("english")
+        _thread_local.stemmer = stemmer_mod.stemmer("english")
     return _thread_local.stemmer.stemWord(token)
 
 

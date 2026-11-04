@@ -1267,3 +1267,53 @@ class TestZeroMatchSelectorWiring:
         monkeypatch.setattr(aux, "call_llm",
                             lambda **kw: "I suggest image_generate please", raising=True)
         assert "image_generate" in tool_search.build_llm_selector()("q", "listing")
+
+
+class TestOptionalStemmer:
+    """snowballstemmer is marker-gated (py3.12+ installs may lack it). Importing the
+    catalog must survive its absence — an unconditional import broke the whole
+    deferred-tool bridge at COLLECTION time before this guard existed."""
+
+    DEFS = (
+        _td("github_create_issue", "Open a new issue in a GitHub repository",
+            {"title": {"type": "string"}, "body": {"type": "string"}}),
+        _td("slack_send_message", "Post a message into a Slack channel",
+            {"channel": {"type": "string"}, "text": {"type": "string"}}),
+    )
+
+    def test_module_imports_when_stemmer_missing(self):
+        import subprocess
+        import textwrap
+        script = textwrap.dedent(
+            """
+            import sys
+            class _BlockSnowball:
+                def find_spec(self, name, path=None, target=None):
+                    if name.split(".")[0] == "snowballstemmer":
+                        raise ImportError("blocked: " + name)
+                    return None
+            sys.meta_path.insert(0, _BlockSnowball())
+            sys.path.insert(0, %r)
+            import tools.tool_search as ts
+            from tools import tool_search_catalog as cat
+            assert cat.snowballstemmer is None
+            assert cat._stem("Issues") == "Issues"  # raw token passthrough
+            print("bridge-ok", ts.TOOL_SEARCH_NAME)
+            """
+        ) % _REPO_ROOT
+        out = subprocess.run([sys.executable, "-c", script],
+                             capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stderr
+        assert "bridge-ok tool_search" in out.stdout
+
+    def test_search_returns_hits_without_stemmer(self, monkeypatch):
+        from tools import tool_search_catalog as cat
+        from tools.tool_search import search_catalog
+        monkeypatch.setattr(cat, "snowballstemmer", None)
+        cat._stem.cache_clear()
+        try:
+            hits = search_catalog(cat.build_catalog(list(self.DEFS)),
+                                  "create a github issue", limit=3)
+            assert hits and hits[0].name == "github_create_issue"
+        finally:
+            cat._stem.cache_clear()  # drop raw-token entries from the shared cache
