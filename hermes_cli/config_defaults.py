@@ -2099,7 +2099,9 @@ DEFAULT_CONFIG = {
             # Opt-in: re-order the hits a query already admitted by each tool's recorded success
             # rate (newest calls only; neutral below 3 calls and at >=40% success). Applied after
             # admission, so it can never hide a hit — lexical ranking until this is set.
-            "reliability": False,
+            # ``reliability_rerank`` is the canonical key; ``reliability`` is a deprecated
+            # alias still honoured (canonical wins when both are set).
+            "reliability_rerank": False,
             # Opt-in: when lexical search matches nothing, make ONE bounded model call over the
             # catalog listing to recover tools by name. Steady-state cost is unchanged.
             "zero_match_llm": False,

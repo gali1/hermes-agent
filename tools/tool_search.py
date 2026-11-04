@@ -38,6 +38,60 @@ logger = logging.getLogger("tools.tool_search")
 _MAX_QUERIES_PER_CALL = 7
 _MAX_DESCRIBE_NAMES_PER_CALL = 10
 
+# Canonical name of the reliability-ranking flag, plus the pre-rename key kept as a
+# deprecated alias. Config drift here is silent by nature (a misspelled opt-in just does
+# nothing), so every non-canonical shape is logged instead of being swallowed.
+RELIABILITY_FLAG = "reliability_rerank"
+RELIABILITY_FLAG_LEGACY = "reliability"
+_RELIABILITY_TRUTHY = frozenset({"1", "true", "yes", "on"})
+# Every key from_raw actually honours. Anything else under tools.tool_search is a typo or a
+# key from another release; it is reported (once, naming it) because a setting the user
+# believes is active but is not is worse than a warning.
+_KNOWN_TOOL_SEARCH_KEYS = frozenset({
+    "enabled", "threshold_pct", "search_default_limit", "max_search_limit", "listing",
+    "listing_max_tokens", "defer", "zero_match_llm", RELIABILITY_FLAG,
+    RELIABILITY_FLAG_LEGACY,
+})
+
+
+def _flag_truthy(value: Any) -> bool:
+    """Bool-ish parsing shared by the flag keys (accepts YAML true/on/1/yes)."""
+    return str(value).strip().lower() in _RELIABILITY_TRUTHY
+
+
+def _reliability_flag(raw: Dict[str, Any]) -> bool:
+    """Resolve ``reliability_rerank`` with ``reliability`` as a deprecated alias.
+
+    Presence, not validity, decides which key speaks: a canonical key set to garbage means
+    False rather than silently falling back to a stale alias. Absent everywhere means False.
+    """
+    has_canonical = RELIABILITY_FLAG in raw
+    has_legacy = RELIABILITY_FLAG_LEGACY in raw
+    if has_canonical and has_legacy:
+        logger.warning(
+            "tools.tool_search sets both %r and its deprecated alias %r - both were read, "
+            "%r decides.", RELIABILITY_FLAG, RELIABILITY_FLAG_LEGACY, RELIABILITY_FLAG)
+    elif has_legacy:
+        logger.warning(
+            "tools.tool_search.%s is a deprecated alias - use tools.tool_search.%s instead.",
+            RELIABILITY_FLAG_LEGACY, RELIABILITY_FLAG)
+    if has_canonical:
+        return _flag_truthy(raw[RELIABILITY_FLAG])
+    if has_legacy:
+        return _flag_truthy(raw[RELIABILITY_FLAG_LEGACY])
+    return False
+
+
+def _warn_unknown_keys(raw: Dict[str, Any]) -> None:
+    """Warn once (naming every offender) about keys tool_search does not implement."""
+    unknown = sorted(str(k) for k in raw if k not in _KNOWN_TOOL_SEARCH_KEYS)
+    if not unknown:
+        return
+    logger.warning(
+        "tools.tool_search has unknown key(s) %s - NOT in effect (no such setting; known "
+        "keys: %s).", ", ".join(repr(k) for k in unknown),
+        ", ".join(sorted(_KNOWN_TOOL_SEARCH_KEYS)))
+
 
 @dataclass(frozen=True)
 class ToolSearchConfig:
@@ -55,6 +109,8 @@ class ToolSearchConfig:
     # Opt-in: re-order already-admitted hits by recorded tool success (see
     # load_tool_reliability). Off by default — ranking stays purely lexical until asked for,
     # and because the factor is applied after the admission gate it can never hide a hit.
+    # Canonical key is ``reliability_rerank``; ``reliability`` is a deprecated alias resolved
+    # by _reliability_flag (canonical wins, alias warns).
     reliability: bool = False
     # Opt-in: on a zero-match query, make ONE bounded model call over the catalog listing to
     # recover candidates whose names are recognisable but whose descriptions did not match.
@@ -72,6 +128,7 @@ class ToolSearchConfig:
         values fall back to safe defaults — a config typo must not break the agent."""
         if not isinstance(raw, dict):  # legacy bool / None
             raw = {"enabled": "off" if raw is False else "auto"}
+        _warn_unknown_keys(raw)
         max_search_limit = _clamped_int(raw.get("max_search_limit"), 25, 1, 50)
         defer_raw = raw.get("defer")
         if defer_raw is not None and not isinstance(defer_raw, (list, tuple, set)):
@@ -92,8 +149,7 @@ class ToolSearchConfig:
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
                          if isinstance(defer_raw, (list, tuple, set)) else None),
-            reliability=str(raw.get("reliability", "")).strip().lower()
-                        in ("1", "true", "yes", "on"),
+            reliability=_reliability_flag(raw),
             zero_match_llm=str(raw.get("zero_match_llm", "")).strip().lower()
                         in ("1", "true", "yes", "on"))
 
