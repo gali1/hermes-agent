@@ -161,15 +161,16 @@ from one vocabulary both sides accept: `no_candidates`, `no_eligible_model`,
 `already_current`, `within_stability_threshold`, `moa_active`, `disabled`, `error`
 (oklab-1 pins the set in `SKIP_REASONS`).
 
-**`moa_active` — recorded on oklab-1, still absent from any dict.** The skip used to be
+**`moa_active` — implemented on oklab-1, still absent on bro-2.** The skip used to be
 invisible on both sides (oklab-1 at the call site, bro-2 deep in the router where it
-returns `None` before a `Decision` exists). oklab-1 now delegates the decision into
+returns `None` before a `Decision` exists). oklab-1 now (a) delegates the decision into
 `route_turn(moa_active=...)`, which records `ROUTING_SKIP_ATTR`
-(`_last_routing_skip_reason = "moa_active"`) before returning `None`, so the reason
-survives the turn. What is still missing on **both** sides is the dict row: no
-`routing_report`/`explain_routing` output carries it yet. C7 holds everywhere; C10's
-"every skip is explainable" is satisfied for logs and agent state, not for the machine
-surface. Open item below.
+(`_last_routing_skip_reason`) before returning `None`, and (b) emits it in the machine
+surface: `routing_report(..., moa_active=True)` returns `skip_reason: "moa_active"`,
+`selected: null`, `kept_current: true` and a human `reason`, while keeping the
+candidate rows so "what would routing have chosen" stays answerable — a skip must not
+look like an empty catalog. bro-2 still returns `None` before any decision exists, so no
+dict there can carry the reason. C10 is satisfied on oklab-1 and open on bro-2.
 
 **The machine surface is a dict, and it is normative.** oklab-1 calls it
 `routing_report()` (`model_router.py:2361-2455`), bro-2 calls it `explain_routing()`
@@ -227,8 +228,9 @@ Still open:
    bro-2 still cannot state modality for attachments delivered beside a *string* prompt,
    because `image_routing.py` runs after selection. Owner: bro-2, using oklab-1's helper
    as the reference shape.
-2. **C10 `moa_active` dict row** — recorded in agent state on oklab-1, but neither side
-   surfaces it in the machine-readable report. Owner: both.
+2. **C10 `moa_active` dict row** — done on oklab-1 (`routing_report(moa_active=True)`);
+   bro-2 returns before a decision object exists, so it needs the same early-skip record.
+   Owner: bro-2.
 2. **bro-2 defect — fixed, wiring still open** — `classify_request` no longer raises on a
    content-parts list and derives the modality flags from the parts (regression tests in
    `tests/agent/test_model_routing.py`). What remains is item 1's string-prompt path.

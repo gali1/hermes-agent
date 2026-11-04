@@ -1477,3 +1477,18 @@ def test_moa_skip_is_recorded_rather_than_silent():
     agent = Agent()
     assert mr.route_turn(agent, "hello", moa_active=True) is None
     assert getattr(agent, mr.ROUTING_SKIP_ATTR) == "moa_active"
+
+
+def test_moa_skip_appears_in_the_machine_report():
+    """C10: the skip must be in the dict, not only in agent state."""
+    cfg = {"smart_model_routing": {"enabled": True, "models": [
+        {"name": "small", "provider": "test", "cost_in": 0.1, "cost_out": 0.2},
+        {"name": "big", "provider": "test", "cost_in": 5.0, "cost_out": 9.0},
+    ]}}
+    report = mr.routing_report(cfg, "hello", moa_active=True)
+    assert report["skip_reason"] == "moa_active"
+    assert report["selected"] is None
+    assert report["kept_current"] is True
+    assert "mixture-of-agents" in report["reason"]
+    # the hypothetical rows stay, so the skip is not mistaken for "no candidates"
+    assert report["candidates"]

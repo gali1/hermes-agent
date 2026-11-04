@@ -2514,6 +2514,7 @@ def routing_report(
     provider: str = "",
     current_model: str = "",
     candidates: Optional[Sequence[str]] = None,
+    moa_active: bool = False,
 ) -> Dict[str, Any]:
     """The ``hermes model routing status --json`` document.
 
@@ -2576,6 +2577,18 @@ def routing_report(
         # Disabled is a strict no-op for execution, but the report still says
         # what routing WOULD do — with "disabled" as the skip reason.
         skip_reason = "disabled"
+
+    if moa_active:
+        # C10: a Mixture-of-Agents turn is skipped before any candidate can be
+        # chosen. Say so in the machine surface instead of leaving the reader to
+        # infer it from a decision that never happened. The candidate rows stay:
+        # they are the answer to "what would routing have chosen", and hiding them
+        # would make the skip look like a failure.
+        skip_reason = "moa_active"
+        selected = None
+        selected_provider = ""
+        kept_current = True
+        reason = "mixture-of-agents is active this turn; model routing is skipped"
 
     return {
         "enabled": enabled,
