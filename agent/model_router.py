@@ -532,9 +532,14 @@ class ModelCandidate:
     tool_support: Optional[CapabilityState] = None
     #: False when the provider is disabled/without credentials.
     enabled: bool = True
-    #: Optional measured latency in ms (used only as a tie-breaker).
+    #: Optional measured latency in ms.  NOT populated by ``candidates_from_specs`` and
+    #: never read by the ranker, so it is not a tie-breaker today: equal scores resolve
+    #: alphabetically in ``rank_candidates``.  The field is kept for API compatibility;
+    #: do not document it as behaviour until something fills it in.
     latency_ms: Optional[float] = None
-    #: Optional historical success rate 0..1; None means unknown.
+    #: Optional historical success rate 0..1; None means unknown.  Only
+    #: ``smart_model_routing.reliability`` (operator config) can currently supply a
+    #: value — nothing measures outcomes and assigns this field.
     reliability: Optional[float] = None
     #: Declared overrides from ``smart_model_routing.models[]`` (or its
     #: translated legacy equivalent).  ``None`` fields are "not declared".
@@ -1113,6 +1118,10 @@ SKIP_REASONS = (
     "no_eligible_model",
     "already_current",
     "within_stability_threshold",
+    # Contract C10 lists this reason; nothing emits it yet (the MoA path does not
+    # consult the router), but the vocabulary must accept it or a future emitter
+    # would be rejected for a reason the contract already promises.
+    "moa_active",
     "error",
 )
 
@@ -1683,10 +1692,15 @@ def routing_pool(
 ) -> Tuple[List[str], str]:
     """The models routing may consider for ``provider``, and the pool scope.
 
-    ``preferred_models_only: true`` (the default) is enforced here and nowhere
-    else: the pool is exactly the models the operator listed for the provider
-    (plus the model currently in use, which is the incumbent, not a new
-    choice), so routing can never select a model that is not on that list.
+    ``preferred_models_only`` defaults to **false** (shared contract C6). A provider
+    that declares exactly one model is still treated as ``"preferred"`` — there is no
+    choice to make and the catalog scan would be wasted — unless the operator wrote
+    the key explicitly, which ``RoutingConfig.preferred_models_only_explicit`` records.
+
+    ``preferred_models_only: true`` is enforced here and nowhere else: the pool is
+    exactly the models the operator listed for the provider (plus the model currently
+    in use, which is the incumbent, not a new choice), so routing can never select a
+    model that is not on that list.
 
     With ``preferred_models_only: false`` the returned scope is
     ``"preferred+catalog"``: preferred models are still tried first, and the

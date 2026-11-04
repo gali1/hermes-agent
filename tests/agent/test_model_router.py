@@ -1196,9 +1196,11 @@ def test_error_skip_reason_is_used_when_selection_blows_up(monkeypatch):
 
 
 def test_skip_reason_constants_match_the_shared_contract():
+    # C10 names ``moa_active`` as a skip reason, so the vocabulary must carry it even
+    # though no code path emits it yet (the MoA path does not consult the router).
     assert set(mr.SKIP_REASONS) == {
         "", "disabled", "no_candidates", "no_eligible_model", "already_current",
-        "within_stability_threshold", "error",
+        "within_stability_threshold", "moa_active", "error",
     }
 
 
@@ -1328,3 +1330,42 @@ def test_single_model_pool_widens_only_when_explicitly_asked(patched_candidates)
     assert mr.RoutingConfig.from_dict(cfg["smart_model_routing"]).preferred_models_only_explicit
     _pool, scope = mr.routing_pool(cfg, "test", current_model="weak")
     assert scope == "preferred+catalog"  # opt-in widening is honoured
+
+
+# ---------------------------------------------------------------------------
+# Documented behaviour that the ranker must actually keep (C10 vocabulary and the
+# two fields the contract used to describe as behaviour).
+# ---------------------------------------------------------------------------
+
+
+def test_skip_reasons_cover_the_contract_c10_vocabulary():
+    documented = {
+        "within_stability_threshold",
+        "moa_active",
+        "disabled",
+        "error",
+    }
+    assert documented <= set(mr.SKIP_REASONS)
+
+
+def test_equal_scores_resolve_alphabetically_not_by_latency():
+    """``latency_ms`` is documented as an unused field, and the real tie-break is the
+    model key. If someone later implements the latency tie-break, this test fails and
+    points at the contract line that has to change with it."""
+    profile = mr.classify_request("What is 15 multiplied by 8?")
+    slow_alpha = mr.ModelCandidate("test", "alpha", info("alpha"), latency_ms=900.0)
+    fast_zeta = mr.ModelCandidate("test", "zeta", info("zeta"), latency_ms=10.0)
+    selection = mr.rank_candidates(profile, [fast_zeta, slow_alpha])
+    assert selection.model == "alpha"          # declaration order and latency both ignored
+    reversed_selection = mr.rank_candidates(profile, [slow_alpha, fast_zeta])
+    assert reversed_selection.model == "alpha"
+
+
+def test_candidate_reliability_is_only_operator_config():
+    """Nothing measures outcomes, so a candidate carries no reliability of its own and
+    the only source is ``smart_model_routing.reliability``."""
+    profile = mr.classify_request("What is 15 multiplied by 8?")
+    plain = mr.ModelCandidate("test", "m", info("m"))
+    assert plain.reliability is None
+    cfg = mr.RoutingConfig.from_dict({"reliability": {"m": 0.9}})
+    assert mr._reliability_of(plain, cfg) == 0.9
