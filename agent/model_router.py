@@ -41,7 +41,7 @@ import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from statistics import median
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "CapabilityState",
@@ -60,12 +60,16 @@ __all__ = [
     "classify_request",
     "configured_models",
     "declared_model_list",
+    "default_weights",
     "estimate_cost",
     "estimate_cost_breakdown",
     "expected_retry_fraction",
     "explain",
     "filter_eligible",
     "is_enabled",
+    "parse_model_ids",
+    "parse_reliability",
+    "parse_weights",
     "pricing_for",
     "rank_candidates",
     "resolve_candidates",
@@ -1219,6 +1223,85 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(v) for v in value]
     return value
+
+
+# ---------------------------------------------------------------------------
+# Typed-input parsers — one implementation for every surface
+# ---------------------------------------------------------------------------
+#
+# ``exclude``, ``weights`` and ``reliability`` are read by the engine, so every
+# interface that can set them (CLI flags, the CLI's interactive flow, the
+# gateway's preferences steps) must read a typed value the same way.  Parsing
+# lives here, next to the schema, rather than in each surface: two parsers is
+# how ``a,b`` starts meaning different things in two places.
+
+def parse_model_ids(text: Any) -> List[str]:
+    """Comma- or whitespace-separated model ids → ordered, de-duplicated list.
+
+    ``None`` and ``""`` yield ``[]`` (an explicit "none"), so a caller can use
+    one parser for "set" and "clear".
+    """
+    if text is None:
+        return []
+    chunks = [str(chunk) for chunk in text] if isinstance(text, (list, tuple)) else [str(text)]
+    out: List[str] = []
+    for chunk in chunks:
+        for part in re.split(r"[,\s]+", chunk.strip()):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def _parse_assignments(text: Any, *, what: str) -> Dict[str, Any]:
+    """``name=value`` pairs → mapping, numbers where they parse.
+
+    A missing ``=`` raises :class:`ValueError` (a typed value the user can fix
+    without reading the source).  A value that is not a number is passed
+    through as a string so :func:`validate_routing` names the offending key and
+    the accepted range instead of a second, differently-worded parser message.
+    """
+    pairs: Dict[str, Any] = {}
+    chunks = [str(chunk) for chunk in text] if isinstance(text, (list, tuple)) else [str(text or "")]
+    for chunk in chunks:
+        for part in re.split(r"[,\s]+", chunk.strip()):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" not in part:
+                raise ValueError(f"{what} entry {part!r} must look like name=value")
+            name, _, raw = part.partition("=")
+            name, raw = name.strip(), raw.strip()
+            if not name:
+                raise ValueError(f"{what} entry {part!r} has no name")
+            try:
+                pairs[name] = float(raw)
+            except (TypeError, ValueError):
+                pairs[name] = raw
+    return pairs
+
+
+def default_weights() -> Dict[str, float]:
+    """A copy of the engine's default scoring weights (never the shared dict)."""
+    return dict(_DEFAULT_WEIGHTS)
+
+
+def parse_weights(text: Any, *, base: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Merge ``capability=0.5,cost=0.3`` over *base* (the current weights).
+
+    Only the dimensions named in the text change; the rest keep their current
+    (or default) value, so a user can tune one number without retyping five.
+    """
+    merged: Dict[str, Any] = dict(base or {})
+    merged.update(_parse_assignments(text, what="weights"))
+    return merged
+
+
+def parse_reliability(text: Any, *, base: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """Merge ``model=0.98,other=0.95`` over *base* (declared success rates)."""
+    merged: Dict[str, Any] = dict(base or {})
+    merged.update(_parse_assignments(text, what="reliability"))
+    return merged
 
 
 def update_routing(

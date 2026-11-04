@@ -1517,6 +1517,9 @@ class GatewayBusySessionMixin:
             f"{'on' if settings.get('cost_optimization', True) else 'off'}"
         )
         lines.append(f"   Models: {cls._model_routing_scope_text(settings)}")
+        excluded = [str(m) for m in ((settings or {}).get("exclude") or [])]
+        if excluded:
+            lines.append(f"   Never auto-select: {', '.join(excluded)}")
         candidates = report.get("candidates") or []
         lines.append(
             f"   Candidates: {report.get('eligible_count', 0)} eligible of {len(candidates)} considered"
@@ -1536,7 +1539,8 @@ class GatewayBusySessionMixin:
     def _model_routing_pending_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
         """``key: before → after`` for the keys the flow wants to write."""
         order = ("enabled", "strategy", "stability_threshold", "models", "preferred_models_only",
-                 "cost_optimization", "switch_on_cost", "llm_assisted_classification")
+                 "cost_optimization", "switch_on_cost", "allow_unknown_metadata",
+                 "exclude", "weights", "reliability")
         rows = []
         for key in order:
             if key not in changes:
@@ -1549,10 +1553,29 @@ class GatewayBusySessionMixin:
         return "\n".join(rows)
 
     @staticmethod
-    def _model_routing_value_text(key: str, value: Any) -> str:
+    def _model_routing_map_text(mapping: Any, sep: str = ", ") -> str:
+        """``{capability: 0.45, ...}`` → ``capability=0.45, ...`` (sorted, stable)."""
+        if not isinstance(mapping, dict) or not mapping:
+            return ""
+        parts = []
+        for key, value in sorted(mapping.items()):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                parts.append(f"{key}={float(value):g}")
+            else:
+                parts.append(f"{key}={value}")
+        return sep.join(parts)
+
+    @classmethod
+    def _model_routing_value_text(cls, key: str, value: Any) -> str:
         if key == "models":
             models = [str(m) for m in (value or [])]
             return "all eligible" if not models else ", ".join(models)
+        if key == "exclude":
+            excluded = [str(m) for m in (value or [])]
+            return "(none)" if not excluded else ", ".join(excluded)
+        if key in ("weights", "reliability"):
+            text = cls._model_routing_map_text(value) if isinstance(value, dict) else str(value)
+            return text or "(none)"
         if isinstance(value, bool):
             return "on" if value else "off"
         return str(value)
@@ -1577,6 +1600,9 @@ class GatewayBusySessionMixin:
         def mark(key: str) -> str:
             return " *" if key in changes else ""
         pending = cls._model_routing_pending_text(settings, changes)
+        excluded = [str(m) for m in (settings.get("exclude") or [])]
+        weights_text = cls._model_routing_map_text(settings.get("weights"), sep=" · ") or "(none)"
+        reliability_text = cls._model_routing_map_text(settings.get("reliability")) or "(none — 0.5 assumed)"
         lines = [
             "Preferences (reply /model-routing <number>; * = pending change):",
             f"  1 Strategy — {settings.get('strategy', 'automatic')}{mark('strategy')}",
@@ -1585,13 +1611,16 @@ class GatewayBusySessionMixin:
             f"{mark('cost_optimization')}",
             f"  4 Mid-session cost downgrade — {'on' if settings.get('switch_on_cost') else 'off'}"
             f"{mark('switch_on_cost')}",
-            f"  5 LLM-assisted classification — "
-            f"{'on' if settings.get('llm_assisted_classification') else 'off'}"
-            f"{mark('llm_assisted_classification')}",
-            f"  6 Route only among my selected models — "
+            f"  5 Route only among my selected models — "
             f"{'yes' if settings.get('preferred_models_only') else 'no (widen when needed)'}"
             f"{mark('preferred_models_only')}",
-            "  7 Back to the main menu",
+            f"  6 Allow unknown capability metadata — "
+            f"{'yes (unknown is penalised, not disqualified)' if settings.get('allow_unknown_metadata', True) else 'no (strict)'}"
+            f"{mark('allow_unknown_metadata')}",
+            f"  7 Never auto-select — {', '.join(excluded) if excluded else '(none)'}{mark('exclude')}",
+            f"  8 Scoring weights — {weights_text}{mark('weights')}",
+            f"  9 Declared reliability — {reliability_text}{mark('reliability')}",
+            "  10 Back to the main menu",
         ]
         if pending:
             lines += ["", "Pending (not saved yet):", pending]
@@ -1808,12 +1837,36 @@ class GatewayBusySessionMixin:
                 changes["cost_optimization"] = not bool(settings.get("cost_optimization", True))
             elif token in {"4", "downgrade"}:
                 changes["switch_on_cost"] = not bool(settings.get("switch_on_cost"))
-            elif token in {"5", "llm"}:
-                changes["llm_assisted_classification"] = not bool(
-                    settings.get("llm_assisted_classification"))
-            elif token in {"6", "scope"}:
+            elif token in {"5", "scope"}:
                 changes["preferred_models_only"] = not bool(settings.get("preferred_models_only"))
-            elif token in {"7", "back", "menu"}:
+            elif token in {"6", "unknown", "metadata"}:
+                changes["allow_unknown_metadata"] = not bool(
+                    settings.get("allow_unknown_metadata", True))
+            elif token in {"7", "exclude"}:
+                flow["step"] = "prefs_exclude"
+                touch(flow)
+                return ("Models that must never be auto-selected (they stay usable through an "
+                        "explicit model choice).\n"
+                        "Reply /model-routing exclude model-a,model-b — or "
+                        "/model-routing exclude none to clear, or cancel.")
+            elif token in {"8", "weights"}:
+                flow["step"] = "prefs_weights"
+                touch(flow)
+                return (
+                    "Scoring weights. Reply /model-routing weights capability=0.5,cost=0.3 — "
+                    "only the dimensions you name change: "
+                    + ", ".join(sorted(mr.default_weights()))
+                    + ".\nReply /model-routing weights default to reset them, or cancel."
+                )
+            elif token in {"9", "reliability"}:
+                flow["step"] = "prefs_reliability"
+                touch(flow)
+                return (
+                    "Declared success rate per model, used to price expected retries. "
+                    "Reply /model-routing reliability model-a=0.98,model-b=0.95 — or "
+                    "/model-routing reliability none to clear, or cancel."
+                )
+            elif token in {"10", "back", "menu"}:
                 flow["step"] = "menu"
                 touch(flow)
                 return self._model_routing_menu_text(settings, changes)
@@ -1821,6 +1874,9 @@ class GatewayBusySessionMixin:
                 return self._model_routing_prefs_text(settings, changes)
             touch(flow)
             return self._model_routing_prefs_text(settings, changes)
+
+        if step in ("prefs_exclude", "prefs_weights", "prefs_reliability"):
+            return self._model_routing_apply_prefs_value(flow, settings, changes, step, args)
 
         if step == "prefs_strategy":
             if token not in self._MODEL_ROUTING_STRATEGIES:
@@ -1854,6 +1910,60 @@ class GatewayBusySessionMixin:
 
         finish()
         return self._model_routing_state_text(report, settings)
+
+    def _model_routing_apply_prefs_value(self, flow: Dict[str, Any], settings: Dict[str, Any],
+                                         changes: Dict[str, Any], step: str, args: str) -> str:
+        """Apply one typed value (exclude / weights / reliability) from the prefs flow.
+
+        Parsing is ``agent.model_router``'s, validation is the writer's own
+        ``validate_routing`` — the same pair the CLI uses, so a payload the chat
+        accepts is one ``hermes model routing configure`` accepts too.  Nothing
+        is written here: the value joins the pending ``changes`` and the final
+        confirmation still decides.
+        """
+        from agent import model_router as mr
+
+        keyword = step.split("_", 1)[1]
+        text = (args or "").strip()
+        if text.lower().startswith(keyword):
+            text = text[len(keyword):].strip()
+
+        def retry(message: str) -> str:
+            flow["step"] = "prefs"
+            flow["ts"] = time.time()
+            return f"{message}\n\n" + self._model_routing_prefs_text(settings, changes)
+
+        if not text:
+            return retry(f"Reply /model-routing {keyword} <value>, or /model-routing cancel.")
+
+        cfg = self._model_routing_load_config()
+        raw_block = dict(cfg.get("smart_model_routing") or {}) if isinstance(cfg, dict) else {}
+        lowered = text.lower()
+        try:
+            if keyword == "exclude":
+                value = [] if lowered in {"none", "clear", "-"} else mr.parse_model_ids(text)
+            elif keyword == "weights":
+                if lowered in {"default", "reset", "-"}:
+                    value = mr.default_weights()
+                else:
+                    value = mr.parse_weights(
+                        text, base=raw_block.get("weights")
+                        if isinstance(raw_block.get("weights"), dict) else mr.default_weights())
+            else:  # reliability
+                value = {} if lowered in {"none", "clear", "-"} else mr.parse_reliability(
+                    text, base=raw_block.get("reliability")
+                    if isinstance(raw_block.get("reliability"), dict) else None)
+        except ValueError as err:
+            return retry(f"❌ {err}")
+
+        problems = mr.validate_routing({**raw_block, keyword: value})
+        if problems:
+            return retry("❌ Not accepted:\n" + "\n".join(f"   {p}" for p in problems))
+
+        changes[keyword] = value
+        flow["step"] = "prefs"
+        flow["ts"] = time.time()
+        return self._model_routing_prefs_text(settings, changes)
 
     @staticmethod
     def _model_routing_hypothetical(cfg: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any]:

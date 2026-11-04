@@ -261,7 +261,7 @@ class TestFlow:
         await _dispatch(runner, "/model-routing quality")
         await _dispatch(runner, "/model-routing 2")
         await _dispatch(runner, "/model-routing 0.4")
-        prompt = await _dispatch(runner, "/model-routing 7")  # back to menu
+        prompt = await _dispatch(runner, "/model-routing 10")  # back to menu (7–9 are the advanced settings)
         await _dispatch(runner, "/model-routing 2")  # disable -> confirm
         assert "strategy: automatic → quality" in prompt
         assert "stability_threshold: 0.15 → 0.4" in prompt

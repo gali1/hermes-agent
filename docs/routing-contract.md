@@ -274,11 +274,42 @@ Two small truths that the CLI surface must keep:
   interactive flow; with no terminal it prints the read-only status instead of blocking.
   `status` stays reachable as its own verb in both cases.
 
+## C15 — Every runtime-read setting is reachable, and nothing else is a control
+Directive §4 in one line: a control exists only for a setting the engine reads, and
+every setting the engine reads has a control. On oklab-1 that means:
+
+* **Reachable from both interactive surfaces.** `enabled`, `strategy`,
+  `stability_threshold`, `cost_optimization`, `preferred_models_only`,
+  `switch_on_cost`, `allow_unknown_metadata`, `exclude`, `weights` and `reliability`
+  are settable from `hermes model routing configure` (flags **and** the interactive
+  flow) and from `/model-routing` → Preferences. Every one of them is also settable
+  without a TTY, so the gateway, scripts and people share one code path.
+* **One parser, one writer.** Typed values (`exclude a,b`, `weights dim=value`,
+  `reliability model=rate`) are parsed by `agent.model_router.parse_model_ids` /
+  `parse_weights` / `parse_reliability` and written by `update_routing`. A surface
+  renders and dispatches; it does not decide what a payload means. The chat accepts
+  exactly what the CLI accepts, and both reject with `validate_routing`'s message.
+* **Weights are merged, never re-derived.** An edit starts from the values *as
+  written* in `smart_model_routing.weights`, so repeating the same command is a
+  no-op. Merging over the normalised effective mapping (which the reader rescales to
+  sum to 1) moves every number on each run and would rewrite the file forever.
+  `weights` applies under `strategy: automatic`; `cost` and `quality` substitute their
+  own fixed vectors by design, so a custom weight set under those strategies is inert
+  — the menu says which strategy is active for exactly that reason.
+* **No control for a key nothing reads.** `llm_assisted_classification` is still
+  parsed and round-tripped (an operator's file keeps its value) but no code path
+  consults it, so no menu offers it any more. C2 keeps classification deterministic.
+* **Nothing is written before the confirmation.** Pending values live in the flow
+  state only; Cancel, and a flow that times out, leave `config.yaml` byte-identical
+  (C13).
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
 extensions. They may change *which eligible model wins* — an additive term promotes as
-well as demotes — but none may relax C1–C3 or C6.
+well as demotes — but none may relax C1–C3 or C6. Of these,
+`llm_assisted_classification` has no caller on either tree: it is accepted in config and
+reported, never acted on, and therefore has no control on any surface (C15).
 
 ## Verification
 ```bash

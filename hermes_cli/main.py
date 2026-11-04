@@ -1948,6 +1948,12 @@ def _print_routing_status(config: dict, *, saved_note: bool | None = None) -> No
     print(f"  preferred models only:    {'yes' if cfg.preferred_models_only else 'no'}")
     print(f"  cost optimization:        {'yes' if cfg.cost_optimization else 'no'}")
     print(f"  mid-session cost switch:  {'yes' if cfg.switch_on_cost else 'no'}")
+    # Only non-default values get a row: the default view stays the compact one
+    # it has always been, and a setting that CHANGES selection is always visible.
+    if cfg.exclude:
+        print(f"  never auto-select:        {', '.join(cfg.exclude)}")
+    if not cfg.allow_unknown_metadata:
+        print("  unknown metadata:         strict (a missing required capability disqualifies)")
     models = []
     source = ""
     if provider:
@@ -2118,18 +2124,39 @@ def _parse_model_flag(values) -> list[str]:
     return out
 
 
+def _routing_compact_map(mapping) -> str:
+    """``{'capability': 0.45, 'cost': 0.3}`` → ``capability=0.45, cost=0.3``."""
+    items = sorted((mapping or {}).items())
+    if not items:
+        return "(none)"
+    parts = []
+    for key, value in items:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            parts.append(f"{key}={value:g}")
+        else:
+            parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
 def _print_routing_settings(label: str, settings: dict) -> None:
     """One compact state block, for the before/after summary."""
     mode = "only selected models" if settings.get("preferred_models_only") else "all eligible models"
     models = settings.get("models") or []
     listed = ", ".join(models) if models else "(none — whole eligible catalog)"
+    excluded = settings.get("exclude") or []
     print(f"  {label}")
     print(f"    enabled:             {'ON' if settings.get('enabled') else 'OFF'}")
     print(f"    strategy:            {settings.get('strategy')}")
     print(f"    stability threshold: {settings.get('stability_threshold')}")
     print(f"    cost optimization:   {'yes' if settings.get('cost_optimization') else 'no'}")
+    print(f"    mid-session cost:    {'yes' if settings.get('switch_on_cost') else 'no'}")
     print(f"    models:              {mode}")
     print(f"    list ({len(models)}):              {listed}")
+    print(f"    never auto-select:   {', '.join(excluded) if excluded else '(none)'}")
+    print(f"    unknown metadata:    "
+          f"{'allowed (unknown stays unknown, penalised)' if settings.get('allow_unknown_metadata', True) else 'strict (missing metadata disqualifies)'}")
+    print(f"    weights:             {_routing_compact_map(settings.get('weights'))}")
+    print(f"    reliability:         {_routing_compact_map(settings.get('reliability'))}")
 
 
 def _print_routing_preview(preview: dict) -> None:
@@ -2195,6 +2222,66 @@ def _routing_configure_common(args, config):
     if cost_optimization is not None:
         changes["cost_optimization"] = bool(cost_optimization)
 
+    # Advanced rules the engine reads.  They are parsed by agent.model_router
+    # (one parser for every surface) and validated by ``update_routing`` below,
+    # so a bad dimension name or range fails with the validator's own message
+    # and nothing is written.
+    exclude_flag = getattr(args, "exclude", None)
+    if exclude_flag and bool(getattr(args, "clear_exclude", False)):
+        print("✗ --exclude and --clear-exclude are different actions; pass only one.",
+              file=sys.stderr)
+        return 2
+    if exclude_flag:
+        changes["exclude"] = router.parse_model_ids(exclude_flag)
+    elif bool(getattr(args, "clear_exclude", False)):
+        changes["exclude"] = []
+
+    allow_unknown = getattr(args, "allow_unknown_metadata", None)
+    if allow_unknown is not None:
+        changes["allow_unknown_metadata"] = bool(allow_unknown)
+    switch_on_cost = getattr(args, "switch_on_cost", None)
+    if switch_on_cost is not None:
+        changes["switch_on_cost"] = bool(switch_on_cost)
+
+    weights_flag = getattr(args, "weights", None)
+    if weights_flag and bool(getattr(args, "weights_default", False)):
+        print("✗ --weights and --weights-default are different actions; pass only one.",
+              file=sys.stderr)
+        return 2
+    try:
+        if weights_flag:
+            # Merge over the AUTHORED weights, not the normalised effective ones:
+            # merging over normalised values would shift every number on each
+            # run, so repeating the same command would never be a no-op.
+            block = config.get("smart_model_routing")
+            raw_weights = block.get("weights") if isinstance(block, dict) else None
+            changes["weights"] = router.parse_weights(
+                weights_flag,
+                base=raw_weights if isinstance(raw_weights, dict) else router.default_weights(),
+            )
+        elif bool(getattr(args, "weights_default", False)):
+            changes["weights"] = router.default_weights()
+    except ValueError as err:
+        print(f"✗ {err}", file=sys.stderr)
+        return 2
+
+    reliability_flag = getattr(args, "reliability", None)
+    if reliability_flag and bool(getattr(args, "clear_reliability", False)):
+        print("✗ --reliability and --clear-reliability are different actions; pass only one.",
+              file=sys.stderr)
+        return 2
+    try:
+        if reliability_flag:
+            block = config.get("smart_model_routing")
+            raw_rel = block.get("reliability") if isinstance(block, dict) else None
+            changes["reliability"] = router.parse_reliability(
+                reliability_flag, base=raw_rel if isinstance(raw_rel, dict) else None)
+        elif bool(getattr(args, "clear_reliability", False)):
+            changes["reliability"] = {}
+    except ValueError as err:
+        print(f"✗ {err}", file=sys.stderr)
+        return 2
+
     as_json = bool(getattr(args, "json", False))
     if not changes:
         # Nothing to change: report the state and stay read-only (no lone-block
@@ -2210,8 +2297,10 @@ def _routing_configure_common(args, config):
         _print_routing_status(config)
         print(
             "  Nothing to change. Pass --enable/--disable, --models/--all-models,\n"
-            "  --strategy or --stability-threshold, or run `hermes model routing\n"
-            "  configure` with no flags in a terminal for the interactive flow.\n"
+            "  --strategy, --stability-threshold, --cost-optimization, --exclude,\n"
+            "  --allow-unknown-metadata, --switch-on-cost, --weights, --reliability,\n"
+            "  or run `hermes model routing configure` with no flags in a terminal\n"
+            "  for the interactive flow.\n"
         )
         return 0
 
@@ -2361,6 +2450,105 @@ def _routing_configure_interactive(args, config) -> int:
     if idx is None:
         return _routing_cancelled()
     changes["cost_optimization"] = idx == 0
+
+    # 5b. Advanced rules — the remaining settings the engine reads, reachable
+    #     here too (directive §4).  One loop whose first option keeps all of
+    #     them, so the common path costs a single keypress; every typed value
+    #     goes through agent.model_router's parser, not a CLI-local one.
+    #
+    #     ``weights`` starts from the values AS WRITTEN in config.yaml (defaults
+    #     when absent), never the normalised effective mapping: editing numbers
+    #     that were re-scaled on read would make the same command produce a new
+    #     file every time.
+    _block = config.get("smart_model_routing") if isinstance(config, dict) else None
+    _raw_weights = _block.get("weights") if isinstance(_block, dict) else None
+    _raw_rel = _block.get("reliability") if isinstance(_block, dict) else None
+    advanced = {
+        "exclude": list(before["exclude"]),
+        "allow_unknown_metadata": bool(before["allow_unknown_metadata"]),
+        "switch_on_cost": bool(before["switch_on_cost"]),
+        "weights": dict(_raw_weights) if isinstance(_raw_weights, dict)
+        else router.default_weights(),
+        "reliability": dict(_raw_rel) if isinstance(_raw_rel, dict) else {},
+    }
+    # The untouched baseline for the "did this actually change?" comparison —
+    # `before` holds normalised weights, which never equal the authored form.
+    _initial_advanced = {
+        key: (dict(value) if isinstance(value, dict) else
+              list(value) if isinstance(value, list) else value)
+        for key, value in advanced.items()
+    }
+    while True:
+        idx = _routing_ask_choice(
+            "Advanced selection rules:",
+            [
+                "Keep them as shown — go to the summary",
+                f"Allow unknown capability metadata: "
+                f"{'on' if advanced['allow_unknown_metadata'] else 'off (strict)'}",
+                f"Allow a mid-session switch to a cheaper model: "
+                f"{'on' if advanced['switch_on_cost'] else 'off'}",
+                f"Never auto-select: {', '.join(advanced['exclude']) or '(none)'}",
+                f"Scoring weights: {_routing_compact_map(advanced['weights'])}",
+                f"Declared reliability: {_routing_compact_map(advanced['reliability'])}",
+            ],
+            default=0,
+        )
+        if idx is None:
+            return _routing_cancelled()
+        if idx == 0:
+            break
+        if idx == 1:
+            advanced["allow_unknown_metadata"] = not advanced["allow_unknown_metadata"]
+            continue
+        if idx == 2:
+            advanced["switch_on_cost"] = not advanced["switch_on_cost"]
+            continue
+        if idx == 3:
+            raw = _routing_ask_text(
+                "Model ids never to auto-select (comma-separated; '-' clears, Enter keeps): "
+            )
+            if raw is None:
+                return _routing_cancelled()
+            if raw == "-":
+                advanced["exclude"] = []
+            elif raw:
+                advanced["exclude"] = router.parse_model_ids(raw)
+            continue
+        if idx == 4:
+            raw = _routing_ask_text(
+                f"Scoring weights as dim=value ({', '.join(sorted(router.default_weights()))}); "
+                "'-' resets to the defaults, Enter keeps: "
+            )
+            if raw is None:
+                return _routing_cancelled()
+            try:
+                if raw == "-":
+                    advanced["weights"] = router.default_weights()
+                elif raw:
+                    advanced["weights"] = router.parse_weights(raw, base=advanced["weights"])
+            except ValueError as err:
+                print(f"\n  ✗ {err}\n", file=sys.stderr)
+            continue
+        if idx == 5:
+            raw = _routing_ask_text(
+                "Declared success rate per model as model=0.95 (comma-separated; "
+                "'-' clears, Enter keeps): "
+            )
+            if raw is None:
+                return _routing_cancelled()
+            try:
+                if raw == "-":
+                    advanced["reliability"] = {}
+                elif raw:
+                    advanced["reliability"] = router.parse_reliability(
+                        raw, base=advanced["reliability"])
+            except ValueError as err:
+                print(f"\n  ✗ {err}\n", file=sys.stderr)
+            continue
+
+    for key, value in advanced.items():
+        if value != _initial_advanced[key]:
+            changes[key] = value
 
     # 6. Summary: before, after, and the same preview `explain`/`status` use.
     base_block = config.get("smart_model_routing")
@@ -2535,6 +2723,14 @@ def cmd_model_routing(args):
                 getattr(args, "strategy", None),
                 getattr(args, "stability_threshold", None) is not None,
                 getattr(args, "cost_optimization", None) is not None,
+                getattr(args, "exclude", None),
+                getattr(args, "clear_exclude", False),
+                getattr(args, "allow_unknown_metadata", None) is not None,
+                getattr(args, "switch_on_cost", None) is not None,
+                getattr(args, "weights", None),
+                getattr(args, "weights_default", False),
+                getattr(args, "reliability", None),
+                getattr(args, "clear_reliability", False),
                 getattr(args, "dry_run", False),
                 getattr(args, "json", False),
             )

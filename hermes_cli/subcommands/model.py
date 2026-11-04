@@ -290,6 +290,86 @@ def build_model_parser(
         help="Prefer capability over price",
     )
     _configure.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="M1,M2,...",
+        help=(
+            "Never auto-select these model ids (comma-separated; repeat the flag to "
+            "add more). They stay usable through an explicit model choice"
+        ),
+    )
+    _configure.add_argument(
+        "--clear-exclude",
+        action="store_true",
+        default=False,
+        help="Empty the never-auto-select list",
+    )
+    _configure.add_argument(
+        "--allow-unknown-metadata",
+        dest="allow_unknown_metadata",
+        action="store_true",
+        default=None,
+        help=(
+            "Treat missing capability metadata as unknown (penalised), not unsupported "
+            "— the default"
+        ),
+    )
+    _configure.add_argument(
+        "--no-allow-unknown-metadata",
+        dest="allow_unknown_metadata",
+        action="store_false",
+        help="Strict: a model missing a required capability's metadata is ineligible",
+    )
+    _configure.add_argument(
+        "--switch-on-cost",
+        dest="switch_on_cost",
+        action="store_true",
+        default=None,
+        help=(
+            "Allow a mid-session switch to a cheaper model (invalidates the provider's "
+            "prompt cache)"
+        ),
+    )
+    _configure.add_argument(
+        "--no-switch-on-cost",
+        dest="switch_on_cost",
+        action="store_false",
+        help="Keep the session's model even when a cheaper one would do — the default",
+    )
+    _configure.add_argument(
+        "--weights",
+        action="append",
+        default=None,
+        metavar="DIM=N,...",
+        help=(
+            "Scoring weights for the automatic strategy, merged over the current "
+            "values (capability, cost, reliability, context, continuity)"
+        ),
+    )
+    _configure.add_argument(
+        "--weights-default",
+        action="store_true",
+        default=False,
+        help="Reset the scoring weights to the engine defaults",
+    )
+    _configure.add_argument(
+        "--reliability",
+        action="append",
+        default=None,
+        metavar="MODEL=RATE,...",
+        help=(
+            "Declared success rate per model (0-1), merged over the current values; "
+            "expected retries are priced from it"
+        ),
+    )
+    _configure.add_argument(
+        "--clear-reliability",
+        action="store_true",
+        default=False,
+        help="Forget every declared reliability rate",
+    )
+    _configure.add_argument(
         "--dry-run", action="store_true", default=False,
         help="Validate and show what would change without writing config.yaml")
     _configure.add_argument(

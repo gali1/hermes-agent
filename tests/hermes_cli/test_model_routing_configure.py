@@ -363,7 +363,7 @@ def test_interactive_enable_select_models_and_save(home, capsys, interactive):
 
     script = interactive(
         _Script(
-            choices=[1, 1, 0, 1, 1, 0],  # enable, selected-only, add-another, done, cost, cheaper
+            choices=[1, 1, 0, 1, 1, 0, 0],  # enable, selected-only, add-another, done, cost, cheaper, advanced-keep
             texts=["0.25"],
             models=["model-a", "model-b"],
             confirm=True,
@@ -423,7 +423,7 @@ def test_interactive_cancel_at_a_preference_changes_nothing(home, capsys, intera
 def test_interactive_declining_the_confirmation_writes_nothing(home, capsys, interactive):
     from hermes_cli.main import cmd_model_routing
 
-    interactive(_Script(choices=[1, 0, 0, 0], texts=[""], confirm=False))
+    interactive(_Script(choices=[1, 0, 0, 0, 0], texts=[""], confirm=False))
     before = _config_text(home)
     assert cmd_model_routing(_ns()) == 0
     out = capsys.readouterr().out
@@ -434,7 +434,7 @@ def test_interactive_declining_the_confirmation_writes_nothing(home, capsys, int
 def test_interactive_yes_skips_the_confirmation(home, capsys, interactive, monkeypatch):
     from hermes_cli.main import cmd_model_routing
 
-    script = interactive(_Script(choices=[1, 0, 0, 0], texts=[""], confirm=False))
+    script = interactive(_Script(choices=[1, 0, 0, 0, 0], texts=[""], confirm=False))
     assert cmd_model_routing(_ns(yes=True)) == 0
     assert not any("Save these settings?" in q for q in script.asked)
     assert _section(home)["enabled"] is True
@@ -443,7 +443,7 @@ def test_interactive_yes_skips_the_confirmation(home, capsys, interactive, monke
 def test_interactive_bad_threshold_uses_the_validator_message(home, capsys, interactive):
     from hermes_cli.main import cmd_model_routing
 
-    interactive(_Script(choices=[1, 0, 0, 0], texts=["2.5"], confirm=True))
+    interactive(_Script(choices=[1, 0, 0, 0, 0], texts=["2.5"], confirm=True))
     before = _config_text(home)
     assert cmd_model_routing(_ns()) == 1
     err = capsys.readouterr().err
@@ -477,7 +477,7 @@ def test_interactive_no_change_is_reported_without_a_write(home, capsys, interac
     _reload()
 
     # keep it on, all eligible models, automatic, keep the threshold, cheaper
-    interactive(_Script(choices=[0, 0, 0, 0], texts=[""], confirm=True))
+    interactive(_Script(choices=[0, 0, 0, 0, 0], texts=[""], confirm=True))
     before = _config_text(home)
     assert cmd_model_routing(_ns()) == 0
     assert "No change" in capsys.readouterr().out
@@ -491,7 +491,7 @@ def test_interactive_all_eligible_mode_clears_the_selection(home, capsys, intera
     assert _section(home)["preferred_models_only"] is True
 
     # keep/off choice 2 = disable? no: 0 keeps, 0 = all eligible, automatic, keep, cheaper
-    interactive(_Script(choices=[0, 0, 0, 0], texts=["0.15"], confirm=True))
+    interactive(_Script(choices=[0, 0, 0, 0, 0], texts=["0.15"], confirm=True))
     assert cmd_model_routing(_ns()) == 0
     section = _section(home)
     assert section["models"] == []
