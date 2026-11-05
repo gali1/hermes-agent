@@ -36,6 +36,9 @@ import json
 import logging
 import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -165,6 +168,9 @@ class SpecialistChoice:
     reason: str
     score: float = 0.0
     candidates_considered: List[str] = field(default_factory=list)
+    #: The chosen model's own declared prices (USD per 1M tokens), for the audit record.
+    cost_in: float = 0.0
+    cost_out: float = 0.0
 
 
 @dataclass
@@ -179,6 +185,8 @@ class DelegationResult:
     bytes_sent: int = 0
     reason: str = ""
     error: str = ""
+    usage: Dict[str, int] = field(default_factory=dict)
+    est_cost_usd: float = 0.0
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -190,6 +198,8 @@ class DelegationResult:
             "bytes_sent": self.bytes_sent,
             "reason": self.reason,
             "error": self.error,
+            "usage": dict(self.usage),
+            "est_cost_usd": round(self.est_cost_usd, 8),
         }
 
     def to_json(self) -> str:
@@ -315,6 +325,8 @@ def resolve_specialist(
         ),
         score=round(best_score, 4),
         candidates_considered=[c.key for c, _ in scored],
+        cost_in=float(getattr(best.spec, "cost_in", 0.0) or 0.0),
+        cost_out=float(getattr(best.spec, "cost_out", 0.0) or 0.0),
     )
 
 
@@ -334,6 +346,48 @@ def _extract_pdf_text(path: Path) -> str:
         return ""
 
 
+def usable_text(text: str) -> str:
+    """Drop the extractor's placeholder notices and keep only real content.
+
+    `tools.read_extract` does not return "" for a scanned page: it returns a bracketed
+    "[NEEDS OCR: pages 1 …]" instruction to the *model*.  Measuring that as text made OCR look
+    unnecessary and sent the instruction itself to the specialist — which then (correctly)
+    answered "the page isn't available".  Strip the notice, then decide.
+    """
+    kept = [line for line in (text or "").splitlines() if "[needs ocr" not in line.lower()]
+    return "\n".join(kept).strip()
+
+
+def ocr_available() -> bool:
+    """Local OCR needs both the rasteriser and the engine; one without the other is a trap."""
+    return bool(shutil.which("pdftoppm")) and bool(shutil.which("tesseract"))
+
+
+def _ocr_pdf(path: Path, *, dpi: int = 200, max_pages: int = 20,
+             lang: str = "eng") -> str:
+    """Transcribe a scanned PDF locally with poppler + tesseract; "" when unavailable."""
+    if not ocr_available():
+        return ""
+    try:
+        with tempfile.TemporaryDirectory(prefix="hermes-ocr-") as tmp:
+            subprocess.run(
+                ["pdftoppm", "-r", str(dpi), "-png", "-f", "1", "-l", str(max_pages),
+                 str(path), str(Path(tmp) / "page")],
+                check=True, capture_output=True, timeout=300,
+            )
+            pages = sorted(Path(tmp).glob("page*.png"))
+            chunks = []
+            for page in pages:
+                done = subprocess.run(["tesseract", str(page), "stdout", "-l", lang],
+                                      capture_output=True, text=True, timeout=180)
+                if done.returncode == 0 and done.stdout.strip():
+                    chunks.append(done.stdout)
+            return "\n".join(chunks).strip()
+    except Exception as exc:  # noqa: BLE001 - OCR is best-effort, never fatal
+        logger.info("OCR failed for %s: %s", path.name, exc)
+        return ""
+
+
 def _transcribe_file(path: Path) -> Tuple[bool, str, str]:
     """Local/cloud STT through the existing transcription stack. Returns (ok, text, why)."""
     try:
@@ -346,6 +400,32 @@ def _transcribe_file(path: Path) -> Tuple[bool, str, str]:
         return True, str(result.get("transcript") or ""), ""
     why = result.get("error") if isinstance(result, dict) else "transcription returned no result"
     return False, "", str(why or "transcription produced no text")[:200]
+
+
+def _usage_of(response: Any) -> Dict[str, int]:
+    """Prompt/completion tokens when the SDK reports them; {} when it does not."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    out: Dict[str, int] = {}
+    for key, attr in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"),
+                      ("total_tokens", "total_tokens")):
+        value = getattr(usage, attr, None)
+        if isinstance(value, int):
+            out[key] = value
+    return out
+
+
+def _price(choice: SpecialistChoice, usage: Dict[str, int]) -> float:
+    """Estimated USD for this call, from the prices carried by the chosen specialist.
+
+    Zero is the honest answer for anything unpriced or for the local STT path — an invented
+    estimate in an audit record is worse than an empty one.
+    """
+    if not usage:
+        return 0.0
+    return (usage.get("input_tokens", 0) * choice.cost_in
+            + usage.get("output_tokens", 0) * choice.cost_out) / 1_000_000.0
 
 
 def _read_limited(path: Path, max_bytes: int) -> Tuple[bytes, str]:
@@ -439,10 +519,16 @@ def build_delegation_messages(
         ]}], len(data), note)
 
     if want == "pdf":
-        extracted = "" if transport == "native" else _extract_pdf_text(target)
+        extracted = "" if transport == "native" else usable_text(_extract_pdf_text(target))
+        ocr_used = False
+        if transport != "native" and len(extracted) < 40 and ocr_available():
+            ocr_text = _ocr_pdf(target)
+            if len(ocr_text.strip()) > len(extracted.strip()):
+                extracted, ocr_used = ocr_text, True
         if extracted.strip():
             clipped = extracted[:MAX_INLINE_TEXT_CHARS]
-            note = (f"extracted {target.name} locally ({len(extracted)} chars, portable path) "
+            how = "OCR (tesseract)" if ocr_used else "text layer"
+            note = (f"{how} on {target.name} locally ({len(extracted)} chars, portable path) "
                     "and sent the text")
             return ([{"role": "user", "content": (
                 f"{header}\n\n--- {target.name} (extracted text) ---\n{clipped}")}],
@@ -573,9 +659,11 @@ async def delegate_capability(
             bytes_sent=sent, reason=f"{choice.reason}; {note}",
             error="the specialist returned no content",
         )
+    usage = _usage_of(response)
     return DelegationResult(
         success=True, text=text, provider=choice.provider, model=choice.model,
         modality=want, bytes_sent=sent, reason=f"{choice.reason}; {note}",
+        usage=usage, est_cost_usd=_price(choice, usage),
     )
 
 

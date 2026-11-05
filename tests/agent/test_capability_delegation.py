@@ -384,7 +384,7 @@ def test_pdf_with_a_text_layer_is_extracted_and_sent_as_text(tmp_path, monkeypat
     body = messages[0]["content"]
     assert isinstance(body, str)
     assert "VAULT TOTAL: 412 GB" in body
-    assert "extracted" in note and "portable path" in note
+    assert "text layer" in note and "portable path" in note
     assert sent == len("VAULT TOTAL: 412 GB")
 
 
@@ -498,3 +498,98 @@ def test_audio_without_stt_reports_the_stt_failure_not_a_fake_result(pool, aux, 
     assert result.success is False
     assert "no STT provider configured" in result.error
     assert aux == []
+
+
+# --------------------------------------------------------------------------- OCR for scans
+
+
+def test_a_scan_is_ocrd_before_falling_back_to_bytes(tmp_path, monkeypatch):
+    """A scanned page has no text layer; OCR is the honest path, a file part is the last resort."""
+    scan = tmp_path / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    monkeypatch.setattr(cd, "ocr_available", lambda: True)
+    monkeypatch.setattr(cd, "_ocr_pdf", lambda p, **k: "SCANNED INVOICE TOTAL 412")
+
+    messages, sent, note = cd.build_delegation_messages(str(scan), "extract the total", "pdf")
+    body = messages[0]["content"]
+    assert isinstance(body, str), "OCR text is sent as text, not as bytes"
+    assert "SCANNED INVOICE TOTAL 412" in body
+    assert "OCR" in note and "tesseract" in note
+
+
+def test_without_ocr_a_scan_still_falls_back_but_says_why(tmp_path, monkeypatch):
+    scan = tmp_path / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    monkeypatch.setattr(cd, "ocr_available", lambda: False)
+
+    messages, _sent, note = cd.build_delegation_messages(str(scan), "extract", "pdf")
+    assert messages[0]["content"][1]["type"] == "file"
+    assert "after local extraction produced nothing" in note
+
+
+def test_ocr_is_not_used_when_the_text_layer_has_content(tmp_path, monkeypatch):
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer with plenty of words "
+                                                           "to exceed the forty character floor")
+    called = []
+    monkeypatch.setattr(cd, "_ocr_pdf", lambda p, **k: called.append(p) or "OCR")
+    messages, _sent, note = cd.build_delegation_messages(str(doc), "read", "pdf")
+    assert called == [], "OCR costs seconds per page: never run it on a readable pdf"
+    assert "text layer" in note
+
+
+# --------------------------------------------------------------------------- extractor placeholder
+
+
+def test_the_needs_ocr_placeholder_is_not_treated_as_content(tmp_path, monkeypatch):
+    """`read_extract` hands back "[NEEDS OCR: pages 1 …]" for a scan — an instruction, not text."""
+    scan = tmp_path / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text",
+                        lambda p: "[NEEDS OCR: pages 1 of this PDF are scanned images …]")
+    assert cd.usable_text("[NEEDS OCR: pages 1 …]\nreal line") == "real line"
+    monkeypatch.setattr(cd, "ocr_available", lambda: True)
+    monkeypatch.setattr(cd, "_ocr_pdf", lambda p, **k: "MAGIC-OCR-8842")
+    messages, _sent, note = cd.build_delegation_messages(str(scan), "read", "pdf")
+    assert "MAGIC-OCR-8842" in messages[0]["content"]
+    assert "OCR" in note
+
+
+def test_usage_and_cost_are_reported_for_a_model_call(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"],
+                                                  cost_in=0.30, cost_out=1.20)])
+
+    async def with_usage(**_kwargs):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(
+                message=types.SimpleNamespace(content="OK", reasoning_content=None))],
+            usage=types.SimpleNamespace(prompt_tokens=1000, completion_tokens=500,
+                                        total_tokens=1500))
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", with_usage, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer, long enough to be used")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(str(doc), "read", modality="pdf",
+                                         config=_config(["primary-model", "reader"]))
+    assert result.success is True
+    assert result.usage["total_tokens"] == 1500
+    # 1000 in * $0.30/M + 500 out * $1.20/M
+    assert abs(result.est_cost_usd - (0.0003 + 0.0006)) < 1e-9
+
+
+def test_local_stt_reports_zero_cost(pool, aux, tmp_path, monkeypatch):
+    pool([_cand("primary-model", ["text"])])
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (True, "hello", ""))
+    voice = tmp_path / "m.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 16)
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(str(voice), "transcribe", modality="audio",
+                                                config=_config(["primary-model"])))
+    assert result.success and result.est_cost_usd == 0.0 and result.usage == {}

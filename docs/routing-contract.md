@@ -471,6 +471,38 @@ Verified on this host (live config, deepseek primary, gpt-6-luna specialist):
 That last row is the honest boundary of this feature on this provider, not a code gap: the layer
 picks correctly and reports what the provider says.
 
+## C22 — Capability registry: native, via-Hermes, unknown, unavailable
+
+`agent/capability_registry.py` is the one place that answers "can this model do X *here*", and it
+refuses to flatten four different answers into one boolean:
+
+| state | meaning | consequence |
+|---|---|---|
+| `native` | the model/provider accepts it (catalog metadata, overlaid by the operator's declarations) | send the part |
+| `hermes` | the model cannot take it, but this installation converts it: PDF text layer, OCR, speech-to-text, image data-URL | send the converted form |
+| `unknown` | nobody declared it and metadata is silent | eligible only when the routing config allows unknown metadata, and reported as unknown |
+| `unavailable` | the provider refused the model (retired/forbidden, memoised 24 h) or the local facility is absent (no tesseract, no STT) | do not claim it works |
+
+The distinction matters most for PDFs: a model with no native PDF input is **not** a model that
+cannot handle a PDF — Hermes extracts the text (or OCRs a scan) and sends text. Reporting that as
+"unsupported" would misdescribe the system, not the model.
+
+Verified on this host: `deepseek-v4.1-flash` → native image/tools/structured, **hermes** for pdf +
+audio + ocr, unavailable video; `gpt-6-luna` → native image/pdf, hermes audio/ocr.
+
+## C23 — OCR is a fallback that must detect the extractor's own placeholder
+
+`tools.read_extract` does not return an empty string for a scanned page: it returns a bracketed
+`[NEEDS OCR: pages 1 …]` **instruction addressed to the model**. Treating that as text made a scan
+look readable, and a specialist answered "the page isn't available" from the instruction itself —
+a failure that looks like a model problem and is not one. `capability_delegation.usable_text()`
+strips those notices; only then is the length threshold meaningful, and only then does OCR run.
+
+Order for a pdf: **text layer → OCR (poppler + tesseract) → native `file` part**, last resort only.
+
+Verified end to end: an image-only PDF (no text layer) → OCR read `MAGIC-OCR-8842` → `gpt-6-luna`
+returned exactly that string.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
