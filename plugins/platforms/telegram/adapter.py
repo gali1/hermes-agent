@@ -511,6 +511,45 @@ class _PollingStallError(RuntimeError):
     """
 
 
+# ── pending-picker registry ───────────────────────────────────────────────────────────
+# Pickers are addressed by (chat, message) rather than by chat alone: several pickers can be
+# alive in one chat, an interrupted tap must not consume another picker's state, and an
+# adapter instance can be replaced between send and tap (plugin reload, gateway restart).
+_PICKER_STATE_REGISTRY: Dict[str, dict] = {}
+_PICKER_STATE_TTL = 1800.0  # an abandoned picker stops answering after 30 minutes
+
+
+def _picker_registry_key(chat_id: str, msg_id) -> str:
+    return f"{chat_id}:{msg_id}"
+
+
+def _picker_state_register(chat_id: str, msg_id, state: dict) -> None:
+    if msg_id is None:
+        return
+    state["_registered_at"] = time.time()
+    _PICKER_STATE_REGISTRY[_picker_registry_key(str(chat_id), msg_id)] = state
+    if len(_PICKER_STATE_REGISTRY) > 200:  # bounded: drop the oldest half, never grow forever
+        for key in sorted(_PICKER_STATE_REGISTRY, key=lambda k: _PICKER_STATE_REGISTRY[k].get("_registered_at") or 0)[:100]:
+            _PICKER_STATE_REGISTRY.pop(key, None)
+
+
+def _picker_state_lookup(chat_id: str, msg_id) -> Optional[dict]:
+    if msg_id is None:
+        return None
+    state = _PICKER_STATE_REGISTRY.get(_picker_registry_key(str(chat_id), msg_id))
+    if state is None:
+        return None
+    if time.time() - float(state.get("_registered_at") or 0) > _PICKER_STATE_TTL:
+        _PICKER_STATE_REGISTRY.pop(_picker_registry_key(str(chat_id), msg_id), None)
+        return None
+    return state
+
+
+def _picker_state_retire(chat_id: str, msg_id) -> None:
+    if msg_id is not None:
+        _PICKER_STATE_REGISTRY.pop(_picker_registry_key(str(chat_id), msg_id), None)
+
+
 class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -4333,8 +4372,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             keyboard = InlineKeyboardMarkup(self._rows_of_two(buttons))
 
             def _remember(msg):
-                self._choice_picker_state[str(chat_id)] = {
+                state = {
                     "msg_id": msg.message_id, "choices": choices, "session_key": session_key, "on_choice_selected": on_choice_selected}
+                self._choice_picker_state[str(chat_id)] = state
+                _picker_state_register(chat_id, msg.message_id, state)
             return self.format_message(title), keyboard, _remember
         return await self._send_prompt(
             "send_choice_picker", chat_id, metadata, build, thread_id=metadata.get("thread_id") if metadata else None,
@@ -4350,7 +4391,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     async def _handle_choice_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle choice picker button taps (cp:<index>)."""
+        msg_id = getattr(getattr(query, "message", None), "message_id", None)
         state = self._choice_picker_state.get(chat_id)
+        # A chat slot belonging to a DIFFERENT message is not this tap's state.
+        if state is not None and msg_id is not None and state.get("msg_id") not in (None, msg_id):
+            state = None
+        if state is None:
+            state = _picker_state_lookup(chat_id, msg_id)
         if not state:
             await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
             return
@@ -4370,7 +4417,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
         await self._edit_result_text(query, result_text)
         await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+        tapped_msg = getattr(getattr(query, "message", None), "message_id", None)
+        _picker_state_retire(chat_id, tapped_msg)
+        if self._choice_picker_state.get(chat_id, {}).get("msg_id") in (None, tapped_msg):
+            self._choice_picker_state.pop(chat_id, None)
 
     # ── multi-select picker (toggle several values, then Done) ──
     # Used by /model-routing's "change models" step. Callback payloads carry only an
@@ -4450,6 +4500,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             def _remember(msg) -> None:
                 state["msg_id"] = getattr(msg, "message_id", None)
                 self._multi_select_state[str(chat_id)] = state
+                _picker_state_register(chat_id, state["msg_id"], state)
             return self.format_message(self._multi_select_text(state)), self._multi_select_keyboard(state), _remember
         return await self._send_prompt(
             "send_multi_select_picker", chat_id, metadata, build,
@@ -4457,7 +4508,12 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     async def _handle_multi_select_callback(self, query, data: str, chat_id: str) -> None:
         """``mrs:<idx>`` toggle · ``mrsv:<page>`` · ``mrsa``/``mrsn`` · ``mrsd`` done · ``mrsx`` cancel."""
+        msg_id = getattr(getattr(query, "message", None), "message_id", None)
         state = self._multi_select_state.get(str(chat_id))
+        if state is not None and msg_id is not None and state.get("msg_id") not in (None, msg_id):
+            state = None
+        if state is None:
+            state = _picker_state_lookup(chat_id, msg_id)
         if not state:
             await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
             return

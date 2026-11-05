@@ -1643,6 +1643,45 @@ class GatewayBusySessionMixin:
         ]
         return "\n".join(lines)
 
+    def _model_routing_current_models(self, settings: Dict[str, Any],
+                                      changes: Dict[str, Any]) -> List[str]:
+        """The models actually in effect, so the picker arrives with them pre-selected.
+
+        Without this nothing is ticked, the toggle list can only add, and removing the model
+        that is currently in use is impossible - which is exactly the complaint this answers.
+        """
+        if changes.get("models"):
+            return [str(m) for m in changes["models"] if m]
+        if settings.get("models"):
+            return [str(m) for m in settings["models"] if m]
+        cfg = self._model_routing_load_config() or {}
+        provider = str((cfg.get("model") or {}).get("provider") or "")
+        declared = ((cfg.get("providers") or {}).get(provider) or {}).get("models") or []
+        if declared:
+            return [str(m) for m in declared if m]
+        default_model = str((cfg.get("model") or {}).get("default") or "")
+        return [default_model] if default_model else []
+
+    def _model_routing_model_choices(self, settings: Dict[str, Any]) -> List[str]:
+        """Models the picker may offer: the operator's list, then the provider catalog.
+
+        Order is meaningful - existing entries keep their priority - so a confirmed
+        selection has a stable interpretation.
+        """
+        from agent import model_router as mr
+
+        cfg = self._model_routing_load_config()
+        provider = str(((cfg or {}).get("model") or {}).get("provider") or "")
+        declared = [str(m) for m in (settings.get("models") or []) if m]
+        default_model = str(((cfg or {}).get("model") or {}).get("default") or "")
+        if default_model and default_model not in declared:
+            declared.insert(0, default_model)
+        try:
+            pool = mr.widen_pool(provider, declared)
+        except Exception:  # a catalog miss must not break the picker
+            pool = list(declared)
+        return [str(m) for m in pool if m]
+
     def _model_routing_models_page(self, flow: Dict[str, Any]) -> str:
         candidates = flow.get("candidates") or []
         page = int(flow.get("page") or 0)
@@ -1766,6 +1805,9 @@ class GatewayBusySessionMixin:
             elif token in {"3", "models"}:
                 flow["step"] = "models"
                 flow["page"] = 0
+                # This page used to read flow["candidates"], which nothing ever set, so the
+                # step reported "no eligible models" and the list could never be changed.
+                flow["candidates"] = self._model_routing_model_choices(settings)
                 touch(flow)
                 return self._model_routing_state_text(report, settings) + "\n\n" + self._model_routing_models_page(flow)
             elif token in {"4", "preferences", "prefs"}:
@@ -2153,9 +2195,13 @@ class GatewayBusySessionMixin:
                 else:
                     changes.pop("preferred_models_only", None)
         elif token in {"3", "models"}:
-            candidates = [str(c) for c in (flow.get("candidates") or []) if c] or [
+            # Offer what routing COULD choose, not only what it currently chooses: with the
+            # configured rows alone the picker could never add a model, only re-pick it.
+            candidates = self._model_routing_model_choices(settings) or [
                 str(c.get("model")) for c in (report.get("candidates") or []) if c.get("model")]
-            current = changes.get("models") or settings.get("models") or []
+            # "Current" must be the models actually in effect, or nothing arrives pre-ticked
+            # and the picker can add but never remove.
+            current = self._model_routing_current_models(settings, changes)
             if await self._try_send_routing_model_select(
                     event, candidates, list(current),
                     lambda _chat_id, picked: self._model_routing_models_picked(event, picked, changes)):
