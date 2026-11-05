@@ -628,17 +628,20 @@ which is exactly the material C26 trusts.
 Verified on generated files: a 12 KB package declaring 315 MB → *"Not a safe DOCX: … refusing to
 inflate it"*; a 6000-row sheet → the truncation line above; a 230 KB CSV → the counted clip above.
 
-## C31 — A finished result ends the re-derivation
+## C31 — The stop condition is the instruction, not `tool_choice`
 
-When a delegation succeeds, the injected block states that the content was extracted from the actual
-file and is complete, and **the call that carries it sets `tool_choice: "none"`** (when the request
-has tools). This is a stop condition, not a hint: measured twice, the primary re-ran its own
-extraction over the same file and hit the turn budget without answering.
+When a delegation succeeds, the injected block says the content was extracted from the actual file,
+is complete, and that re-extracting it is wasted work — then the call proceeds unchanged.
 
-Guards: only on success (a failed delegation must leave tools available, or the model cannot recover
-itself), only when `tools` is present, never overwriting a `tool_choice` the caller set, the caller's
-request is not mutated in place, and `capability_delegation.stop_tool_use_after_delegation: false`
-turns it off. A `tool_stop` line is written to the audit trail.
+`tool_choice: "none"` was tried first and rejected on evidence. With it set, `deepseek-v4.1-flash`
+emits the tool call as **XML text**: a normal video prompt produced
+`<tool_calls><invoke name="terminal">…` instead of an answer, on the pdf, video and silent-video rows.
+Tools therefore stay available, and the wording carries the instruction.
+
+Measured after the change, normal prompt, no special instruction, tools enabled: video answered
+`MAGIC-VIDEO-5510` switching to `ACTION ITEM ship OCR path`, **0 tool calls, no leaked XML**. The
+per-turn memo (`_DONE_THIS_TURN`) still guarantees the same file is never delegated twice, and the
+same prompt no longer re-derives the material.
 
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
