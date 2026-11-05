@@ -508,13 +508,25 @@ class TestModelPoolIsComplete:
         assert "anthropic/claude-haiku" not in _config_text(routing_home)
 
     @pytest.mark.asyncio
-    async def test_an_unknown_name_is_reported_not_silently_ignored(
+    async def test_an_unknown_name_is_added_with_a_warning(
             self, routing_home, runner, monkeypatch):
+        """The operator naming a model outranks a possibly stale catalog cache - add it, but
+        say the capability metadata is unknown so a typo is visible immediately."""
         monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
                             lambda self, settings: ["openai/gpt-5-mini"])
         reply = await _dispatch(runner, "/model-routing add gpt-6-lunaa")
-        assert "Not in the provider catalog: gpt-6-lunaa" in reply
+        assert "Not in the provider catalog" in reply and "gpt-6-lunaa" in reply
         assert "refresh" in reply
+        assert "Added: gpt-6-lunaa" in reply
+        assert "Selected (4):" in reply, "the 3 configured models plus the one just named"
+
+    @pytest.mark.asyncio
+    async def test_removing_something_not_selected_says_so(
+            self, routing_home, runner, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["openai/gpt-5-mini"])
+        reply = await _dispatch(runner, "/model-routing remove not-in-the-list")
+        assert "nothing to remove" in reply and "not-in-the-list" in reply
 
     @pytest.mark.asyncio
     async def test_removing_the_last_model_is_refused(self, routing_home, runner, monkeypatch):

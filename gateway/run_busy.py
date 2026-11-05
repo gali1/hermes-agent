@@ -1794,13 +1794,17 @@ class GatewayBusySessionMixin:
                 pool = [str(c) for c in (state.get("candidates") or []) if c]
             state["candidates"] = pool
             current = self._model_routing_current_models(settings, changes_now)
-            added, dropped, unknown, already = [], [], [], []
+            added, dropped, unsure, already, missing = [], [], [], [], []
             for name in names:
                 if verb == "add":
                     match = next((m for m in pool if m.lower() == name.lower()), None)
                     if match is None:
-                        unknown.append(name)
-                    elif match in current:
+                        # The operator naming a model is a stronger signal than a possibly stale
+                        # catalog cache, and `allow_unknown_metadata: yes` means an undeclared
+                        # model is penalised rather than disqualified - so add it, but say so.
+                        match = name
+                        unsure.append(name)
+                    if match in current:
                         already.append(match)
                     else:
                         current.append(match)
@@ -1808,7 +1812,7 @@ class GatewayBusySessionMixin:
                 else:
                     match = next((m for m in current if m.lower() == name.lower()), None)
                     if match is None:
-                        unknown.append(name)
+                        missing.append(name)
                     else:
                         current.remove(match)
                         dropped.append(match)
@@ -1833,10 +1837,15 @@ class GatewayBusySessionMixin:
                 notes.append("Removed: " + ", ".join(dropped))
             if already:
                 notes.append("Already in the list: " + ", ".join(already))
-            if unknown:
-                notes.append("Not in the provider catalog: " + ", ".join(unknown)
-                             + " (check the spelling, or run `hermes model routing refresh` "
-                               "if the model is new)")
+            if missing:
+                notes.append("Not in your selection, so nothing to remove: "
+                             + ", ".join(missing))
+            if unsure:
+                notes.append("\u26a0\ufe0f Not in the provider catalog (added anyway - routing "
+                             "treats unknown capability metadata as a penalty, not a "
+                             "disqualification): " + ", ".join(unsure)
+                             + "\n   Check the spelling, or run `hermes model routing refresh` "
+                               "if the model is new.")
             head = "\n".join(notes)
             if added or dropped:
                 state["step"] = "confirm"
