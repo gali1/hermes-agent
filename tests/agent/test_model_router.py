@@ -1579,3 +1579,75 @@ def test_image_output_request_routes_away_from_a_text_only_model():
     )
     assert mr._exclusion_reason(text_only, profile, mr.RoutingConfig()) == "unsupported_output_image"
     assert mr.rank_candidates(profile, [text_only, painter]).best_key == "test/painter"
+
+
+# -- switch_on_cost: the mid-session opt-in must actually be reachable ---------
+
+
+def test_switch_on_cost_allows_a_cost_downgrade_mid_session():
+    """`switch_on_cost` is exposed as 'Allow a mid-session switch to a cheaper model'.
+
+    The mid-session guard (prompt-cache stability) used to return before the flag was read,
+    so the setting was inert for every turn after the first: the CLI and the picker offered a
+    switch that could not change a decision.
+    """
+    profile = mr.classify_request("hello")
+    selection = mr.rank_candidates(
+        profile,
+        [spec_cand(spec("current", cost_in=50.0, cost_out=50.0)),
+         spec_cand(spec("rival", cost_in=0.1, cost_out=0.1))],
+        mr.RoutingConfig(switch_on_cost=True),
+        current_model="current",
+        mid_session=True,
+    )
+    assert selection.model == "rival"
+    assert selection.kept_current is False
+
+
+def test_switch_on_cost_never_upgrades_mid_session_without_a_gap():
+    """The opt-in names a *cheaper* model. A mid-session jump that merely scores higher, at the
+    same price, would pay the prompt-cache miss for a better fit it cannot justify."""
+    profile = mr.classify_request("hello", conversation_tokens=60000)
+    cfg = mr.RoutingConfig(
+        switch_on_cost=True, stability_threshold=0.001,
+        # Fit dominates, price and reliability are neutral, so the rival wins on context fit
+        # alone: a score win with no cost argument.
+        weights={"capability": 0.1, "cost": 0.0, "reliability": 0.0,
+                 "context": 0.9, "continuity": 0.0},
+    )
+    selection = mr.rank_candidates(
+        profile,
+        [spec_cand(spec("current", cost_in=1.0, cost_out=1.0, context_window=70000)),
+         spec_cand(spec("rival", cost_in=1.0, cost_out=1.0, context_window=2_000_000))],
+        cfg,
+        current_model="current",
+        mid_session=True,
+    )
+    assert selection.model == "current", "a non-cheaper rival must not dislodge the incumbent"
+    assert "mid-session switch requires" in selection.reason
+
+
+def test_switch_on_cost_off_keeps_the_incumbent_mid_session():
+    profile = mr.classify_request("hello")
+    selection = mr.rank_candidates(
+        profile,
+        [spec_cand(spec("current", cost_in=50.0, cost_out=50.0)),
+         spec_cand(spec("rival", cost_in=0.1, cost_out=0.1))],
+        mr.RoutingConfig(switch_on_cost=False),
+        current_model="current",
+        mid_session=True,
+    )
+    assert selection.model == "current"
+    assert selection.skip_reason == "within_stability_threshold"
+
+
+def test_route_turn_switches_mid_session_when_the_operator_opted_in(patched_candidates):
+    agent = _StubAgent(model="pricey")
+    cfg = _route_config(models=("weak", "pricey"), default="pricey")
+    cfg["smart_model_routing"]["switch_on_cost"] = True
+    mr.route_turn(agent, "What is 15 multiplied by 8?", config=cfg)   # turn 0 -> weak
+    agent.model = "pricey"                                            # back on the pricey one
+    agent.switch_calls.clear()
+    mr.route_turn(agent, "What is 15 multiplied by 8?", config=cfg)   # turn 1, opted in
+    assert agent.switch_calls, "switch_on_cost=True must permit the mid-session downgrade"
+    assert agent.model == "weak"

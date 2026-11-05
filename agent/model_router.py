@@ -2334,17 +2334,22 @@ def rank_candidates(
                 f"{gain:.3f} < stability {cfg.stability_threshold:.3f}",
                 "within_stability_threshold",
             )
-        if mid_session:
-            # A capable incumbent that merely scores lower is still serving the
-            # session; only an *ineligible* incumbent forces a mid-session
-            # change, because switching would invalidate the cached prompt
-            # prefix.  (A fresh turn — what `explain` / `status` describe — has
-            # no cache to protect and may switch on a capability gap.)
+        # A capable incumbent that merely scores higher is still serving the session;
+        # switching would invalidate the cached prompt prefix, so mid-session changes need a
+        # reason stronger than a score: an ineligible incumbent, a capability gap, or the
+        # operator opting in to a CHEAPER model via `switch_on_cost`.
+        #
+        # `switch_on_cost` used to be checked *after* this guard, which the guard had already
+        # made unreachable for any turn after the first — the setting was documented, exposed
+        # in the CLI/picker, and had no effect on a live session. It now relaxes exactly the
+        # case it names: a cost-driven downgrade, never a quality upgrade.
+        cost_downgrade_optin = bool(cfg.switch_on_cost and downgrade)
+        if mid_session and not cost_downgrade_optin:
             return _keep(
                 incumbent,
                 f"kept current model: {best.key} scored higher but a "
-                "mid-session switch requires a capability gap or ineligible "
-                "incumbent (prompt-cache stability)",
+                "mid-session switch requires a capability gap, an ineligible incumbent, "
+                "or switch_on_cost for a cheaper model (prompt-cache stability)",
                 "within_stability_threshold",
             )
         if downgrade and not cfg.switch_on_cost:
