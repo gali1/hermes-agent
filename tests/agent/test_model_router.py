@@ -1546,3 +1546,36 @@ def test_an_undeclared_output_modality_stays_unknown_not_unsupported():
     silent = mr.ModelCandidate("test", "silent", None)
     assert mr.capability_state(silent, "output_image") is mr.CapabilityState.UNKNOWN
     assert mr._exclusion_reason(silent, profile, mr.RoutingConfig()) == ""
+
+
+def test_an_image_output_request_is_recognised_from_the_turn_itself():
+    """C9b: until the classifier reads the turn, only a caller that already knew
+    to pass expects_image could protect an image-output request."""
+    for prompt in ("generate an image of a red fox", "Draw me a picture of the harbour",
+                   "render the chart as an image"):
+        profile = mr.classify_request(prompt)
+        assert "image" in profile.output_modalities, prompt
+        assert "output_image" in mr.required_capabilities(profile), prompt
+
+
+def test_merely_mentioning_an_image_does_not_ask_for_one():
+    """Negative controls: an attachment's description and a question about image
+    generation are INPUT requests, and must not trip the output gate."""
+    for prompt in ("what is in this image?", "explain how image generation works",
+                   "summarise this picture for me"):
+        profile = mr.classify_request(prompt)
+        assert "image" not in profile.output_modalities, prompt
+
+
+def test_image_output_request_routes_away_from_a_text_only_model():
+    profile = mr.classify_request("generate an image of a red fox")
+    text_only = mr.ModelCandidate(
+        "test", "txt-only", info("txt-only"),
+        spec=mr.ModelSpec.from_entry({"name": "txt-only", "supports_image_output": False}),
+    )
+    painter = mr.ModelCandidate(
+        "test", "painter", info("painter"),
+        spec=mr.ModelSpec.from_entry({"name": "painter", "supports_image_output": True}),
+    )
+    assert mr._exclusion_reason(text_only, profile, mr.RoutingConfig()) == "unsupported_output_image"
+    assert mr.rank_candidates(profile, [text_only, painter]).best_key == "test/painter"

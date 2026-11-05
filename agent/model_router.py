@@ -140,6 +140,18 @@ _STRUCTURED_SIGNALS = re.compile(
     re.IGNORECASE,
 )
 
+#: Phrases that ASK FOR an image back. Deliberately narrow: an unanchored "image"
+#: match would fire on any turn that merely mentions one ("what is in this image"),
+#: which is an INPUT request and already handled by attachments. Requires an
+#: explicit generation verb next to the artefact noun.
+_IMAGE_OUTPUT_SIGNALS = re.compile(
+    r"(?:\b(?:generate|create|make|draw|paint|render|produce|design)\b[^.?!\n]{0,40}"
+    r"\b(?:image|picture|illustration|drawing|artwork|logo|icon|poster|avatar)\b)"
+    r"|(?:\b(?:image|picture|illustration)\b[^.?!\n]{0,20}"
+    r"\b(?:of|showing)\b[^.?!\n]{0,20}\b(?:please|generate|create|draw)\b)",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Task profile + classification
@@ -385,8 +397,13 @@ def classify_request(
                 in_mods.append("video")
                 signals.append("input:video")
 
+    # C9b: derive the output modality from the turn itself when the caller did not
+    # say. Without this, an image-output request is only protectable by a caller
+    # that already knows to pass expects_image, which nothing real does.
+    wants_image_back = bool(expects_image) or bool(_IMAGE_OUTPUT_SIGNALS.search(text))
+
     out_mods: List[str] = ["text"]
-    if expects_image:
+    if wants_image_back:
         out_mods.append("image")
         signals.append("output:image")
     if expects_audio:

@@ -189,10 +189,16 @@ the original attachment and require image-output capability.
   by test: `test_image_output_request_excludes_a_model_that_cannot_emit_images`.
 - *Recorded on oklab-1*: `Decision.input_modalities` / `.output_modalities` carry what the
   decision was made for, so a follow-up turn can ask what was promised.
-- *Still missing on BOTH sides*: deriving `expects_image` from the turn itself (nothing
-  sets it outside tests), and re-attaching the original image on a follow-up. Until the
-  first lands, C9b is enforceable when asked for explicitly and inert otherwise — say
-  that, do not imply end-to-end image-edit support.
+- *Derived from the turn on oklab-1*: the classifier now recognises an image-output
+  request from the prompt itself (a generation verb within 40 characters of an artefact
+  noun: generate/create/make/draw/paint/render/produce/design + image/picture/
+  illustration/drawing/artwork/logo/icon/poster/avatar). Negative controls are pinned by
+  test, because the naive "contains the word image" rule would route every attachment
+  question through an image-output gate: "what is in this image?" and "explain how image
+  generation works" both stay text.
+- *Still missing on BOTH sides*: re-attaching the original image on a follow-up edit
+  turn. Until that lands, an image-edit turn is routed correctly but the attachment
+  continuity is the caller's job, so do not imply end-to-end image-edit support.
 
 **Invariant that does hold:** neither side may satisfy a modality requirement by
 dropping the attachment.
