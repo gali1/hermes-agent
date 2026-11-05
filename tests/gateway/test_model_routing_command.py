@@ -359,3 +359,102 @@ class TestCrossInterfaceSync:
         assert preview["enabled"] is True
         assert preview["settings"]["strategy"] == "cost"
         assert preview["skip_reason"] != "disabled"
+
+
+# ------------------------------------------------- C16/C17 at the gateway surface
+
+
+BLOCKLESS_CONFIG = """\
+model:
+  default: openai/gpt-5-mini
+  provider: openrouter
+"""
+
+
+@pytest.fixture
+def blockless_home(tmp_path, monkeypatch):
+    """A scratch HERMES_HOME with **no** ``smart_model_routing`` block (absence == off)."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(BLOCKLESS_CONFIG, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "1")
+    return home
+
+
+class TestNoOpWriteIsNotAClaim:
+    """C16 says nothing is written; C17 says the chat cannot claim otherwise.
+
+    Absence of ``smart_model_routing`` is the OFF state, so ``disable`` on a config that
+    never carried the block has nothing to do. Until M17 the gateway still answered
+    ``✅ Saved smart_model_routing (changed: nothing).`` and promised it would take effect.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disable_on_a_blockless_config_claims_no_save(self, blockless_home, runner):
+        before = _config_text(blockless_home)
+
+        await _dispatch(runner, "/model-routing")
+        await _dispatch(runner, "/model-routing 2")
+        reply = await _dispatch(runner, "/model-routing yes")
+
+        assert "✅ Saved" not in reply, reply
+        assert "Nothing saved" in reply
+        assert "not modified" in reply
+        assert "Takes effect on the next turn" not in reply
+        assert "smart_model_routing" not in _config_text(blockless_home)
+        assert _config_text(blockless_home) == before
+
+    @pytest.mark.asyncio
+    async def test_single_model_mode_is_the_same_action_as_disable(self, blockless_home, runner):
+        """§6.3: "switch to single-model mode" is the same action as disable — on the file too."""
+        before = _config_text(blockless_home)
+
+        await _dispatch(runner, "/model-routing")
+        await _dispatch(runner, "/model-routing 5")
+        reply = await _dispatch(runner, "/model-routing yes")
+
+        assert "✅ Saved" not in reply, reply
+        assert _config_text(blockless_home) == before
+
+    @pytest.mark.asyncio
+    async def test_single_model_mode_still_clears_a_real_selection(self, routing_home, runner):
+        """The control arm: when the flag IS on, both spellings of disable must write it off."""
+        mr.update_routing({"enabled": True, "preferred_models_only": True,
+                           "models": ["openai/gpt-5-mini"]})
+
+        await _dispatch(runner, "/model-routing")
+        await _dispatch(runner, "/model-routing 5")
+        reply = await _dispatch(runner, "/model-routing yes")
+
+        assert "✅ Saved" in reply
+        settings = mr.routing_settings()
+        assert settings["enabled"] is False
+        assert settings["preferred_models_only"] is False
+
+    @pytest.mark.asyncio
+    async def test_enable_still_reports_a_real_save(self, blockless_home, runner):
+        """Control: a change that does write must keep saying so."""
+        before = _config_text(blockless_home)
+
+        await _dispatch(runner, "/model-routing")
+        await _dispatch(runner, "/model-routing 1")
+        reply = await _dispatch(runner, "/model-routing yes")
+
+        assert "✅ Saved smart_model_routing" in reply
+        assert "Takes effect on the next turn" in reply
+        assert _config_text(blockless_home) != before
+        assert mr.routing_settings()["enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_button_surface_obeys_the_same_rules(self, blockless_home, runner):
+        """C12: the button path is the same applier, so it cannot diverge on the file."""
+        before = _config_text(blockless_home)
+
+        await _dispatch(runner, "/model-routing")
+        # Same two tokens the inline keyboard sends for "Switch to single-model mode".
+        await runner._model_routing_button_action(_event("/model-routing"), "single")
+        reply = await runner._model_routing_button_action(_event("/model-routing"), "yes")
+
+        assert "✅ Saved" not in reply, reply
+        assert _config_text(blockless_home) == before

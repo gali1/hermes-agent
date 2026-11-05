@@ -1751,8 +1751,18 @@ class GatewayBusySessionMixin:
             elif token in {"2", "disable", "off", "5", "single"}:
                 changes["enabled"] = False
                 if token in {"5", "single"}:
+                    # Section 6.3: "switch to single-model mode" is the *same action* as
+                    # disable, so it must produce the same change-set. Drop a pending
+                    # selection, and clear the scope flag only when it is actually on —
+                    # an unconditional ``preferred_models_only: False`` made this spelling
+                    # materialise a routing block on a config that never had one (C16),
+                    # while ``2``/``disable`` correctly writes nothing.
                     changes.pop("models", None)
-                    changes["preferred_models_only"] = False
+                    if bool(changes.get("preferred_models_only",
+                                        settings.get("preferred_models_only"))):
+                        changes["preferred_models_only"] = False
+                    else:
+                        changes.pop("preferred_models_only", None)
             elif token in {"3", "models"}:
                 flow["step"] = "models"
                 flow["page"] = 0
@@ -1992,6 +2002,19 @@ class GatewayBusySessionMixin:
         # loads config.yaml, so this cannot echo the caller's optimism.
         saved = mr.routing_settings()
         report = mr.routing_report(self._model_routing_load_config(), "")
+        if not result.get("written"):
+            # A verb that changes nothing must not claim a write (C14/C16). Where the block
+            # is absent, ``enabled: false`` *is* the state the file already describes, so
+            # ``update_routing`` returns written=False — the reply has to say so instead of
+            # printing the "Saved ... Takes effect on the next turn" pair the CLI stopped
+            # claiming in M15/C16.
+            return "\n".join([
+                f"ℹ️ Nothing saved — {result.get('no_op') or 'config.yaml already holds this state'}.",
+                "config.yaml was not modified. Current state:",
+                self._model_routing_state_text(report, saved),
+                "",
+                "Verify from the host: hermes model routing status",
+            ])
         changed = ", ".join(result.get("changed") or []) or "nothing"
         lines = [f"✅ Saved smart_model_routing (changed: {changed}).",
                  "Read back from config.yaml:"]
@@ -2120,8 +2143,15 @@ class GatewayBusySessionMixin:
         elif token in {"2", "disable", "off", "5", "single"}:
             changes["enabled"] = False
             if token in {"5", "single"}:
+                # Same change-set as the typed `5`: see the typed applier's note — the
+                # flag is cleared only when it is actually on, so this spelling does not
+                # materialise a block on a config that never had one (C16/C17).
                 changes.pop("models", None)
-                changes["preferred_models_only"] = False
+                if bool(changes.get("preferred_models_only",
+                                    settings.get("preferred_models_only"))):
+                    changes["preferred_models_only"] = False
+                else:
+                    changes.pop("preferred_models_only", None)
         elif token in {"3", "models"}:
             candidates = [str(c) for c in (flow.get("candidates") or []) if c] or [
                 str(c.get("model")) for c in (report.get("candidates") or []) if c.get("model")]

@@ -342,6 +342,31 @@ present, the verb still prints `Saved to config.yaml`. That statement is about t
 resulting config, which does hold that state; it was left alone rather than widening the
 diff.
 
+## C17 — A no-op reply may not claim a write, and "single-model mode" is disable on the file too
+
+C16 governs the file; this governs what the chat says about it, and closes the one
+spelling of disable that still changed the file.
+
+* **The gateway reports a write only when the file changed.** `_model_routing_commit`
+  reads the writer's own `written` flag before composing its reply. When the writer
+  returns `written: false` (the C16 absent-block no-op), the reply is
+  `Nothing saved — <no_op reason>`, it says `config.yaml was not modified`, and it never
+  carries `✅ Saved` or `Takes effect on the next turn`. This is C14's rule (a footer is a
+  claim about the file) applied to §6.3's result message; the CLI has held it since M13.
+* **`Switch to single-model mode` produces disable's change-set.** §6.3 makes it the same
+  action, so it may not add `preferred_models_only: false` unconditionally: on a config
+  that never carried a block that extra key made the *writer* see a real change and
+  materialise `{enabled: false, preferred_models_only: false}` where `2`/`disable` wrote
+  nothing. The flag is cleared only when it is actually on (pending or saved), and a
+  pending `models` selection is always dropped.
+* **Both input surfaces.** The typed applier and the button applier carry the same
+  change-set logic (C12); the rule is asserted through the real dispatch path and through
+  `_model_routing_button_action`.
+
+Control that keeps the assertions honest: `enable` on the same blockless config must
+still print `✅ Saved smart_model_routing` and must still write, and `single` with the
+flag genuinely on must still turn it off.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
