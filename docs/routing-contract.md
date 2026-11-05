@@ -390,6 +390,25 @@ Control that keeps the assertions honest: a tap from an older message must still
 that message's options, and a picker must still answer after the adapter's per-chat maps are
 cleared (simulating a plugin reload).
 
+## C19 — A page the user must answer with text has to say how
+
+The numbered models page is not a menu graphic: every caller of it is a reply the user answers
+by typing. It is reachable only where no button picker was used — a text-only platform, or a
+button platform whose toggle send failed — so it must name the accepted answers:
+
+* one compact line, not a prose dump: the numbered form (`1,3`, first = highest priority), the
+  word forms (`all`, `none`, `back`, `cancel`), and the exact-name form (`add <model>` /
+  `remove <model>`);
+* the pager stays one line (`Models 1–10 of 132 · next / prev`) rather than a second sentence
+  of instructions;
+* removing the instruction line is a regression even though the row list still renders: a
+  user who cannot see what to type is the reported "I type something and get the same text
+  back" loop, reached through the page instead of the flow.
+
+Control that keeps this honest: a button platform's typed `3` must send the picker and never
+this page (C12: same interaction as the 🎛 button), so the page only exists where the line
+above is the only guidance available.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

@@ -516,6 +516,51 @@ class TestRoutingButtonsFlow:
         assert "Reply /model-routing 1,3" in reply
 
     @pytest.mark.asyncio
+    async def test_text_only_page_teaches_the_answers(self, routing_home):
+        """The numbered page only exists as a reply the user answers with text, so it must say
+        how. Trimming it to bare rows leaves a text-only user with no way in."""
+        adapter = _TextOnlyAdapter()
+        runner = _make_runner(adapter)
+
+        await runner._handle_model_routing_command(_event("/model-routing"))
+        reply = await runner._handle_model_routing_command(_event("/model-routing 3"))
+
+        assert reply is not None, "a text-only platform must get a text page, not a silent drop"
+        assert "Reply /model-routing 1,3" in reply
+        for word in ("all", "none", "cancel", "add <model>"):
+            assert word in reply
+        # the fix must not resurrect the prose dump it replaced
+        assert "1,3 (numbers" not in reply
+        assert "next or /model-routing prev" not in reply
+
+    @pytest.mark.asyncio
+    async def test_compact_pager_and_the_instruction_coexist(self, routing_home, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: [f"m{i}" for i in range(40)])
+        runner = _make_runner(_TextOnlyAdapter())
+
+        await runner._handle_model_routing_command(_event("/model-routing"))
+        reply = await runner._handle_model_routing_command(_event("/model-routing 3"))
+
+        assert reply is not None
+        assert "Models 1\u201310 of 40" in reply      # one compact pager line
+        assert "Reply /model-routing 1,3" in reply     # still answerable
+
+    @pytest.mark.asyncio
+    async def test_unreadable_selection_says_it_once(self, routing_home):
+        """One instruction per reply: the error sentence must not repeat what the page says."""
+        runner = _make_runner(_TextOnlyAdapter())
+
+        await runner._handle_model_routing_command(_event("/model-routing"))
+        await runner._handle_model_routing_command(_event("/model-routing 3"))
+        reply = await runner._handle_model_routing_command(_event("/model-routing zzz"))
+
+        assert reply is not None
+        assert reply.startswith("Could not read that selection.")
+        assert reply.count("Reply /model-routing 1,3") == 1
+        assert "add <model>" in reply
+
+    @pytest.mark.asyncio
     async def test_preferences_button_hands_over_to_the_typed_step(self, routing_home):
         adapter = _ButtonAdapter()
         runner = _make_runner(adapter)

@@ -1714,6 +1714,12 @@ class GatewayBusySessionMixin:
         if pages > 1:
             line = f"Models {page * size + 1}\u2013{page * size + len(window)} of {len(candidates)}"
             lines.append(line + "  \u00b7  next / prev")
+        # Every caller of this page is a reply the user answers with text: a text-only
+        # platform, or a button platform where the toggle picker could not be sent. Without
+        # this line the list is a dead end (the reported "I type something and get the same
+        # text back"). Compact on purpose - one line, no paging prose.
+        lines.append("Reply /model-routing 1,3 (first = highest priority), all, none, back or "
+                     "cancel \u2014 or name one: add <model> / remove <model>.")
         return "\n".join(lines)
 
     async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
@@ -1974,8 +1980,10 @@ class GatewayBusySessionMixin:
                     if candidates[index] not in picked:
                         picked.append(candidates[index])
                 if not picked and token not in {"none"}:
-                    return ("Could not read that selection. Reply with numbers from the list "
-                            "(e.g. /model-routing 1,3), all, none, back or cancel.\n\n"
+                    # The page below carries the instruction line (C19), so this sentence must
+                    # not repeat it - that is exactly the "two ways to say the same thing"
+                    # clutter the operator reported.
+                    return ("Could not read that selection.\n\n"
                             + self._model_routing_models_page(flow))
                 chosen = picked
             changes["models"] = list(chosen)
