@@ -551,7 +551,9 @@ code, `delegation_batch` showing `operations: 2`.
 
 On `telegram`, `api_server` and any other remote platform, the delegation planner accepts **only**
 the adapter's own `saved at:` note pointing inside Hermes' media caches
-(`cache/documents`, `cache/images`, `cache/audio`, `cache/video`, `cache/media`), resolved with
+(`cache/documents`, `cache/images`, `cache/audio`, `cache/video`, `cache/media`) plus the local Bot
+API server's own directories (`telegram-bot-api/local`, `telegram-bot-api/data` — in `--local` mode
+the adapter reads telegram files straight off disk there), resolved with
 symlinks and `..` collapsed (`Path.resolve(strict=True)` then `relative_to(root)`). A path that was
 typed, pasted, recalled from memory, or echoed by a tool or a web page delegates nothing.
 
@@ -625,6 +627,18 @@ which is exactly the material C26 trusts.
 
 Verified on generated files: a 12 KB package declaring 315 MB → *"Not a safe DOCX: … refusing to
 inflate it"*; a 6000-row sheet → the truncation line above; a 230 KB CSV → the counted clip above.
+
+## C31 — A finished result ends the re-derivation
+
+When a delegation succeeds, the injected block states that the content was extracted from the actual
+file and is complete, and **the call that carries it sets `tool_choice: "none"`** (when the request
+has tools). This is a stop condition, not a hint: measured twice, the primary re-ran its own
+extraction over the same file and hit the turn budget without answering.
+
+Guards: only on success (a failed delegation must leave tools available, or the model cannot recover
+itself), only when `tools` is present, never overwriting a `tool_choice` the caller set, the caller's
+request is not mutated in place, and `capability_delegation.stop_tool_use_after_delegation: false`
+turns it off. A `tool_stop` line is written to the audit trail.
 
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,

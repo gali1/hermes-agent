@@ -793,3 +793,25 @@ def test_a_truncated_csv_says_how_many_rows_were_shown(tmp_path, monkeypatch):
     messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
     assert "truncated: showed" in note and "rows" in note
     assert "of 20001 rows" in note or "of 20000 rows" in note
+
+
+def test_the_configured_output_cap_raises_the_estimate(monkeypatch):
+    """A 4000-token answer costs 20x a 200-token allowance; the estimate must use the real cap."""
+    choice = cd.SpecialistChoice(provider="p", model="m", modality="text", reason="t",
+                                cost_in=0.10, cost_out=0.50)
+    monkeypatch.setattr(cd, "_output_token_allowance", lambda: 1024)
+    low, _ = cd._price(choice, {}, bytes_sent=1200, modality="text")
+    monkeypatch.setattr(cd, "_output_token_allowance", lambda: 64000)
+    high, basis = cd._price(choice, {}, bytes_sent=1200, modality="text")
+    assert high > low * 10, f"{high} should dwarf {low}"
+    assert basis == "estimated_from_bytes"
+
+
+def test_the_estimate_is_biased_high_not_low(monkeypatch):
+    """bytes/3 over-counts input tokens on purpose: undercounting lets a budget slip."""
+    choice = cd.SpecialistChoice(provider="p", model="m", modality="text", reason="t",
+                                cost_in=1.0, cost_out=0.0)
+    monkeypatch.setattr(cd, "_output_token_allowance", lambda: 1024)
+    usd, _ = cd._price(choice, {}, bytes_sent=3000, modality="text")
+    # 3000 bytes at 4 bytes/token would be 750 tokens = $0.00075; 3 bytes/token gives 1000 = $0.001
+    assert usd >= 0.0009, f"estimate {usd} under-counts input"
