@@ -205,6 +205,13 @@ class DelegationResult:
     error: str = ""
     usage: Dict[str, int] = field(default_factory=dict)
     est_cost_usd: float = 0.0
+    #: False when the provider reported no token usage: est_cost_usd is then an ESTIMATE derived
+    #: from the payload size and the specialist's declared rates, not a measured figure. Billing
+    #: audit needs that distinction, and a money budget needs a non-zero number even when the
+    #: provider is silent - treating unknown cost as 0.0 means the budget can never trip.
+    cost_known: bool = True
+    #: "usage" (measured), "estimated_from_bytes" (provider silent), "free_local" (STT/OCR).
+    cost_basis: str = "usage"
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -218,6 +225,8 @@ class DelegationResult:
             "error": self.error,
             "usage": dict(self.usage),
             "est_cost_usd": round(self.est_cost_usd, 8),
+            "cost_known": self.cost_known,
+            "cost_basis": self.cost_basis,
         }
 
     def to_json(self) -> str:
@@ -432,8 +441,14 @@ def _transcribe_file(path: Path) -> Tuple[bool, str, str]:
 
 
 def _usage_of(response: Any) -> Dict[str, int]:
-    """Prompt/completion tokens when the SDK reports them; {} when it does not."""
+    """Prompt/completion tokens when the provider reports them; {} when it does not."""
     usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if isinstance(usage, dict):
+        return {key: int(value) for key, value in usage.items()
+                if key in ("input_tokens", "output_tokens", "total_tokens")
+                and isinstance(value, int)}
     if usage is None:
         return {}
     out: Dict[str, int] = {}
@@ -445,16 +460,39 @@ def _usage_of(response: Any) -> Dict[str, int]:
     return out
 
 
-def _price(choice: SpecialistChoice, usage: Dict[str, int]) -> float:
-    """Estimated USD for this call, from the prices carried by the chosen specialist.
+#: Used ONLY when the provider reports no usage, and labelled as an estimate. It deliberately
+#: OVERCOUNTS: a budget that under-charges a silent provider is a budget that never trips.
+#: 3 bytes/token is pessimistic for text, and the output allowance takes the configured cap when
+#: one exists rather than assuming a short reply.
+_EST_BYTES_PER_TOKEN = 3
+_EST_OUTPUT_TOKENS_FLOOR = 1024
 
-    Zero is the honest answer for anything unpriced or for the local STT path — an invented
-    estimate in an audit record is worse than an empty one.
-    """
-    if not usage:
-        return 0.0
-    return (usage.get("input_tokens", 0) * choice.cost_in
-            + usage.get("output_tokens", 0) * choice.cost_out) / 1_000_000.0
+
+def _output_token_allowance() -> int:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        block = (load_config_readonly() or {}).get("capability_delegation") or {}
+        cap = int(block.get("max_output_tokens") or 0)
+    except Exception:  # noqa: BLE001
+        cap = 0
+    return max(cap, _EST_OUTPUT_TOKENS_FLOOR)
+
+
+def _price(choice: SpecialistChoice, usage: Dict[str, int], *,
+           bytes_sent: int = 0, modality: str = "") -> Tuple[float, str]:
+    """(usd, basis) — measured when the provider reports usage, labelled estimate when it does not."""
+    if usage:
+        usd = (usage.get("input_tokens", 0) * choice.cost_in
+               + usage.get("output_tokens", 0) * choice.cost_out) / 1_000_000.0
+        return usd, "usage"
+    if not (choice.cost_in or choice.cost_out):
+        return 0.0, "free_local"
+    est_in = max(1, int(bytes_sent or 0) // _EST_BYTES_PER_TOKEN)
+    usd = (est_in * choice.cost_in
+           + _output_token_allowance() * choice.cost_out) / 1_000_000.0
+    binary = modality in ("audio", "video", "image", "pdf", "document")
+    return usd, ("estimated_from_bytes_binary" if binary else "estimated_from_bytes")
 
 
 def _read_limited(path: Path, max_bytes: int) -> Tuple[bytes, str]:
@@ -645,7 +683,7 @@ async def delegate_capability(
         if ok and transcript.strip():
             return DelegationResult(
                 success=True, text=transcript.strip(), provider="stt", model="local",
-                modality="audio", bytes_sent=size,
+                modality="audio", bytes_sent=size, cost_known=True, cost_basis="free_local",
                 reason="transcribed locally with the STT stack — no model call was needed",
             )
         return DelegationResult(
@@ -719,10 +757,11 @@ async def delegate_capability(
             error="the specialist returned no content",
         )
     usage = _usage_of(response)
+    usd, basis = _price(choice, usage, bytes_sent=sent, modality=want)
     return DelegationResult(
         success=True, text=text, provider=choice.provider, model=choice.model,
         modality=want, bytes_sent=sent, reason=f"{choice.reason}; {note}",
-        usage=usage, est_cost_usd=_price(choice, usage),
+        usage=usage, est_cost_usd=usd, cost_known=bool(usage), cost_basis=basis,
     )
 
 

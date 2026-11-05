@@ -596,6 +596,7 @@ def test_local_stt_reports_zero_cost(pool, aux, tmp_path, monkeypatch):
     result = asyncio.run(cd.delegate_capability(str(voice), "transcribe", modality="audio",
                                                 config=_config(["primary-model"])))
     assert result.success and result.est_cost_usd == 0.0 and result.usage == {}
+    assert result.cost_basis == "free_local" and result.cost_known is True
 
 
 # --------------------------------------------------------------------------- documents + video
@@ -647,3 +648,60 @@ def test_video_transport_native_is_refused_honestly(tmp_path):
     messages, sent, note = cd.build_delegation_messages(str(clip), "look", "video",
                                                         transport="native")
     assert sent == 0 and "no provider here accepts a native video part" in note
+
+
+def test_a_model_call_without_usage_is_marked_cost_unknown(pool, monkeypatch, tmp_path):
+    """gpt-6-luna is priced; reporting 0.0 without saying "no usage" is a lie by omission."""
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"],
+                                                  cost_in=0.10, cost_out=0.50)])
+
+    async def no_usage(**_kwargs):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="OK", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", no_usage, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer, long enough to be used")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(str(doc), "read", modality="pdf",
+                                        config=_config(["primary-model", "reader"]))
+    assert result.success is True
+    assert result.cost_known is False, "no usage must not read as free"
+    assert result.cost_basis == "estimated_from_bytes_binary", (
+        "a binary payload's estimate is labelled as byte-derived, not token-derived")
+    # 41-byte pdf payload: ~10 input tokens + a 200-token reply allowance, at $0.10/$0.50 per 1M
+    assert result.est_cost_usd > 0.0, "a money budget must not be defeated by a silent provider"
+
+
+def test_a_dict_usage_shape_is_understood(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"],
+                                                  cost_in=0.10, cost_out=0.50)])
+
+    async def dict_usage(**_kwargs):
+        return {"choices": [{"message": {"content": "OK"}}],
+                "usage": {"input_tokens": 2000, "output_tokens": 1000, "total_tokens": 3000}}
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", dict_usage, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer, long enough to be used")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(str(doc), "read", modality="pdf",
+                                        config=_config(["primary-model", "reader"]))
+    assert result.usage["total_tokens"] == 3000
+    assert abs(result.est_cost_usd - (2000 * 0.10 + 1000 * 0.50) / 1_000_000) < 1e-12
+    assert result.cost_known is True
+
+
+def test_a_large_binary_payload_trips_a_small_budget_on_estimate_alone():
+    """2 MB of audio with a silent provider must still cost enough to blow a $0.01 budget."""
+    choice = cd.SpecialistChoice(provider="opencode-zen", model="gpt-6-luna", modality="audio",
+                                 reason="test", cost_in=0.10, cost_out=0.50)
+    usd, basis = cd._price(choice, {}, bytes_sent=2 * 1024 * 1024, modality="audio")
+    assert basis == "estimated_from_bytes_binary"
+    assert usd > 0.01, f"estimate {usd} would fit inside a 1-cent budget"

@@ -547,6 +547,70 @@ Operations are independent by construction, so they run in parallel (`ThreadPool
 invoice → two operations (audio → `stt/local`, pdf → `gpt-6-luna`), one answer containing the OCR
 code, `delegation_batch` showing `operations: 2`.
 
+## C26 — Path trust: only adapter-produced files are delegated on remote surfaces
+
+On `telegram`, `api_server` and any other remote platform, the delegation planner accepts **only**
+the adapter's own `saved at:` note pointing inside Hermes' media caches
+(`cache/documents`, `cache/images`, `cache/audio`, `cache/video`, `cache/media`), resolved with
+symlinks and `..` collapsed (`Path.resolve(strict=True)` then `relative_to(root)`). A path that was
+typed, pasted, recalled from memory, or echoed by a tool or a web page delegates nothing.
+
+Why it is not merely tidy: a typed path that is treated as an attachment lets anyone who can put
+text in front of the agent — another member of a group chat, a web page the agent fetched — make it
+read a local file and send the contents to a third-party provider. One such source was already
+found in the wild: recalled memory injected into the user message contained my own scratch paths,
+and four `platform=telegram` events were produced for files nobody had attached.
+
+On the **CLI** typed paths stay allowed: it is the operator's own machine, and refusing them would
+break every local workflow. `strip_injected_context()` removes `<memory-context>` and system-note
+blocks before scanning, and tool/web output is never scanned at all (only the last user message is).
+
+## C27 — Cost: measured, estimated, or free — never silently zero
+
+| `cost_basis` | meaning | how produced |
+|---|---|---|
+| `usage` | measured | the provider reported token usage; priced from the specialist's own rates |
+| `estimated_from_bytes` / `_binary` | estimated, and labelled | provider silent: `bytes/3` input tokens (pessimistic) + the configured output allowance (floor 1024) |
+| `free_local` | genuinely free | local STT/OCR: no model call was made |
+| `failed` | nothing was spent | the operation failed before a call |
+
+`cost_known` is true only for `usage` and `free_local`. **A money budget charges the estimate**,
+because a budget that treats a silent provider as free never trips — which is the same as having no
+budget. `delegation_batch.cost_known` is the AND of its members, and its `cost_basis` reads
+`mixed_or_estimated` when they differ. Verified: a 2 MB audio payload with a silent provider
+estimates above a 1-cent budget; a 4-delegation run with the budget below the per-op estimate stops
+launching after the first.
+
+## C28 — api_server parity means its part types, not a workaround
+
+`gateway/platforms/api_server.py:466-468` defines the whole surface:
+
+```
+_TEXT_PART_TYPES   = {"text", "input_text", "output_text"}
+_IMAGE_PART_TYPES  = {"image_url", "input_image"}
+_FILE_PART_TYPES   = {"file", "input_file"}       # normaliser raises before any provider call
+```
+
+Accepted = **five** part types (text/input_text/output_text/image_url/input_image), plus a bare
+string and a list item that is a bare string, which are stringified. By design, and documented
+rather than routed around:
+
+* `file` / `input_file` parts are refused at normalisation, not at the provider.
+* A `data:application/pdf` URL is refused for both `file` and `image_url` ("Only image data URLs
+  are supported"), so a document reaches a model on this surface **only as extracted text** — which
+  is what the delegation layer produces anyway.
+* No audio parts (`audio_api: False`), no magic-byte inspection of inbound image payloads.
+
+So api_server parity is: the same delegation *behaviour* (note → local extraction/OCR/STT →
+labelled context → primary answers), over the part types this route accepts.
+
+## C29 — Telegram inbound size: this install is not bound by the 20 MB hosted cap
+
+`telegram.extra.base_url: http://127.0.0.1:8081/bot` with `telegram.extra.local_mode: true`: a
+self-hosted local Bot API server. The hosted-API 20 MB **download** limit therefore does not apply
+(2 GB send cap retained), and inbound files land on disk where the adapter records their paths —
+which is exactly the material C26 trusts.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
