@@ -23,8 +23,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -348,95 +350,645 @@ def _call_transcriber(transcribe: Transcriber, audio: Path) -> Tuple[float, bool
     return time.monotonic() - started, bool(ok), str(text or ""), str(error or "")
 
 
-def _stt_with_budget(wav: str, duration_s: float, *, out_dir: Path, deadline: float,
-                     transcribe: Transcriber) -> Tuple[str, float, str, float]:
-    """Transcribe as much of the audio as the remaining budget pays for, from the start.
+def _video_stt_config() -> Dict[str, Any]:
+    """``stt.video.*`` from the Hermes config; {} when unavailable (tests, CLI tools).
 
-    A first, short clip measures actual throughput (wall seconds per audio second) on this
-    machine and provider; that measurement - not a guessed constant - decides how much audio the
-    rest of the budget can pay for. Audio is then cut with ffmpeg, chunk by chunk, and the
-    deadline is re-checked before every call, so a too-optimistic estimate from the probe can
-    only overrun by one chunk rather than by the whole remaining track. The covered span is
-    returned so the caller can state exactly what was transcribed.
+    Only the video path reads this, so a five-minute clip can be tuned (smaller model, more
+    workers, a longer speech budget) without changing what voice-message transcription does.
     """
-    if duration_s <= 0.05:
-        return "", 0.0, "audio track is empty", 0.0
-    remaining = _remaining(deadline)
-    if remaining <= 0.05:
-        return "", 0.0, "time budget exhausted before speech-to-text (budget)", 0.0
+    try:
+        from hermes_cli.config import load_config_readonly
 
-    available = max(1.0, remaining * 0.5)  # never let the measuring call eat the whole budget
-    probe_s = min(duration_s, max(1.0, min(STT_PROBE_MAX_S, duration_s / 4.0, available)))
-    single_pass = probe_s >= duration_s - 1.0
-    if single_pass:
-        probe_s = duration_s
+        config = load_config_readonly() or {}
+    except Exception:  # noqa: BLE001 - no config is a normal state for a library call
+        return {}
+    stt = config.get("stt") if isinstance(config, dict) else None
+    if not isinstance(stt, dict):
+        return {}
+    video = stt.get("video")
+    out: Dict[str, Any] = dict(video) if isinstance(video, dict) else {}
+    local: Dict[str, Any] = stt["local"] if isinstance(stt.get("local"), dict) else {}
+    if not out.get("language"):
+        out["language"] = local.get("language") or stt.get("language") or ""
+    return out
 
-    part = _clip_wav(wav, out_dir / "stt_part0.wav", 0.0, probe_s)
-    if part is None:  # conversion failed; hand the full wav over rather than nothing
-        part, probe_s = Path(wav), duration_s
-        single_pass = True
-    elapsed, ok, text, error = _call_transcriber(transcribe, part)
-    if not ok and not text.strip():
-        return "", 0.0, error or "STT returned nothing", 0.0
-    parts = [text.strip()] if text.strip() else []
-    covered = probe_s
-    wall = elapsed
-    rtf = (elapsed / probe_s) if probe_s > 0 else 0.0
-    worst_rate = rtf
-    if single_pass:
-        return "\n".join(parts).strip(), covered, "", rtf
 
-    chunk_index = 1
+_STT_WORKER_SOURCE = '''"""Chunk decoder for agent/video_context.py - faster-whisper over slices of one wav.
+
+Written at run time into the video temp directory and executed by an interpreter that has
+faster-whisper installed. It exists because the video path needs three things the general STT
+provider does not offer: ONE model load per worker instead of one per chunk, the decoding
+settings this ctranslate2 build accepts (int8, beam_size=1, Silero VAD), and one JSON line per
+finished chunk, so a worker killed at the deadline still reports what it really decoded.
+
+argv: <audio wav> <plan json> <out jsonl> <config json>
+plan:  [[index, start_s, end_s], ...]   config: {model, device, compute_type, cpu_threads,
+         beam_size, language}
+"""
+import json
+import sys
+import time
+import wave
+
+import numpy as np
+from faster_whisper import WhisperModel
+
+audio_path, plan_path, out_path, config_path = sys.argv[1:5]
+with open(config_path, encoding="utf-8") as handle:
+    config = json.load(handle)
+with open(plan_path, encoding="utf-8") as handle:
+    plan = json.load(handle)
+
+model = WhisperModel(config["model"], device=config.get("device") or "cpu",
+                     compute_type=config.get("compute_type") or "int8",
+                     cpu_threads=int(config.get("cpu_threads") or 0))
+with wave.open(audio_path, "rb") as handle:
+    rate = handle.getframerate()
+    channels = handle.getnchannels()
+    raw = handle.readframes(handle.getnframes())
+audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+if channels > 1:
+    audio = audio.reshape(-1, channels).mean(axis=1)
+
+kwargs = {"beam_size": int(config.get("beam_size") or 1), "vad_filter": True,
+          "condition_on_previous_text": False,
+          "no_speech_threshold": 0.6, "log_prob_threshold": -1.0,
+          "vad_parameters": {"min_silence_duration_ms": 500}}
+if config.get("language"):
+    kwargs["language"] = config["language"]
+
+with open(out_path, "a", encoding="utf-8") as out:
+    for index, start, end in plan:
+        clip = audio[int(float(start) * rate):int(float(end) * rate)]
+        began = time.monotonic()
+        try:
+            segments, _info = model.transcribe(clip, **kwargs)
+            # Same AND-gate the local STT stack uses (openai-whisper's own rule): non-speech
+            # *and* low confidence, so quiet real speech survives and silence noise does not.
+            text = " ".join(
+                segment.text.strip() for segment in segments
+                if not (float(getattr(segment, "no_speech_prob", 0.0)) > 0.6
+                        and float(getattr(segment, "avg_logprob", 0.0)) < -1.0)
+            ).strip()
+            record = {"i": int(index), "ok": True, "text": text,
+                      "wall": round(time.monotonic() - began, 3)}
+        except Exception as exc:
+            record = {"i": int(index), "ok": False, "text": "",
+                      "error": ("%s: %s" % (type(exc).__name__, exc))[:200],
+                      "wall": round(time.monotonic() - began, 3)}
+        out.write(json.dumps(record) + "\\n")
+        out.flush()
+'''
+
+
+def _faster_whisper_available() -> bool:
+    try:
+        import faster_whisper  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+_PYTHON_PROBE_CACHE: Dict[str, bool] = {}
+
+
+def _interpreter_has_faster_whisper(python: str) -> bool:
+    """Does this interpreter import faster-whisper? Probed once per path, cached."""
+    if not python or not Path(python).exists():
+        return False
+    if python in _PYTHON_PROBE_CACHE:
+        return _PYTHON_PROBE_CACHE[python]
+    ok = False
+    try:
+        done = subprocess.run([python, "-c", "import faster_whisper"], timeout=60,
+                              capture_output=True)
+        ok = done.returncode == 0
+    except Exception:  # noqa: BLE001
+        ok = False
+    _PYTHON_PROBE_CACHE[python] = ok
+    return ok
+
+
+def _stt_worker_python(config: Dict[str, Any]) -> Optional[str]:
+    """The interpreter that can run the chunk worker: env, then us, then the STT command's.
+
+    The configured STT provider is a command template (``HERMES_LOCAL_STT_COMMAND``), and its
+    first word is usually the interpreter that already has faster-whisper installed - the same
+    one that answers voice messages. Reusing it means the video path gets the model settings it
+    needs without touching that provider.
+    """
+    candidates: List[str] = []
+    explicit = os.getenv("HERMES_VIDEO_STT_PYTHON") or config.get("python")
+    if isinstance(explicit, str) and explicit.strip():
+        candidates.append(explicit.strip())
+    if _faster_whisper_available():
+        candidates.append(sys.executable)  # this very process can run the worker
+    template = (os.getenv("HERMES_LOCAL_STT_COMMAND") or "").strip()
+    if template:
+        try:
+            first = shlex.split(template.format(input_path="x", output_dir="y", model="base",
+                                                language="en"))[0]
+        except (ValueError, KeyError, IndexError):
+            first = ""
+        if first and ("python" in Path(first).name.lower()):
+            candidates.append(first)
+    candidates.append(sys.executable)
+    for candidate in candidates:
+        if _interpreter_has_faster_whisper(candidate):
+            return candidate
+    return None
+
+
+def _partition_chunks(count: int, workers: int) -> List[List[int]]:
+    """Contiguous blocks of chunk indexes, one per worker: coverage then grows in time order."""
+    workers = max(1, min(workers, count))
+    base, extra = divmod(count, workers)
+    blocks: List[List[int]] = []
+    start = 0
+    for worker in range(workers):
+        size = base + (1 if worker < extra else 0)
+        blocks.append(list(range(start, start + size)))
+        start += size
+    return [block for block in blocks if block]
+
+
+def _parallel_worker_decode(wav: str, chunks: Sequence[Tuple[float, float]], *, out_dir: Path,
+                            deadline: float, python: str, model: str, workers: int,
+                            beam_size: int, compute_type: str, device: str,
+                            cpu_threads: int, language: Optional[str]
+                            ) -> Tuple[List[Optional[Tuple[float, bool, str, str]]], float, str]:
+    """Decode chunks in ``workers`` processes, each with one model load, killed at the deadline.
+
+    Each worker writes a JSON line per finished chunk as soon as it is done, so whatever was
+    decoded before the deadline survives even when the process is terminated.
+    """
+    results: List[Optional[Tuple[float, bool, str, str]]] = [None] * len(chunks)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    worker_script = out_dir / "stt_worker.py"
+    worker_script.write_text(_STT_WORKER_SOURCE, encoding="utf-8")
+    config_path = out_dir / "stt_worker_config.json"
+    config_path.write_text(json.dumps({
+        "model": model, "device": device or "cpu", "compute_type": compute_type or "int8",
+        "cpu_threads": max(1, int(cpu_threads)), "beam_size": max(1, int(beam_size)),
+        "language": language or ""}), encoding="utf-8")
+
+    started = time.monotonic()
+    processes: List[Tuple[Any, Path, int, Path]] = []
+    for worker, block in enumerate(_partition_chunks(len(chunks), workers)):
+        plan_path = out_dir / f"stt_plan_{worker}.json"
+        plan_path.write_text(json.dumps(
+            [[position, round(chunks[position][0], 3), round(chunks[position][1], 3)]
+             for position in block]), encoding="utf-8")
+        result_path = out_dir / f"stt_result_{worker}.jsonl"
+        result_path.write_text("", encoding="utf-8")
+        log_path = out_dir / f"stt_worker_{worker}.err"
+        with open(log_path, "wb") as log_handle:
+            processes.append((subprocess.Popen(
+                [python, str(worker_script), wav, str(plan_path), str(result_path),
+                 str(config_path)],
+                stdout=subprocess.DEVNULL, stderr=log_handle), result_path, len(block),
+                log_path))
+
+    try:
+        while True:
+            alive = [item for item in processes if item[0].poll() is None]
+            complete = all(
+                sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+                >= expected for _proc, path, expected, _log in processes)
+            if complete or not alive or _remaining(deadline) <= 0.4:
+                break
+            time.sleep(0.2)
+    finally:
+        for proc, _path, _expected, _log in processes:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc, _path, _expected, _log in processes:
+            try:
+                proc.wait(timeout=3.0)
+            except Exception:  # noqa: BLE001
+                proc.kill()
+
+    error = ""
+    wall_total = 0.0
+    lines_read = 0
+    for _proc, path, _expected, _log in processes:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                position = int(record["i"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not 0 <= position < len(results):
+                continue
+            lines_read += 1
+            wall = float(record.get("wall") or 0.0)
+            results[position] = (wall, bool(record.get("ok")),
+                                 str(record.get("text") or ""), str(record.get("error") or ""))
+            wall_total += wall
+    missing = [position for position, result in enumerate(results) if result is None]
+    if missing:
+        error = "time budget reached before a chunk finished (budget)"
+    if lines_read == 0:
+        # No chunk at all came back: the worker died before decoding (model load, OOM, ...).
+        detail = ""
+        for _proc, _path, _expected, log_path in processes:
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:  # noqa: BLE001
+                tail = ""
+            if tail:
+                detail = tail.splitlines()[-1][:200]
+                break
+        error = f"faster-whisper worker produced no output ({detail or 'see worker log'})"
+    elif all(result is not None and not result[1] and not result[2].strip()
+             for result in results):
+        first = results[0]
+        error = f"faster-whisper worker failed ({first[3] if first else 'no output'})"
+    if wall_total <= 0:
+        wall_total = time.monotonic() - started
+    return results, wall_total, error
+
+
+def _resolve_stt_model(explicit: Optional[str], config: Dict[str, Any]) -> str:
+    for candidate in (explicit, os.getenv(STT_MODEL_ENV), config.get("model")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return DEFAULT_STT_MODEL
+
+
+def _resolve_stt_workers(explicit: Optional[int], config: Dict[str, Any]) -> int:
+    for candidate in (explicit, config.get("workers")):
+        try:
+            if candidate is not None:
+                return max(1, min(16, int(candidate)))
+        except (TypeError, ValueError):
+            continue
+    return STT_WORKERS_DEFAULT
+
+
+def _resolve_stt_budget(explicit: Optional[float], config: Dict[str, Any],
+                        time_budget_s: float) -> float:
+    """Speech budget: caller, then ``stt.video.budget_s``, then the overall budget."""
+    for candidate in (explicit, config.get("budget_s")):
+        try:
+            if candidate is not None:
+                return max(0.0, float(candidate))
+        except (TypeError, ValueError):
+            continue
+    return time_budget_s
+
+
+def _resolve_stt_engine(*, transcribe: Optional[Transcriber], config: Dict[str, Any]
+                        ) -> Tuple[str, Optional[str], Optional[Transcriber]]:
+    """Which decoder to use: ("supplied"|"faster-whisper"|"provider", python, callable).
+
+    A caller-supplied transcriber always wins, so the configured STT stack stays in charge when
+    the caller named it. Otherwise the chunk worker is preferred when an interpreter can run it
+    (the video path needs int8/beam=1/one model load), and the configured provider is the
+    fallback - still parallelised per chunk, just without control of its decode settings.
+    """
+    if transcribe is not None:
+        return "supplied", None, transcribe
+    backend = str(config.get("backend") or "auto").strip().lower()
+    if backend not in ("provider", "command", "local_command"):
+        python = _stt_worker_python(config)
+        if python:
+            return "faster-whisper", python, None
+    from agent.capability_delegation import _transcribe_file
+
+    return "provider", None, _transcribe_file
+
+
+def _speech_spans(wav: str, duration_s: float, *, timeout_s: float,
+                  noise_db: float = STT_SILENCE_DB,
+                  min_silence_s: float = STT_MIN_SILENCE_S) -> Optional[List[Tuple[float, float]]]:
+    """Spans that contain something other than silence; None when ffmpeg cannot tell us.
+
+    ``silencedetect`` writes its events to stderr; inverting them gives the speech spans, which
+    is what gets decoded. Returning None (rather than guessing) keeps the fallback honest: with
+    no answer, the whole track is treated as speech and nothing is skipped or claimed skipped.
+    """
+    if timeout_s <= 1.0 or duration_s <= 0:
+        return None
+    try:
+        done = subprocess.run(
+            ["ffmpeg", "-v", "info", "-nostdin", "-i", wav, "-af",
+             f"silencedetect=noise={noise_db:g}dB:duration={min_silence_s:g}",
+             "-f", "null", "-"],
+            capture_output=True, text=True, timeout=max(2.0, timeout_s))
+    except Exception:  # noqa: BLE001
+        return None
+    stderr = done.stderr or ""
+    events = re.findall(r"silence_(start|end):\s*(-?[0-9]+(?:\.[0-9]+)?)", stderr)
+    if not events and "silencedetect" not in stderr:
+        return None  # ffmpeg refused the filter: no basis for skipping anything
+    spans: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for kind, value in events:
+        stamp = max(0.0, min(duration_s, float(value)))
+        if kind == "start":
+            if stamp - cursor > 0.05:
+                spans.append((cursor, stamp))
+            cursor = max(cursor, stamp)
+        else:
+            cursor = max(cursor, stamp)
+    if duration_s - cursor > 0.05:
+        spans.append((cursor, duration_s))
+    padded: List[Tuple[float, float]] = []
+    for start, end in spans:
+        start, end = max(0.0, start - 0.12), min(duration_s, end + 0.12)
+        if padded and start - padded[-1][1] <= 0.1:
+            padded[-1] = (padded[-1][0], max(end, padded[-1][1]))
+        else:
+            padded.append((start, end))
+    return padded
+
+
+def _plan_chunks(spans: Sequence[Tuple[float, float]], *, chunk_s: float,
+                 join_gap_s: float = 1.5) -> List[Tuple[float, float]]:
+    """Cut speech spans into decode jobs of at most ``chunk_s`` seconds, in time order."""
+    pieces: List[Tuple[float, float]] = []
+    for start, end in spans:
+        position = start
+        while end - position > 0.2:
+            take = min(max(0.5, chunk_s), end - position)
+            pieces.append((position, position + take))
+            position += take
+    chunks: List[Tuple[float, float]] = []
+    for start, end in pieces:
+        if (chunks and start - chunks[-1][1] <= join_gap_s
+                and end - chunks[-1][0] <= max(0.5, chunk_s)):
+            chunks[-1] = (chunks[-1][0], end)
+        else:
+            chunks.append((start, end))
+    return chunks
+
+
+@dataclass
+class SttOutcome:
+    """What the speech pass actually produced, and exactly which seconds it read."""
+
+    text: str = ""
+    covered_s: float = 0.0
+    error: str = ""
+    rtf: float = 0.0
+    silence_skipped_s: float = 0.0
+    audio_duration_s: float = 0.0
+    chunks: int = 0
+    wall_s: float = 0.0
+
+
+def _transcribe_chunks(wav: str, chunks: Sequence[Tuple[float, float]], *, out_dir: Path,
+                       deadline: float, transcribe: Transcriber,
+                       workers: int) -> Tuple[List[Optional[Tuple[float, bool, str, str]]],
+                                              float, str]:
+    """Decode chunks in parallel waves, in time order, stopping at ``deadline``.
+
+    A wave is at most ``workers`` chunks; each runs on its own daemon thread so the deadline can
+    be honoured by joining with a timeout instead of waiting for the slowest job. Chunks that do
+    not finish are left unset - the caller reports the coverage it really has rather than
+    pretending the audio in flight was read.
+    """
+    results: List[Optional[Tuple[float, bool, str, str]]] = [None] * len(chunks)
+    wall_total = 0.0
+    per_chunk_wall = 0.0
     failure = ""
-    while covered < duration_s - 0.5:
-        remaining = _remaining(deadline)
-        reserve = min(3.0, max(0.5, remaining * 0.05))  # notes and cleanup must still fit
-        spendable = remaining - reserve
-        if spendable <= 0.5:
-            break
-        chunk = min(STT_CHUNK_S, duration_s - covered)
-        if worst_rate > 0 and worst_rate * chunk > spendable:
-            chunk = spendable / worst_rate
-        if chunk < 2.0:  # another model load would cost more than the audio is worth
-            break
-        clip = _clip_wav(wav, out_dir / f"stt_part{chunk_index}.wav", covered, chunk)
+    index = 0
+
+    def _run(position: int) -> None:
+        start, end = chunks[position]
+        clip = _clip_wav(wav, out_dir / f"stt_c{position:03d}.wav", start, end - start)
         if clip is None:
+            results[position] = (0.0, False, "", "could not cut chunk")
+            return
+        results[position] = _call_transcriber(transcribe, clip)
+
+    while index < len(chunks):
+        remaining = _remaining(deadline)
+        if remaining <= 0.5:
             break
-        elapsed, ok, text, error = _call_transcriber(transcribe, clip)
-        wall += elapsed
-        if not ok and not text.strip():
-            failure = f"STT failed after {_fmt_mmss(covered)} ({error})"
+        # First wave is a single chunk: it measures this machine's real throughput before any
+        # parallelism is assumed, so a slow host loses one chunk's worth of budget, not all of it.
+        size = 1 if per_chunk_wall <= 0 else max(
+            1, min(workers, int(remaining * 0.85 / per_chunk_wall)))
+        batch = list(range(index, min(len(chunks), index + size)))
+        started = time.monotonic()
+        threads = [threading.Thread(target=_run, args=(position,), daemon=True) for position in batch]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=max(0.0, _remaining(deadline)))
+        spent = time.monotonic() - started
+        done = [position for position in batch if results[position] is not None]
+        if not done:
+            failure = "time budget reached before a chunk finished (budget)"
             break
+        per_chunk_wall = spent
+        wall_total += sum(results[position][0] for position in done)  # type: ignore[index]
+        index = batch[-1] + 1
+        if len(done) < len(batch):
+            failure = "time budget reached mid-chunk (budget)"
+            break
+        failed = [p for p in done
+                  if not results[p][1] and not results[p][2].strip()]  # type: ignore[index]
+        if failed:
+            detail = results[failed[0]][3]  # type: ignore[index]
+            failure = f"STT failed at {_fmt_mmss(chunks[failed[0]][0])} ({detail})"
+            break
+    return results, wall_total, failure
+
+
+def _stt_job(target: Path, tmp: Path, *, deadline: float,
+             transcribe: Optional[Transcriber], worker_python: Optional[str],
+             duration_s: float, workers: int, chunk_s: float, silence_db: float,
+             min_silence_s: float, model: str, beam_size: int, compute_type: str,
+             device: str, cpu_threads: int, language: Optional[str],
+             timings: Dict[str, float]) -> SttOutcome:
+    """Audio extraction, silence cutting, parallel decoding and the coverage arithmetic."""
+    outcome = SttOutcome(audio_duration_s=duration_s)
+    started = time.monotonic()
+    if _remaining(deadline) <= 0.5:
+        outcome.error = "time budget exhausted before audio extraction (budget)"
+        outcome.wall_s = time.monotonic() - started
+        return outcome
+
+    stage = time.monotonic()
+    wav, why = extract_audio(target, out_dir=tmp / "audio",
+                             timeout_s=min(600.0, _remaining(deadline)))
+    timings["audio_s"] = round(time.monotonic() - stage, 2)
+    if not wav:
+        outcome.error = why or "no audio track"
+        outcome.wall_s = time.monotonic() - started
+        return outcome
+
+    duration = _wav_duration(Path(wav)) or duration_s
+    outcome.audio_duration_s = duration
+    if duration <= 0.05:
+        outcome.error = "audio track is empty"
+        outcome.wall_s = time.monotonic() - started
+        return outcome
+
+    stage = time.monotonic()
+    spans = _speech_spans(wav, duration, timeout_s=min(30.0, max(2.0, _remaining(deadline) * 0.25)),
+                          noise_db=silence_db, min_silence_s=min_silence_s)
+    timings["silence_s"] = round(time.monotonic() - stage, 2)
+    if spans is None:
+        chunks = _plan_chunks([(0.0, duration)], chunk_s=chunk_s)
+    elif not spans:
+        outcome.covered_s = duration
+        outcome.silence_skipped_s = duration
+        outcome.error = "no speech detected (silence detector found only silence)"
+        outcome.wall_s = time.monotonic() - started
+        return outcome
+    else:
+        chunks = _plan_chunks(spans, chunk_s=chunk_s)
+    outcome.chunks = len(chunks)
+    if not chunks:
+        outcome.error = "no speech detected (silence detector found only silence)"
+        outcome.wall_s = time.monotonic() - started
+        return outcome
+
+    # With too little time left for a parallel wave, plan one short probe chunk instead of a
+    # queue: the coverage arithmetic then describes exactly that probe.
+    remaining = _remaining(deadline)
+    full_plan = True
+    if remaining < STT_MIN_CHUNK_BUDGET_S:
+        start = chunks[0][0] if chunks[0][0] > 1.0 else 0.0
+        probe_s = min(duration - start,
+                      max(1.0, min(STT_PROBE_MAX_S, duration / 4.0, remaining * 0.5)))
+        chunks = [(start, start + probe_s)]
+        full_plan = False
+        outcome.chunks = 1
+    else:
+        outcome.chunks = len(chunks)
+
+    if worker_python:
+        results, wall_total, failure = _parallel_worker_decode(
+            wav, chunks, out_dir=tmp / "audio", deadline=deadline, python=worker_python,
+            model=model, workers=workers, beam_size=beam_size, compute_type=compute_type,
+            device=device, cpu_threads=cpu_threads, language=language)
+        timings["stt_workers"] = len(_partition_chunks(len(chunks), workers))
+    else:
+        results, wall_total, failure = _transcribe_chunks(
+            wav, chunks, out_dir=tmp / "audio", deadline=deadline,
+            transcribe=transcribe, workers=workers)
+
+    parts: List[str] = []
+    covered_end = 0.0
+    done = 0
+    chunk_failure = ""
+    for position, (start, end) in enumerate(chunks):
+        result = results[position]
+        if result is None:
+            break
+        _elapsed, ok, text, detail = result
         if text.strip():
             parts.append(text.strip())
-        covered = min(duration_s, covered + chunk)
-        if chunk > 0:
-            worst_rate = max(worst_rate, elapsed / chunk)
-        chunk_index += 1
+        covered_end = end
+        done += 1
+        if not ok:
+            chunk_failure = f"STT failed at {_fmt_mmss(start)} ({detail or 'no text'})"
+            break  # partial text is kept, but nothing after a failed chunk is claimed
+    transcribed_s = sum(chunks[i][1] - chunks[i][0] for i in range(done))
+    outcome.text = "\n".join(parts).strip()
+    complete = done == len(chunks) and full_plan
+    outcome.covered_s = duration if complete else covered_end
+    outcome.silence_skipped_s = max(0.0, outcome.covered_s - transcribed_s)
+    outcome.rtf = (wall_total / transcribed_s) if transcribed_s > 0.05 else 0.0
+    outcome.wall_s = time.monotonic() - started
+    if done < len(chunks):
+        outcome.error = chunk_failure or failure or (
+            f"time budget reached after {_fmt_mmss(covered_end)} (budget)")
+    return outcome
 
-    rtf = (wall / covered) if covered > 0 else 0.0
-    return "\n".join(parts).strip(), covered, failure, rtf
+
+def _apply_stt_outcome(context: VideoContext, outcome: SttOutcome) -> None:
+    """Attach the transcript and the coverage line that says what was really read."""
+    if outcome.audio_duration_s:
+        context.audio_duration_s = outcome.audio_duration_s
+    context.covered_s = round(outcome.covered_s, 2)
+    context.stt_realtime_factor = round(outcome.rtf, 3)
+    context.silence_skipped_s = round(outcome.silence_skipped_s, 2)
+    context.stt_chunks = outcome.chunks
+    if outcome.text.strip():
+        context.transcript = outcome.text.strip()
+        if outcome.error:
+            context.transcript_error = outcome.error  # partial speech keeps the reason
+    else:
+        context.transcript_error = outcome.error or "STT returned nothing"
+    total = context.audio_duration_s or context.duration_s
+    skipped = context.silence_skipped_s
+    if "no speech detected" in (outcome.error or ""):
+        context.notes.append(
+            f"audio transcribed 0:00-{_fmt_mmss(outcome.covered_s)} of {_fmt_mmss(total)} "
+            f"(no speech detected; {_fmt_mmss(skipped)} of silence skipped)")
+        return
+    if total <= 0:
+        return
+    if outcome.covered_s >= total - 1.0:
+        note = f"audio transcribed 0:00-{_fmt_mmss(total)} of {_fmt_mmss(total)} (complete"
+        note += f"; {skipped:.0f}s of silence skipped)" if skipped >= 0.5 else ")"
+        context.notes.append(note)
+    else:
+        # The parenthetical must not lie about why the span stopped: a failed decode is not a
+        # budget stop, and saying so is the difference between "read less" and "broke".
+        reason = "budget" if not outcome.error or "budget" in outcome.error.lower() else "partial"
+        context.notes.append(
+            f"audio transcribed 0:00-{_fmt_mmss(outcome.covered_s)} of {_fmt_mmss(total)} "
+            f"({reason})")
 
 
 def build_video_context(path: str, *, max_frames: int = 8, do_ocr: bool = True,
                         do_transcribe: bool = True, keep_frames: bool = False,
                         transcribe: Optional[Transcriber] = None,
-                        time_budget_s: float = DEFAULT_TIME_BUDGET_S) -> VideoContext:
+                        time_budget_s: float = DEFAULT_TIME_BUDGET_S,
+                        stt_budget_s: Optional[float] = None,
+                        stt_model: Optional[str] = None,
+                        stt_workers: Optional[int] = None,
+                        stt_chunk_s: Optional[float] = None) -> VideoContext:
     """Frames + OCR + speech -> one structured representation, inside a wall-clock budget.
 
-    Never raises. Every stage stops at ``time_budget_s`` and leaves a coverage note saying how
-    much of the clip was actually read; nothing is invented for the part that was not.
+    Never raises. Frames and OCR stop at ``time_budget_s``; speech-to-text stops at
+    ``stt_budget_s`` (default: the same value, so existing callers see no change). The two run
+    concurrently, so the wall time is roughly the slower stage, not their sum. A coverage note
+    always says how much of the audio was actually read; nothing is invented for the part that
+    was not.
+
+    ``stt_model`` / ``stt_workers`` / ``stt_chunk_s`` default to ``stt.video.*`` in the config
+    (then to base / cpu_count-capped workers / 30 s). A transcriber passed in by the caller is
+    used as-is, so the configured STT stack stays in charge when one is supplied.
+
+    Optional ``stt.video`` config keys: ``model``, ``workers``, ``chunk_s``, ``budget_s``,
+    ``beam_size``, ``compute_type``, ``device``, ``cpu_threads``, ``language``, ``python``,
+    ``min_silence_s``, ``silence_db``, and ``backend`` (``auto`` uses the chunk worker,
+    ``provider`` forces the configured STT stack).
     """
     started = time.monotonic()
     try:
         budget = max(0.0, float(time_budget_s))
     except (TypeError, ValueError):
         budget = DEFAULT_TIME_BUDGET_S
+    config = _video_stt_config()
+    speech_budget = _resolve_stt_budget(stt_budget_s, config, budget)
+    workers = _resolve_stt_workers(stt_workers, config)
+    model = _resolve_stt_model(stt_model, config)
+    try:
+        chunk_s = float(stt_chunk_s if stt_chunk_s is not None else config.get("chunk_s")
+                        or STT_CHUNK_S)
+    except (TypeError, ValueError):
+        chunk_s = STT_CHUNK_S
+    chunk_s = min(120.0, max(2.0, chunk_s))
+
     # Keep a beat for assembling the notes/timings and cleaning up, so the call lands inside the
     # budget it was given rather than a second over it.
     deadline = started + max(0.0, budget - (1.0 if budget > 2.0 else 0.0))
+    stt_deadline = started + max(0.0, speech_budget - (1.0 if speech_budget > 2.0 else 0.0))
     target = Path(path)
-    context = VideoContext(path=str(target))
+    context = VideoContext(path=str(target), time_budget_s=round(budget, 2),
+                           stt_budget_s=round(speech_budget, 2), stt_workers=workers,
+                           stt_model=model)
     if not ffmpeg_available():
         context.notes.append("ffmpeg/ffprobe not installed")
         context.timings["total_s"] = round(time.monotonic() - started, 2)
@@ -465,9 +1017,23 @@ def build_video_context(path: str, *, max_frames: int = 8, do_ocr: bool = True,
             context.notes.append(
                 f"frames: {len(context.frames)} of {int(requested)} sampled (budget)")
 
+        no_audio = "has_audio" in info and not info["has_audio"]
+        if do_transcribe and no_audio:
+            # ffprobe already answered: do not let ffmpeg's error text stand in for the fact.
+            context.transcript_error = "no audio track"
+            context.notes.append("no audio stream in the container")
+            context.notes.append(
+                f"audio transcribed 0:00-0:00 of {_fmt_mmss(context.duration_s)} "
+                "(no audio track)")
+        speech = _start_speech_pass(context, target, tmp, stt_deadline=stt_deadline,
+                                    transcribe=transcribe, workers=workers, chunk_s=chunk_s,
+                                    model=model, config=config) if (
+            do_transcribe and not no_audio) else None
+
+        # OCR runs while the chunks decode: the two stages share the clock, not a queue.
+        read = 0
         if do_ocr and context.frames:
             stage = time.monotonic()
-            read = 0
             for frame in context.frames:
                 if _remaining(deadline) <= 0.5:
                     break
@@ -477,9 +1043,8 @@ def build_video_context(path: str, *, max_frames: int = 8, do_ocr: bool = True,
             if read < len(context.frames):
                 context.notes.append(f"OCR: {read} of {len(context.frames)} frames read (budget)")
 
-        if do_transcribe:
-            _transcribe_with_budget(context, target, tmp, deadline, transcribe,
-                                    has_audio=None if not info else bool(info.get("has_audio")))
+        if speech is not None:
+            _finish_speech_pass(context, speech[0], speech[1], stt_deadline)
 
         if keep_frames:
             context.notes.append(f"frames kept at {tmp / 'frames'}")
@@ -491,60 +1056,57 @@ def build_video_context(path: str, *, max_frames: int = 8, do_ocr: bool = True,
     return context
 
 
-def _transcribe_with_budget(context: VideoContext, target: Path, tmp: Path, deadline: float,
-                            transcribe: Optional[Transcriber],
-                            has_audio: Optional[bool] = None) -> None:
-    """Audio extraction + STT, with the coverage claim attached to the context."""
-    if has_audio is False:
-        # ffprobe already answered: do not let ffmpeg's error text stand in for the fact.
-        context.transcript_error = "no audio track"
-        context.notes.append("no audio stream in the container")
-        return
-    if _remaining(deadline) <= 0.5:
-        context.transcript_error = "time budget exhausted before audio extraction (budget)"
-        context.notes.append(f"audio transcribed 0:00-0:00 of {_fmt_mmss(context.duration_s)} (budget)")
-        return
-    if transcribe is None:
-        from agent.capability_delegation import _transcribe_file
+def _start_speech_pass(context: VideoContext, target: Path, tmp: Path, *, stt_deadline: float,
+                       transcribe: Optional[Transcriber], workers: int, chunk_s: float,
+                       model: str, config: Dict[str, Any]
+                       ) -> Tuple[threading.Thread, Dict[str, Any]]:
+    """Kick off STT on a worker thread so OCR proceeds in parallel."""
+    box: Dict[str, Any] = {}
 
-        transcribe = _transcribe_file
+    def _job() -> None:
+        stage = time.monotonic()
+        try:
+            backend, python, callable_ = _resolve_stt_engine(transcribe=transcribe,
+                                                             config=config)
+            box["backend"] = backend
+            cpu_threads = int(config.get("cpu_threads") or
+                              max(1, (os.cpu_count() or 1) // max(1, workers)))
+            box["outcome"] = _stt_job(
+                target, tmp, deadline=stt_deadline, transcribe=callable_,
+                worker_python=python,
+                duration_s=context.audio_duration_s or context.duration_s, workers=workers,
+                chunk_s=chunk_s, silence_db=float(config.get("silence_db") or STT_SILENCE_DB),
+                min_silence_s=float(config.get("min_silence_s") or STT_MIN_SILENCE_S),
+                model=model, beam_size=int(config.get("beam_size") or STT_BEAM_SIZE_DEFAULT),
+                compute_type=str(config.get("compute_type") or STT_COMPUTE_TYPE_DEFAULT),
+                device=str(config.get("device") or "cpu"), cpu_threads=cpu_threads,
+                language=(config.get("language") or "").strip() or None,
+                timings=context.timings)
+        except Exception as exc:  # noqa: BLE001 - a stage crash is reported, never raised
+            box["backend"] = box.get("backend", "supplied")
+            box["outcome"] = SttOutcome(
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                audio_duration_s=context.audio_duration_s or context.duration_s)
+        finally:
+            context.timings["stt_s"] = round(time.monotonic() - stage, 2)
 
-    stage = time.monotonic()
-    wav, why = extract_audio(target, out_dir=tmp / "audio",
-                             timeout_s=min(600.0, _remaining(deadline)))
-    context.timings["audio_s"] = round(time.monotonic() - stage, 2)
-    if not wav:
-        context.transcript_error = why or "no audio track"
-        if why.startswith("time budget"):
-            context.notes.append(
-                f"audio transcribed 0:00-0:00 of {_fmt_mmss(context.duration_s)} (budget)")
-        return
+    thread = threading.Thread(target=_job, name="video-stt", daemon=True)
+    thread.start()
+    return thread, box
 
-    duration = _wav_duration(Path(wav))
-    if duration <= 0:
-        duration = context.duration_s
-    context.audio_duration_s = duration or context.audio_duration_s
 
-    stage = time.monotonic()
-    text, covered, error, rtf = _stt_with_budget(
-        wav, duration, out_dir=tmp / "audio", deadline=deadline, transcribe=transcribe)
-    context.timings["stt_s"] = round(time.monotonic() - stage, 2)
-    context.covered_s = round(covered, 2)
-    context.stt_realtime_factor = round(rtf, 3)
-    if text.strip():
-        context.transcript = text.strip()
-        if error:
-            context.transcript_error = error  # partial speech still carries the failure reason
-    else:
-        context.transcript_error = error or "STT returned nothing"
-    total = context.audio_duration_s or duration
-    if total > 0:
-        if covered >= total - 1.0:
-            context.notes.append(
-                f"audio transcribed 0:00-{_fmt_mmss(total)} of {_fmt_mmss(total)} (complete)")
-        else:
-            context.notes.append(
-                f"audio transcribed 0:00-{_fmt_mmss(covered)} of {_fmt_mmss(total)} (budget)")
+def _finish_speech_pass(context: VideoContext, thread: threading.Thread,
+                        box: Dict[str, Any], stt_deadline: float) -> None:
+    """Join the speech thread and attach whatever it really produced."""
+    thread.join(timeout=max(0.5, _remaining(stt_deadline) + 5.0))
+    context.stt_backend = str(box.get("backend") or "")
+    outcome = box.get("outcome")
+    if outcome is None:
+        outcome = SttOutcome(
+            error="time budget exhausted during speech-to-text (budget)",
+            audio_duration_s=context.audio_duration_s or context.duration_s)
+        context.timings.setdefault("stt_s", 0.0)
+    _apply_stt_outcome(context, outcome)
 
 
 def frame_image_parts(context: VideoContext, limit: int = 4) -> List[Dict[str, object]]:
