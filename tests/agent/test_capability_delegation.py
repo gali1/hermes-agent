@@ -216,8 +216,10 @@ def test_provider_rejection_is_reported_not_swallowed(pool, monkeypatch, tmp_pat
 
     clip = tmp_path / "memo.mp3"
     clip.write_bytes(b"ID3" + b"0" * 32)
+    # transport="native" is the path that actually spends a provider request for audio
     result = cd.delegate_capability_sync(
-        str(clip), "transcribe", modality="audio", config=_config(["primary-model", "reader"]))
+        str(clip), "transcribe", modality="audio", config=_config(["primary-model", "reader"]),
+        transport="native")
 
     assert result.success is False
     assert "input_audio is not supported" in result.error
@@ -459,3 +461,40 @@ def test_transport_is_threaded_through_the_call(pool, monkeypatch, tmp_path):
         transport="text"))
     assert result.success is True
     assert "EXTRACTED BODY" in seen["messages"][0]["content"]
+
+
+# --------------------------------------------------------------------------- audio = STT
+
+
+def test_audio_returns_the_transcript_without_touching_a_model(pool, aux, tmp_path, monkeypatch):
+    """The missing capability is speech-to-text, not a model: no request should be spent."""
+    pool([_cand("primary-model", ["text"])])
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (True, "the disk is failing", ""))
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(
+        str(voice), "transcribe this", modality="audio",
+        config=_config(["primary-model"])))
+
+    assert result.success is True
+    assert result.text == "the disk is failing"
+    assert result.provider == "stt" and result.model == "local"
+    assert aux == [], "no specialist request for an audio transcript"
+
+
+def test_audio_without_stt_reports_the_stt_failure_not_a_fake_result(pool, aux, tmp_path, monkeypatch):
+    pool([_cand("primary-model", ["text"])])
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (False, "", "no STT provider configured"))
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(
+        str(voice), "transcribe this", modality="audio",
+        config=_config(["primary-model"])))
+
+    assert result.success is False
+    assert "no STT provider configured" in result.error
+    assert aux == []

@@ -434,6 +434,10 @@ is tested. C20's own limit stands: this hook still never sends a file to a speci
 `agent/capability_delegation.py` answers a different question from C20's: *which model performs one
 sub-task inside a turn the primary model still owns*. The primary is never displaced by it.
 
+* **Audio is a transcript, not a model call.** The capability the primary lacks for audio is
+  speech-to-text, which is infrastructure here; the row below shows it working, with the PyAV
+  incompatibility (`faster_whisper` wants `av.open(metadata_errors=...)`, PyAV 19 removed it)
+  routed around by an isolated venv behind the documented command-provider seam.
 * **Portable first, native part only as an opt-in.** Nothing in this tree builds a `file` or
   `input_audio` part — `gateway/platforms/api_server.py` rejects both and `agent/image_routing.py`
   states that a PDF must never become a vision part — so the default path is the one every provider
@@ -460,7 +464,7 @@ Verified on this host (live config, deepseek primary, gpt-6-luna specialist):
 |---|---|
 | image (PNG) → `gpt-6-luna`, asked for the visible string | `DELEGATE-OK-7319` returned |
 | pdf (688 B, real xref) → extraction (80 chars) → `gpt-6-luna` | `PDF-OK-4412` returned: the specialist saw text, never bytes |
-| audio on this host | **no STT backend installed** ("faster-whisper or HERMES_LOCAL_STT_COMMAND") and no live audio-capable model — reported as a failure, not faked |
+| audio (Ogg Vorbis) → local STT → transcript | **works**: `stt.provider: local_command` → `HERMES_LOCAL_STT_COMMAND` → `~/.hermes/tools/stt-venv` (isolated faster-whisper); the transcript is the delegation result and **no model request is spent** |
 | `gemini-3-flash` (catalog-listed, provider-retired) | 410 `ModelDeprecated` reported, then skipped on the next resolve |
 | audio / video specialists on opencode-zen | **none live**: `gemini-3.5/3.7-flash` answer 403 "model access is disabled" — audio and video delegation are unavailable until a live multimodal specialist exists |
 

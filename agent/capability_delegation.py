@@ -489,6 +489,30 @@ async def delegate_capability(
     except Exception as exc:  # pragma: no cover - defensive
         return DelegationResult(success=False, error=str(exc))
 
+    # ---- audio: transcribe, do not rent a model -------------------------------------
+    # The capability the primary model lacks here is speech-to-text, which is infrastructure and
+    # already exists in this tree. Returning the transcript beats paying a specialist to read
+    # text the primary can read itself; `transport="native"` still sends the audio to a model.
+    if want == "audio" and transport != "native":
+        try:
+            size = Path(os.path.expanduser(str(path or ""))).stat().st_size
+        except OSError as exc:
+            return DelegationResult(success=False, modality="audio",
+                                    error=f"no such file: {path} ({exc})")
+        ok, transcript, why = await asyncio.to_thread(
+            _transcribe_file, Path(os.path.expanduser(str(path))))
+        if ok and transcript.strip():
+            return DelegationResult(
+                success=True, text=transcript.strip(), provider="stt", model="local",
+                modality="audio", bytes_sent=size,
+                reason="transcribed locally with the STT stack — no model call was needed",
+            )
+        return DelegationResult(
+            success=False, modality="audio", bytes_sent=size,
+            error=(f"could not transcribe {Path(path).name}: {why}. Install/point an STT provider, "
+                   "or set transport='native' to send the audio to a specialist model."),
+        )
+
     if choice is None:
         choice = resolve_specialist(want, config=config, exclude=exclude)
     if choice is None:
