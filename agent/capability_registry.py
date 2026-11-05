@@ -68,7 +68,7 @@ def local_facilities() -> Dict[str, Capability]:
         "ocr": Capability(
             "ocr", UNAVAILABLE, "tesseract", "tesseract not installed"),
         "video_frames": Capability(
-            "video_frames", UNAVAILABLE, "ffmpeg", "frame extraction not wired yet"),
+            "video_frames", UNAVAILABLE, "agent.video_context", "ffmpeg unavailable"),
     }
     try:
         from tools.transcription_tools import is_stt_enabled
@@ -84,10 +84,10 @@ def local_facilities() -> Dict[str, Capability]:
             "ocr", HERMES, "tesseract",
             "scanned pages can be transcribed locally" if _binary("pdftoppm")
             else "tesseract present but pdftoppm missing: images only")
-    if _binary("ffmpeg"):
+    if _binary("ffmpeg") and _binary("ffprobe"):
         facilities["video_frames"] = Capability(
-            "video_frames", UNAVAILABLE, "ffmpeg",
-            "ffmpeg present; frame extraction pipeline not implemented")
+            "video_frames", HERMES, "agent.video_context",
+            "frames sampled + OCR'd + speech transcribed locally; no native video part needed")
     return facilities
 
 
@@ -166,10 +166,11 @@ def model_capabilities(provider: str, model: str, config: Any = None) -> Dict[st
     out["video"] = Capability(
         "video",
         NATIVE if out["input_video"].state == NATIVE else (
-            UNAVAILABLE),
-        "model" if out["input_video"].state == NATIVE else "no local pipeline",
+            HERMES if facilities["video_frames"].usable else UNAVAILABLE),
+        "model" if out["input_video"].state == NATIVE else "local decomposition",
         "native video input" if out["input_video"].state == NATIVE
-        else "frame extraction not implemented")
+        else ("frames + OCR + speech, sent as timestamped text"
+              if facilities["video_frames"].usable else "ffmpeg missing"))
     out["ocr"] = facilities["ocr"]
 
     structured = getattr(candidate, "supports_output", None)

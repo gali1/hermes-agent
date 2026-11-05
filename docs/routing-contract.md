@@ -503,6 +503,50 @@ Order for a pdf: **text layer → OCR (poppler + tesseract) → native `file` pa
 Verified end to end: an image-only PDF (no text layer) → OCR read `MAGIC-OCR-8842` → `gpt-6-luna`
 returned exactly that string.
 
+## C24 — Video is decomposed, not demanded
+
+No provider in this pool accepts a native video part, and waiting for one is not a design. A clip
+becomes a labelled, timestamped text representation with the tools already on the host:
+
+```
+ffprobe  -> duration + dimensions
+ffmpeg   -> sampled frames (scene changes first, evenly spaced as a fallback), capped
+tesseract-> on-screen text per frame, with the frame's timestamp
+ffmpeg   -> 16 kHz mono wav -> local STT -> speech transcript
+```
+
+`agent/video_context.py` assembles that into `VIDEO / SPEECH / ON SCREEN / NOTES` and the result is
+sent as **text** to a text-reading specialist (`resolve_specialist("text")`), because asking for a
+model with native video input would refuse work this installation can already do. Frames are kept
+in a temp dir and deleted unless `keep_frames=True`; sending frames to a vision model is opt-in
+(`frame_image_parts`), because a frame costs tokens and OCR costs nothing.
+
+Verified: a 6.1 s clip carrying on-screen codes and an audio track → 8 frames, all OCR'd
+(`MAGIC-VIDEO-5510`, `ACTION ITEM ship OCR path`), speech transcribed locally → `gpt-6-luna`
+answered *"shows MAGIC-VIDEO-5510 until about 3.1 seconds, then ACTION ITEM ship…"*, i.e. it
+reasoned over timestamps it never saw as video.
+
+## C25 — Several operations per request, bounded
+
+One request can need more than one capability (a recording that must be transcribed *and* have its
+slides read). `max_operations` (default 1, replaces `max_per_request` — still honoured) allows
+several, but never unbounded:
+
+| guard | mechanism |
+|---|---|
+| operation count | `max_operations`, and one operation per `(path, modality)` |
+| time | `budget_seconds` — no new operation starts past the deadline |
+| money | `budget_usd` — estimated cost accumulates as results arrive; the rest is skipped |
+| repeats | per-turn memo keyed by `turn_id`/`session_id` plus the material marker (TTL 30 min): the injected note is not enough, because the loop rebuilds the request from history on the next model call and would delegate again |
+| recursion | thread-local guard on the middleware |
+| partial results | a skipped or failed operation becomes a labelled note; the primary answers from what came back |
+| audit | one `delegation` line per operation + one `delegation_batch` line with `operations`, `est_cost_usd`, `budget_hit` |
+
+Operations are independent by construction, so they run in parallel (`ThreadPoolExecutor`, max 4);
+`parallel: false` runs them in order. Verified live: one turn with an audio note and a scanned
+invoice → two operations (audio → `stt/local`, pdf → `gpt-6-luna`), one answer containing the OCR
+code, `delegation_batch` showing `operations: 2`.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

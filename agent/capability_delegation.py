@@ -49,7 +49,20 @@ from agent import model_router as mr
 logger = logging.getLogger(__name__)
 
 #: Modalities a specialist call can carry today, and the part shape used for each.
-TRANSPORTED_MODALITIES: Tuple[str, ...] = ("image", "audio", "pdf", "text")
+TRANSPORTED_MODALITIES: Tuple[str, ...] = ("image", "audio", "pdf", "text", "document", "video")
+
+#: Canonical modality names. These win over the alias table: "document" is a modality, not a
+#: colloquial way of saying pdf, and letting the alias table decide turned a .xlsx into a "pdf"
+#: with an application/pdf mime type.
+KNOWN_MODALITIES = frozenset({"image", "audio", "video", "pdf", "text", "document", "unknown"})
+
+
+def normalize_modality(value: str) -> str:
+    explicit = (value or "").strip().lower()
+    if explicit in KNOWN_MODALITIES:
+        return explicit
+    return MODALITY_ALIASES.get(explicit, explicit)
+
 
 #: Spoken aliases an operator or a model may use.
 MODALITY_ALIASES: Dict[str, str] = {
@@ -57,6 +70,7 @@ MODALITY_ALIASES: Dict[str, str] = {
     "voice": "audio", "sound": "audio", "recording": "audio", "speech": "audio",
     "doc": "pdf", "document": "pdf", "scan": "pdf", "scanned": "pdf",
     "movie": "video", "clip": "video", "film": "video",
+    "spreadsheet": "document", "deck": "document", "slides": "document", "word": "document",
 }
 
 _SUFFIX_MODALITY: Dict[str, str] = {
@@ -65,6 +79,10 @@ _SUFFIX_MODALITY: Dict[str, str] = {
     ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".ogg": "audio",
     ".oga": "audio", ".opus": "audio", ".flac": "audio", ".aac": "audio", ".aiff": "audio",
     ".pdf": "pdf",
+    ".docx": "document", ".doc": "document", ".xlsx": "document", ".xls": "document",
+    ".xlsm": "document", ".xlsb": "document", ".pptx": "document", ".ppt": "document",
+    ".odt": "document", ".ods": "document", ".odp": "document", ".rtf": "document",
+    ".epub": "document", ".ipynb": "document", ".db": "document", ".sqlite": "document",
     ".mp4": "video", ".mov": "video", ".mkv": "video", ".webm": "video", ".avi": "video",
     ".txt": "text", ".md": "text", ".markdown": "text", ".csv": "text", ".tsv": "text",
     ".json": "text", ".yaml": "text", ".yml": "text", ".log": "text", ".py": "text",
@@ -154,7 +172,7 @@ def infer_modality(path: str, *, override: str = "") -> str:
     """Best-effort modality for a file, from an explicit name or its suffix."""
     explicit = (override or "").strip().lower()
     if explicit:
-        return MODALITY_ALIASES.get(explicit, explicit)
+        return normalize_modality(explicit)
     return _SUFFIX_MODALITY.get(Path(path).suffix.lower(), "unknown")
 
 
@@ -260,7 +278,7 @@ def resolve_specialist(
     own model is skipped by default — delegating a task to the model already holding the
     conversation is not delegation, and it would be a no-op with a cost.
     """
-    want = MODALITY_ALIASES.get((modality or "").strip().lower(), (modality or "").strip().lower())
+    want = normalize_modality(modality)
     if want not in TRANSPORTED_MODALITIES:
         return None
 
@@ -388,6 +406,17 @@ def _ocr_pdf(path: Path, *, dpi: int = 200, max_pages: int = 20,
         return ""
 
 
+def _extract_document_text(path: Path) -> str:
+    """xlsx/csv/docx/pptx/odt/... via the readers this tree already ships."""
+    try:
+        from tools.read_extract import extract_document_text
+
+        return extract_document_text(str(path)) or ""
+    except Exception as exc:  # noqa: BLE001 - an unreadable deck is a note, not a crash
+        logger.info("document extraction failed for %s: %s", path.name, exc)
+        return ""
+
+
 def _transcribe_file(path: Path) -> Tuple[bool, str, str]:
     """Local/cloud STT through the existing transcription stack. Returns (ok, text, why)."""
     try:
@@ -444,6 +473,7 @@ def build_delegation_messages(
     modality: str,
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    max_frames: int = 8,
     transport: str = "auto",
 ) -> Tuple[List[Dict[str, Any]], int, str]:
     """Messages for the specialist: one text part with the task, one part carrying the file.
@@ -468,7 +498,7 @@ def build_delegation_messages(
     if not target.exists() or not target.is_file():
         raise ValueError(f"no such file: {target}")
 
-    want = MODALITY_ALIASES.get((modality or "").strip().lower(), (modality or "").strip().lower())
+    want = normalize_modality(modality)
     data, mime = _read_limited(target, max_bytes)
     header = (
         f"{instruction.strip()}\n\n"
@@ -517,6 +547,31 @@ def build_delegation_messages(
             {"type": "input_audio", "input_audio": {
                 "data": base64.b64encode(data).decode("ascii"), "format": fmt}},
         ]}], len(data), note)
+
+    if want == "document":
+        extracted = "" if transport == "native" else usable_text(_extract_document_text(target))
+        if extracted:
+            note = (f"extracted {target.name} locally with the document readers "
+                    f"({len(extracted)} chars, structure preserved) and sent the text")
+            return ([{"role": "user", "content": f"[{note}]\n\n{extracted[:MAX_INLINE_TEXT_CHARS]}"}],
+                    len(extracted), note)
+        note = f"no text could be extracted from {target.name}"
+        return ([{"role": "user", "content": f"[{note}]"}], 0, note)
+
+    if want == "video":
+        if transport == "native":
+            note = f"{target.name}: no provider here accepts a native video part"
+            return ([{"role": "user", "content": f"[{note}]"}], 0, note)
+        from agent.video_context import build_video_context
+
+        context = build_video_context(str(target), max_frames=max_frames, do_ocr=True,
+                                      do_transcribe=True, transcribe=_transcribe_file)
+        text = context.as_text()
+        with_text = sum(1 for frame in context.frames if frame.ocr_text.strip())
+        note = (f"decomposed {target.name} locally into a timestamped representation "
+                f"({with_text} of {len(context.frames)} sampled frame(s) had readable text, "
+                f"speech {'transcribed' if context.transcript else 'unavailable'})")
+        return ([{"role": "user", "content": f"[{note}]\n\n{text}"}], len(text), note)
 
     if want == "pdf":
         extracted = "" if transport == "native" else usable_text(_extract_pdf_text(target))
@@ -600,7 +655,11 @@ async def delegate_capability(
         )
 
     if choice is None:
-        choice = resolve_specialist(want, config=config, exclude=exclude)
+        # A video or a document is *decomposed or extracted* here, so the specialist that matters
+        # is one that reads text - asking for a model with native video input would refuse a task
+        # this installation can already serve.
+        resolve_as = "text" if want in ("video", "document") else want
+        choice = resolve_specialist(resolve_as, config=config, exclude=exclude)
     if choice is None:
         return DelegationResult(
             success=False,

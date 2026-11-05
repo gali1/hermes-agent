@@ -154,12 +154,15 @@ def test_text_is_inlined_and_truncated(tmp_path, monkeypatch):
     assert "truncated" in note
 
 
-def test_video_is_refused_rather_than_pretended(tmp_path):
+def test_unreadable_video_yields_notes_not_a_description(tmp_path):
+    """Video is decomposed now, so the honest failure mode is a note - never invented content."""
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"\x00" * 64)
-    with pytest.raises(ValueError) as exc:
-        cd.build_delegation_messages(str(clip), "what happens?", "video")
-    assert "no supported transport part" in str(exc.value)
+    messages, _sent, note = cd.build_delegation_messages(str(clip), "what happens?", "video")
+    body = messages[0]["content"]
+    assert "decomposed" in note
+    assert "ffprobe could not read the file" in body
+    assert "0 of 0 sampled frame(s)" in note or "had readable text" in note
 
 
 def test_oversized_file_is_refused_before_any_call(tmp_path):
@@ -593,3 +596,54 @@ def test_local_stt_reports_zero_cost(pool, aux, tmp_path, monkeypatch):
     result = asyncio.run(cd.delegate_capability(str(voice), "transcribe", modality="audio",
                                                 config=_config(["primary-model"])))
     assert result.success and result.est_cost_usd == 0.0 and result.usage == {}
+
+
+# --------------------------------------------------------------------------- documents + video
+
+
+def test_a_spreadsheet_is_extracted_not_rented(tmp_path, monkeypatch):
+    deck = tmp_path / "q3.xlsx"
+    deck.write_bytes(b"PK\x03\x04")
+    monkeypatch.setattr(cd, "_extract_document_text",
+                        lambda p: "SHEET: Summary\nrow 1: revenue 412000")
+    messages, sent, note = cd.build_delegation_messages(str(deck), "what is revenue", "document")
+    assert "revenue 412000" in messages[0]["content"]
+    assert "structure preserved" in note
+
+
+def test_an_unreadable_presentation_is_a_note_not_an_exception(tmp_path, monkeypatch):
+    deck = tmp_path / "talk.pptx"
+    deck.write_bytes(b"PK\x03\x04")
+    monkeypatch.setattr(cd, "_extract_document_text", lambda p: "")
+    messages, _sent, note = cd.build_delegation_messages(str(deck), "summarise", "document")
+    assert "no text could be extracted" in messages[0]["content"]
+    assert "no text could be extracted" in note
+
+
+def test_video_is_decomposed_locally_into_timestamped_text(tmp_path, monkeypatch):
+    clip = tmp_path / "standup.mp4"
+    clip.write_bytes(b"\x00" * 64)
+    from agent import video_context as vc
+
+    def fake_context(path, **kwargs):
+        ctx = vc.VideoContext(path=path, duration_s=93.0, width=1280, height=720)
+        ctx.frames = [vc.Frame(0, 0.0, "f0.jpg", "SPRINT 42 BURNDOWN"),
+                      vc.Frame(1, 46.5, "f1.jpg", "")]
+        ctx.transcript = "we shipped the OCR path yesterday"
+        return ctx
+
+    monkeypatch.setattr(vc, "build_video_context", fake_context)
+    messages, sent, note = cd.build_delegation_messages(str(clip), "summarise", "video")
+    body = messages[0]["content"]
+    assert "93.0s" in body and "1280x720" in body
+    assert "SPRINT 42 BURNDOWN" in body and "46.5s" not in body.split("ON SCREEN")[0]
+    assert "we shipped the OCR path yesterday" in body
+    assert "1 of 2 sampled frame(s) had readable text" in note
+
+
+def test_video_transport_native_is_refused_honestly(tmp_path):
+    clip = tmp_path / "x.mp4"
+    clip.write_bytes(b"\x00" * 16)
+    messages, sent, note = cd.build_delegation_messages(str(clip), "look", "video",
+                                                        transport="native")
+    assert sent == 0 and "no provider here accepts a native video part" in note
