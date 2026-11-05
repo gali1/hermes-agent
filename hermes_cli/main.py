@@ -2744,6 +2744,14 @@ def cmd_model_routing(args):
         return _routing_refresh(args)
 
     if action in ("enable", "disable"):
+        if action == "disable" and "smart_model_routing" not in config:
+            # Absence is the OFF state, so there is nothing to turn off.  A verb
+            # that changes nothing must not change the file (C16): creating the
+            # block here would leave a section the user never opted into, and
+            # `disable` would stop being a no-op on an untouched config.
+            print("\n  ✓ Dynamic model selection: already off — nothing to change\n")
+            _print_routing_status(config)
+            return 0
         section = _routing_section(config)
         if action == "enable":
             strategy = getattr(args, "strategy", None)

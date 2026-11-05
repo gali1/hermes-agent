@@ -317,6 +317,31 @@ every setting the engine reads has a control. On oklab-1 that means:
   state only; Cancel, and a flow that times out, leave `config.yaml` byte-identical
   (C13).
 
+## C16 — A verb that changes nothing does not change the file
+`disable` is the OFF state, and an *absent* `smart_model_routing` block is also the OFF
+state (`routing_settings` reads it as `enabled: false`; absence is the shipped default).
+So `disable` on a config that never carried a block has nothing to do. This tree must not
+materialise the section for it:
+
+* `hermes model routing disable` on an absent block → exit 0, prints `already off — nothing
+  to change`, reads nothing but the state, and leaves `config.yaml` byte-identical.
+* `hermes model routing configure --disable` on an absent block → the same rule in the
+  shared writer: `written: false`, `changed: []`, `no_op` naming the reason.
+* The rule is scoped to the *absent* case. A present block is still written when the
+  value changes (`disable` while on turns it off and keeps every other preference), and a
+  present block already at `enabled: false` is not rewritten.
+* `enable` is unaffected: an absent block plus `enabled: true` is a real change and writes.
+
+Why it matters: every later reader treats a present block as an opt-in record, `status`
+prints the "Saved in: config.yaml" footer for it, and `setup_quick.py` writes its own
+explicit `enabled: False` on purpose. A `disable` that manufactures one blurs "the user
+opted in and turned it off" with "the user never opted in", for a command with no effect.
+
+Residual, deliberately not changed: when the state already matches and the block *is*
+present, the verb still prints `Saved to config.yaml`. That statement is about the
+resulting config, which does hold that state; it was left alone rather than widening the
+diff.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

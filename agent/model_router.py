@@ -1406,6 +1406,16 @@ def update_routing(
     if read_only:
         return result
 
+    # A verb that changes nothing must not change the file.  An absent block is
+    # the OFF state (the engine's own default), so ``disable`` on a config that
+    # never carried one has nothing to do: writing ``enabled: false`` there would
+    # materialise a section for a command that had no effect, and every later
+    # reader would see a routing block the user never opted into.
+    if "smart_model_routing" not in base_raw and merged == {"enabled": False}:
+        result["changed"] = []
+        result["no_op"] = "smart_model_routing is absent and the change leaves it off"
+        return result
+
     base_raw["smart_model_routing"] = merged
     hermes_config.save_config(base_raw)
 

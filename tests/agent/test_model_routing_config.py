@@ -110,6 +110,38 @@ def test_absent_block_is_never_materialised(home):
     assert "smart_model_routing" not in _raw(home)
 
 
+def test_disabling_an_absent_block_is_not_a_write(home):
+    """Absence is the OFF state, so ``disable`` must not materialise a block.
+
+    The complement of ``test_absent_block_is_never_materialised`` for the write
+    path: a verb whose only change is ``enabled: false`` on a file that never
+    carried a routing block has nothing to do, and a command that changes
+    nothing must not change the file.
+    """
+    before = _read(home)
+
+    result = mr.update_routing({"enabled": False})
+
+    assert _read(home) == before, "the file must stay byte-identical"
+    assert "smart_model_routing" not in _raw(home), "no block may be created"
+    assert result["written"] is False
+    assert result["changed"] == []
+    assert result["settings"]["enabled"] is False
+
+
+def test_disabling_a_present_block_still_writes(home):
+    """The no-op rule is scoped to an *absent* block; a real change still lands."""
+    _write(home, _CONFIG + "smart_model_routing:\n  enabled: true\n  strategy: cost\n")
+
+    result = mr.update_routing({"enabled": False})
+
+    assert result["written"] is True
+    assert result["changed"] == ["enabled"]
+    block = _raw(home)["smart_model_routing"]
+    assert block["enabled"] is False
+    assert block["strategy"] == "cost", "other preferences survive a disable"
+
+
 def test_routing_settings_reads_the_block_from_disk(home):
     _write(home, _CONFIG + "smart_model_routing:\n  enabled: true\n  strategy: cost\n  stability_threshold: 0.4\n  models:\n    - model-b\n    - model-a\n")
     settings = mr.routing_settings()

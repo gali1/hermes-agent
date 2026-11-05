@@ -167,6 +167,50 @@ def test_enable_disable_roundtrip(home, capsys):
     assert section.get("strategy") == "cost"
 
 
+def test_disable_on_a_config_without_a_routing_block_changes_nothing(home, capsys):
+    """The CLI verb must agree with the engine: absence is already OFF."""
+    from hermes_cli.main import cmd_model_routing
+
+    before = (home / "config.yaml").read_bytes()
+
+    assert cmd_model_routing(_ns(routing_command="disable")) == 0
+
+    assert (home / "config.yaml").read_bytes() == before, "no write on a no-op disable"
+    out = capsys.readouterr().out
+    assert "already off" in out
+    assert "Saved" not in out, "a command that wrote nothing must not claim a save"
+
+
+def test_configure_disable_json_on_an_absent_block_reports_no_write(home, capsys):
+    """The flag path shares the rule and says so in the machine-readable result."""
+    import json
+
+    from hermes_cli.main import cmd_model_routing
+
+    before = (home / "config.yaml").read_bytes()
+
+    assert cmd_model_routing(_ns(routing_command="configure", disable=True, json=True)) == 0
+
+    assert (home / "config.yaml").read_bytes() == before
+    result = json.loads(capsys.readouterr().out)
+    assert result["written"] is False
+    assert result["changed"] == []
+
+
+def test_disable_still_writes_when_routing_was_on(home):
+    """Regression guard: the no-op rule must not swallow a real disable."""
+    from hermes_cli.main import cmd_model_routing
+
+    cmd_model_routing(_ns(routing_command="enable", strategy="cost"))
+    assert _routing_section(home).get("enabled") is True
+
+    assert cmd_model_routing(_ns(routing_command="disable")) == 0
+
+    section = _routing_section(home)
+    assert section.get("enabled") is False
+    assert section.get("strategy") == "cost"
+
+
 def test_enable_all_models_flips_preferred_models_only(home):
     from hermes_cli.main import cmd_model_routing
 
