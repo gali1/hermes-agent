@@ -35,6 +35,11 @@ ANYDOC_EXTENSIONS = frozenset({
 MAX_ANYDOC_BYTES = 50 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
+#: OOXML packages are zip files, so a 20 KB .xlsx can inflate to gigabytes. These are the guards
+#: that stand between a delegated document and the host's memory.
+_MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 200
+_MIN_RATIO_CHECK_BYTES = 8 * 1024 * 1024
 _MAX_XLSX_COLS = 256
 
 _NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -448,11 +453,36 @@ def _extract_notebook(path: str, *, display_path: Optional[str] = None) -> str:
     return _joined(out, "Notebook contains no readable cells")
 
 
+def _zip_inflation_error(zf: zipfile.ZipFile) -> str:
+    """A message when this package looks like a decompression bomb, otherwise "".
+
+    Measured before the fix: a 12 KB package declaring ~900 MB of parts was read straight into RAM
+    for xlsx/docx; pptx only failed later inside anydoc at ~855 MB RSS. The check is on the central
+    directory (no decompression), so it costs nothing on a normal file.
+    """
+    try:
+        infos = zf.infolist()
+    except Exception:  # noqa: BLE001
+        return ""
+    compressed = sum(max(info.compress_size, 1) for info in infos)
+    declared = sum(info.file_size for info in infos)
+    if declared > _MAX_UNCOMPRESSED_BYTES:
+        return (f"package declares {declared / 1e6:.0f} MB uncompressed "
+                f"(limit {_MAX_UNCOMPRESSED_BYTES / 1e6:.0f} MB) - refusing to inflate it")
+    if declared > _MIN_RATIO_CHECK_BYTES and declared / max(compressed, 1) > _MAX_COMPRESSION_RATIO:
+        return (f"compression ratio {declared / max(compressed, 1):.0f}:1 exceeds "
+                f"{_MAX_COMPRESSION_RATIO}:1 - refusing to inflate it")
+    return ""
+
+
 @contextlib.contextmanager
 def _open_zip(path: str, kind: str) -> Iterator[zipfile.ZipFile]:
     """Open an OOXML package; bad-zip/OS failures (body included) become ExtractionError."""
     try:
         with zipfile.ZipFile(path) as zf:
+            bomb = _zip_inflation_error(zf)
+            if bomb:
+                raise ExtractionError(f"Not a safe {kind}: {bomb}")
             yield zf
     except (zipfile.BadZipFile, OSError) as exc:
         bad_zip = isinstance(exc, zipfile.BadZipFile)
@@ -510,9 +540,14 @@ def _extract_xlsx(path: str) -> str:
             if sheet.get("state", "visible") in {"hidden", "veryHidden"} or part not in names:
                 continue
             with contextlib.suppress(ET.ParseError):
-                rows = _sheet_rows(zf.read(part), shared)
-                out += [f"# ── Sheet: {sheet.get('name', 'Sheet')} ──",
-                        *(["\t".join(row) for row in rows] or ["(empty)"]), ""]
+                rows, total = _sheet_rows(zf.read(part), shared)
+                name = sheet.get("name", "Sheet")
+                out += [f"# ── Sheet: {name} ──",
+                        *(["\t".join(row) for row in rows] or ["(empty)"])]
+                if total > len(rows):
+                    out.append(f"…[truncated: showed {len(rows)} of {total} rows on sheet "
+                               f"'{name}' (limit {_MAX_XLSX_ROWS_PER_SHEET})]")
+                out.append("")
     return _joined(out, "XLSX has no visible sheets with content")
 
 
@@ -523,9 +558,13 @@ def _col_index(ref: str) -> int:
     return max(idx - 1, 0)
 
 
-def _sheet_rows(xml_bytes: bytes, shared: list[str]) -> list[list[str]]:
+def _sheet_rows(xml_bytes: bytes, shared: list[str]) -> tuple[list[list[str]], int]:
+    """(rows, total_rows_in_sheet) — the total is what lets a truncated sheet say so."""
     root = ET.fromstring(xml_bytes)
     s = f"{{{_NS_S}}}"
+    total = 0
+    for _ in root.iter(f"{s}row"):
+        total += 1
     rows: list[list[str]] = []
     for row in itertools.islice(root.iter(f"{s}row"), _MAX_XLSX_ROWS_PER_SHEET):
         cells: dict[int, str] = {}
@@ -538,7 +577,7 @@ def _sheet_rows(xml_bytes: bytes, shared: list[str]) -> list[list[str]]:
         rows.append([cells.get(i, "") for i in range(max_col + 1)])
     while rows and not any(value.strip() for value in rows[-1]):
         rows.pop()
-    return rows
+    return rows, total
 
 
 def _cell_value(cell: ET.Element, shared: list[str], s: str) -> str:

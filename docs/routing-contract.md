@@ -611,6 +611,21 @@ self-hosted local Bot API server. The hosted-API 20 MB **download** limit theref
 (2 GB send cap retained), and inbound files land on disk where the adapter records their paths —
 which is exactly the material C26 trusts.
 
+## C30 — Document limits are enforced and announced
+
+| guard | where | behaviour |
+|---|---|---|
+| zip bomb | `read_extract._zip_inflation_error`, before any inflation | refuses when the central directory declares > 200 MB uncompressed, or a ratio > 200:1 above 8 MB |
+| xlsx rows | `_MAX_XLSX_ROWS_PER_SHEET` = 5000, 256 cols | appends `…[truncated: showed 5000 of 6000 rows on sheet 'Q3' (limit 5000)]` |
+| csv/tsv charset | `decode_text_payload`: BOM → utf-8-sig/utf-16/utf-32, else strict utf-8, else cp1252 | a cp1252 file no longer arrives as `Ren\ufffd M\ufffdller`; a UTF-16 file no longer arrives NUL-separated |
+| csv/tsv truncation | `clip_text_with_counts`, on a line boundary | `truncated: showed 4762 of 9001 rows, 119991 of 230205 chars` — never a silent cut mid-row |
+| sqlite | `mode=ro&immutable=1` | read-only; 200 tables / 5 preview rows / 80 chars per cell |
+| macros | never read | `vbaProject.bin` is not opened; nothing is executed |
+| formulas | cached values only | `=A1*B1` surfaces as its cached result; the formula text is invisible |
+
+Verified on generated files: a 12 KB package declaring 315 MB → *"Not a safe DOCX: … refusing to
+inflate it"*; a 6000-row sheet → the truncation line above; a 230 KB CSV → the counted clip above.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

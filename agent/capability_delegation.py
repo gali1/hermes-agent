@@ -34,6 +34,7 @@ import asyncio
 import base64
 import json
 import logging
+import codecs
 import mimetypes
 import os
 import shutil
@@ -373,6 +374,41 @@ def _extract_pdf_text(path: Path) -> str:
         return ""
 
 
+def decode_text_payload(data: bytes) -> Tuple[str, str]:
+    """(text, encoding). BOM first, then strict UTF-8, then cp1252.
+
+    Measured before this: a cp1252 spreadsheet arrived as ``Ren\ufffd M\ufffdller`` and a UTF-16
+    one as NUL-separated garbage, because everything was decoded as UTF-8 with errors="replace".
+    """
+    if data.startswith(codecs.BOM_UTF8):
+        return data.decode("utf-8-sig", errors="replace"), "utf-8-sig"
+    if data.startswith(codecs.BOM_UTF16_LE) or data.startswith(codecs.BOM_UTF16_BE):
+        return data.decode("utf-16", errors="replace"), "utf-16"
+    if data.startswith(codecs.BOM_UTF32_LE) or data.startswith(codecs.BOM_UTF32_BE):
+        return data.decode("utf-32", errors="replace"), "utf-32"
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace"), "cp1252"
+
+
+def clip_text_with_counts(body: str, limit: int) -> Tuple[str, str]:
+    """(clipped, note) - cut on a line boundary and say how much was kept.
+
+    A block cut mid-row with no counts lets a reader believe they saw the whole file.
+    """
+    if len(body) <= limit:
+        return body, ""
+    head = body[:limit]
+    cut = head.rfind("\n")
+    if cut > 0:
+        head = head[:cut]
+    shown_rows = head.count("\n") + 1
+    total_rows = body.count("\n") + 1
+    return head, (f"truncated: showed {shown_rows} of {total_rows} rows, "
+                  f"{len(head)} of {len(body)} chars")
+
+
 def usable_text(text: str) -> str:
     """Drop the extractor's placeholder notices and keep only real content.
 
@@ -545,11 +581,12 @@ def build_delegation_messages(
     )
 
     if want == "text":
-        body = data.decode("utf-8", errors="replace")
-        truncated = len(body) > MAX_INLINE_TEXT_CHARS
-        if truncated:
-            body = body[:MAX_INLINE_TEXT_CHARS] + "\n…[truncated by the delegation layer]"
-        note = f"inlined {target.name} as text" + (" (truncated)" if truncated else "")
+        body, encoding = decode_text_payload(data)
+        body, clip_note = clip_text_with_counts(body, MAX_INLINE_TEXT_CHARS)
+        note = f"inlined {target.name} as text ({encoding})"
+        if clip_note:
+            note += f" — {clip_note}"
+            body += f"\n…[{clip_note}]"
         return ([{"role": "user", "content": f"{header}\n\n--- {target.name} ---\n{body}"}],
                 len(body.encode("utf-8")), note)
 

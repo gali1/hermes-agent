@@ -149,7 +149,7 @@ def test_text_is_inlined_and_truncated(tmp_path, monkeypatch):
     log.write_text("x" * 200)
     messages, sent, note = cd.build_delegation_messages(str(log), "summarise", "text")
     body = messages[0]["content"]
-    assert "truncated by the delegation layer" in body
+    assert "truncated: showed 1 of 1 rows, 20 of 200 chars" in body
     assert sent <= 4096
     assert "truncated" in note
 
@@ -705,3 +705,91 @@ def test_a_large_binary_payload_trips_a_small_budget_on_estimate_alone():
     usd, basis = cd._price(choice, {}, bytes_sent=2 * 1024 * 1024, modality="audio")
     assert basis == "estimated_from_bytes_binary"
     assert usd > 0.01, f"estimate {usd} would fit inside a 1-cent budget"
+
+
+# --------------------------------------------------------------------------- document limits
+
+
+def test_a_zip_bomb_is_refused_before_inflation(tmp_path):
+    """A 12 KB package can declare gigabytes; refusing it is cheaper than an OOM kill."""
+    import zipfile
+
+    from tools.read_extract import ExtractionError, extract_document_text
+
+    bomb = tmp_path / "bomb.docx"
+    with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", b"\x00" * (300 * 1024 * 1024))
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_document_text(str(bomb))
+    assert "refusing to inflate" in str(exc.value)
+
+
+def test_a_normal_docx_still_passes_the_zip_guard(tmp_path):
+    import zipfile
+
+    from tools.read_extract import extract_document_text
+
+    doc = tmp_path / "ok.docx"
+    body = "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>" \
+           "<w:body><w:p><w:r><w:t>MAGIC-DOCX-2290</w:t></w:r></w:p></w:body></w:document>"
+    with zipfile.ZipFile(doc, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", body)
+    assert "MAGIC-DOCX-2290" in extract_document_text(str(doc))
+
+
+def test_an_xlsx_sheet_says_how_many_rows_it_left_out(tmp_path):
+    """Silent truncation is the failure: '5000 of 6000 rows' is honest, 5000 rows alone is not."""
+    import zipfile
+
+    from tools.read_extract import _MAX_XLSX_ROWS_PER_SHEET, extract_document_text
+
+    rows = _MAX_XLSX_ROWS_PER_SHEET + 500
+    sheet = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/'
+             'spreadsheetml/2006/main"><sheetData>'
+             + "".join(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>row {i}</t></is></c></row>'
+                       for i in range(1, rows + 1))
+             + "</sheetData></worksheet>")
+    book = ('<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/'
+            'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+            '2006/relationships"><sheets><sheet name="Q3" sheetId="1" r:id="rId1"/></sheets></workbook>')
+    rels = ('<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/'
+            '2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '</Relationships>')
+    path = tmp_path / "big.xlsx"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/workbook.xml", book)
+        zf.writestr("xl/_rels/workbook.xml.rels", rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+    text = extract_document_text(str(path))
+    assert f"showed {_MAX_XLSX_ROWS_PER_SHEET} of {rows} rows" in text
+
+
+def test_a_utf16_csv_is_decoded_not_shredded_into_nuls(tmp_path, monkeypatch):
+    csv = tmp_path / "utf16.csv"
+    csv.write_bytes("id,name\n1,René Müller\n2,Zoe\n".encode("utf-16"))
+    monkeypatch.setattr(cd, "delegate_capability_sync", lambda *a, **k: None)
+    messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
+    body = messages[0]["content"]
+    assert "René Müller" in body and "\x00" not in body
+    assert "utf-16" in note
+
+
+def test_a_cp1252_csv_no_longer_produces_replacement_characters(tmp_path):
+    csv = tmp_path / "cp.csv"
+    csv.write_bytes("id,name\n1,René Müller\n".encode("cp1252"))
+    messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
+    assert "René Müller" in messages[0]["content"]
+    assert "cp1252" in note
+
+
+def test_a_truncated_csv_says_how_many_rows_were_shown(tmp_path, monkeypatch):
+    csv = tmp_path / "big.csv"
+    csv.write_text("id,name\n" + "\n".join(f"{i},name{i}" for i in range(20000)))
+    body_limit = 500
+    monkeypatch.setattr(cd, "MAX_INLINE_TEXT_CHARS", body_limit)
+    messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
+    assert "truncated: showed" in note and "rows" in note
+    assert "of 20001 rows" in note or "of 20000 rows" in note
