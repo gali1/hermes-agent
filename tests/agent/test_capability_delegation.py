@@ -1,0 +1,370 @@
+"""Specialist task delegation: the primary model keeps the conversation, a specialist does one job.
+
+These tests exercise the call path itself — who is chosen, what is sent, what comes back — not the
+turn-level routing decision (that is tests/agent/test_model_router.py).
+"""
+from __future__ import annotations
+
+import json
+import types
+from pathlib import Path
+
+import pytest
+
+from agent import capability_delegation as cd
+
+# --------------------------------------------------------------------------- fixtures
+
+
+def _info(modalities):
+    return types.SimpleNamespace(
+        input_modalities=tuple(modalities), output_modalities=("text",))
+
+
+def _cand(model, modalities, *, cost_in=1.0, cost_out=1.0, provider="test"):
+    from agent.model_router import ModelCandidate, ModelSpec
+    return ModelCandidate(
+        provider=provider, model=model, info=_info(modalities),
+        spec=ModelSpec(name=model, provider=provider, cost_in=cost_in, cost_out=cost_out))
+
+
+def _config(models, *, preferred_only=False, primary="primary-model"):
+    return {
+        "model": {"provider": "test", "default": primary},
+        "smart_model_routing": {
+            "enabled": True,
+            "preferred_models_only": preferred_only,
+            "models": list(models),
+        },
+        "providers": {"test": {"models": list(models)}},
+    }
+
+
+@pytest.fixture
+def pool(monkeypatch):
+    """Patch the pool the resolver sees, so no catalog or live config is involved."""
+    def _install(candidates):
+        monkeypatch.setattr(cd, "_pool", lambda config: (config, cd._routing_config(config),
+                                                        candidates, "test"))
+        return candidates
+    return _install
+
+
+@pytest.fixture
+def aux(monkeypatch):
+    """Capture the out-of-band call and return a canned response."""
+    calls = []
+
+    async def fake_async_call_llm(**kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="SPECIALIST TEXT", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", fake_async_call_llm, raising=False)
+    monkeypatch.setattr(
+        aux_mod, "extract_content_or_reasoning",
+        lambda resp: resp.choices[0].message.content, raising=False)
+    return calls
+
+
+# --------------------------------------------------------------------------- resolution
+
+
+def test_resolver_picks_the_model_that_declares_the_modality(pool):
+    pool([_cand("primary-model", ["text"]),
+          _cand("reader", ["text", "pdf"]),
+          _cand("talker", ["text", "audio"])])
+    choice = cd.resolve_specialist("pdf", config=_config(["primary-model", "reader", "talker"]))
+    assert choice is not None
+    assert choice.model == "reader"
+    assert "capability-first" in choice.reason
+
+
+def test_resolver_never_delegates_to_the_conversations_own_model(pool):
+    """With only the primary able to do it, there is no specialist — not a self-delegation."""
+    pool([_cand("primary-model", ["text", "pdf"])])
+    assert cd.resolve_specialist("pdf", config=_config(["primary-model"])) is None
+
+
+def test_resolver_reports_when_no_declared_model_accepts_the_modality(pool):
+    pool([_cand("primary-model", ["text"]), _cand("talker", ["text", "audio"])])
+    assert cd.resolve_specialist("pdf", config=_config(["primary-model", "talker"])) is None
+
+
+def test_resolver_honours_selected_models_only(pool):
+    """preferred_models_only must not silently widen to a catalog model."""
+    pool([_cand("primary-model", ["text"])])
+    assert cd.resolve_specialist(
+        "pdf", config=_config(["primary-model"], preferred_only=True)) is None
+
+
+def test_resolver_prefers_the_cheaper_of_two_capable_specialists(pool):
+    pool([_cand("primary-model", ["text"]),
+          _cand("pricey", ["text", "pdf"], cost_in=50.0, cost_out=50.0),
+          _cand("cheap", ["text", "pdf"], cost_in=0.1, cost_out=0.1)])
+    choice = cd.resolve_specialist(
+        "pdf", config=_config(["primary-model", "pricey", "cheap"]))
+    assert choice.model == "cheap", "price breaks ties between equally capable specialists"
+
+
+# --------------------------------------------------------------------------- message building
+
+
+def test_image_is_sent_as_a_data_url_part(tmp_path):
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    messages, sent, note = cd.build_delegation_messages(str(img), "what is this?", "image")
+    parts = messages[0]["content"]
+    assert parts[0]["type"] == "text"
+    assert parts[1]["type"] == "image_url"
+    assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert sent == img.stat().st_size
+    assert "image_url" in note
+
+
+def test_audio_is_sent_as_an_input_audio_part_with_the_container_format(tmp_path):
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+    messages, _sent, note = cd.build_delegation_messages(str(voice), "transcribe", "audio")
+    part = messages[0]["content"][1]
+    assert part["type"] == "input_audio"
+    assert part["input_audio"]["format"] == "ogg"
+    assert part["input_audio"]["data"]
+
+
+def test_pdf_is_sent_as_a_file_part(tmp_path):
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    messages, _sent, _note = cd.build_delegation_messages(str(doc), "extract the totals", "pdf")
+    part = messages[0]["content"][1]
+    assert part["type"] == "file"
+    assert part["file"]["filename"] == "scan.pdf"
+    assert part["file"]["file_data"].startswith("data:application/pdf;base64,")
+
+
+def test_text_is_inlined_and_truncated(tmp_path, monkeypatch):
+    monkeypatch.setattr(cd, "MAX_INLINE_TEXT_CHARS", 20)
+    log = tmp_path / "app.log"
+    log.write_text("x" * 200)
+    messages, sent, note = cd.build_delegation_messages(str(log), "summarise", "text")
+    body = messages[0]["content"]
+    assert "truncated by the delegation layer" in body
+    assert sent <= 4096
+    assert "truncated" in note
+
+
+def test_video_is_refused_rather_than_pretended(tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00" * 64)
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(clip), "what happens?", "video")
+    assert "no supported transport part" in str(exc.value)
+
+
+def test_oversized_file_is_refused_before_any_call(tmp_path):
+    big = tmp_path / "huge.pdf"
+    big.write_bytes(b"%PDF" + b"0" * (2 * 1024 * 1024))
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(big), "read", "pdf", max_bytes=1024 * 1024)
+    assert "delegation limit" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- the call
+
+
+def test_delegation_returns_the_specialists_text(pool, aux, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+
+    result = cd.delegate_capability_sync(
+        str(doc), "extract the totals", modality="pdf",
+        config=_config(["primary-model", "reader"]))
+
+    assert result.success is True
+    assert result.text == "SPECIALIST TEXT"
+    assert (result.provider, result.model) == ("test", "reader")
+    assert len(aux) == 1, "exactly one out-of-band call"
+    call = aux[0]
+    assert call["provider"] == "test" and call["model"] == "reader"
+    assert call["task"] == "capability_delegation"
+    assert call["messages"][0]["content"][1]["type"] == "file"
+
+
+def test_no_specialist_means_no_call_and_an_honest_error(pool, aux, tmp_path):
+    pool([_cand("primary-model", ["text"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model"]))
+
+    assert result.success is False
+    assert "no declared specialist" in result.error
+    assert aux == [], "a missing specialist must not spend a request"
+
+
+def test_provider_rejection_is_reported_not_swallowed(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "audio"])])
+
+    async def boom(**kwargs):
+        raise RuntimeError("400 input_audio is not supported by this model")
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", boom, raising=False)
+
+    clip = tmp_path / "memo.mp3"
+    clip.write_bytes(b"ID3" + b"0" * 32)
+    result = cd.delegate_capability_sync(
+        str(clip), "transcribe", modality="audio", config=_config(["primary-model", "reader"]))
+
+    assert result.success is False
+    assert "input_audio is not supported" in result.error
+    assert result.text == ""
+
+
+def test_empty_specialist_reply_is_a_failure(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+
+    async def empty(**kwargs):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="   ", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", empty, raising=False)
+
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "reader"]))
+
+    assert result.success is False
+    assert "no content" in result.error
+
+
+def test_the_primary_model_is_never_the_delegate(pool, aux, tmp_path):
+    """Delegating to the model that is already answering is a no-op with a price tag."""
+    pool([_cand("primary-model", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model"]))
+    assert result.success is False
+    assert aux == []
+
+
+def test_result_json_is_serialisable(pool, aux, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "reader"]))
+    payload = json.loads(result.to_json())
+    assert payload["success"] is True and payload["model"] == "reader"
+
+
+# --------------------------------------------------------------------------- retired models
+
+
+def test_a_remembered_dead_specialist_is_skipped(pool, tmp_path, monkeypatch):
+    """The provider retired the model but the catalog cache still lists it: skip, don't retry."""
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    pool([_cand("primary-model", ["text"]),
+          _cand("retired", ["text", "pdf"]),
+          _cand("live", ["text", "pdf"], cost_in=5.0, cost_out=5.0)])
+    cd.remember_unusable("test", "retired", "410 ModelDeprecated")
+    choice = cd.resolve_specialist(
+        "pdf", config=_config(["primary-model", "retired", "live"]))
+    assert choice is not None and choice.model == "live"
+
+
+def test_a_provider_refusal_is_remembered(pool, monkeypatch, tmp_path):
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    pool([_cand("primary-model", ["text"]), _cand("retired", ["text", "pdf"])])
+
+    async def gone(**kwargs):
+        raise RuntimeError("Error code: 410 - ModelDeprecated: Model retired has been deprecated.")
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", gone, raising=False)
+
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "retired"]))
+
+    assert result.success is False
+    assert ("test", "retired") in cd.remembered_unusable()
+    assert cd.resolve_specialist(
+        "pdf", config=_config(["primary-model", "retired"])) is None
+
+
+def test_an_ordinary_bad_request_is_not_memorised(pool, monkeypatch, tmp_path):
+    """A malformed part is our bug, not a dead model — remembering it would hide a real specialist."""
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+
+    async def bad(**_kwargs):
+        raise RuntimeError("Error code: 400 - invalid request: unsupported content part")
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", bad, raising=False)
+
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "reader"]))
+    assert result.success is False
+    assert cd.remembered_unusable() == set()
+
+
+def test_forget_unusable_clears_the_memo(tmp_path, monkeypatch):
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    cd.remember_unusable("test", "retired", "410")
+    assert ("test", "retired") in cd.remembered_unusable()
+    cd.forget_unusable("test", "retired")
+    assert cd.remembered_unusable() == set()
+
+
+# --------------------------------------------------------------------------- tool surface
+
+
+def test_the_tool_is_registered_in_the_delegation_toolset():
+    import tools.capability_delegation_tools  # noqa: F401  (registers on import)
+    from tools.registry import registry
+
+    assert "delegate_capability" in registry.get_tool_names_for_toolset("delegation")
+    assert registry.get_tool_to_toolset_map().get("delegate_capability") == "delegation"
+
+
+def test_tool_refuses_without_a_path_or_instruction():
+    import asyncio
+    from tools.capability_delegation_tools import _handle_delegate_capability
+
+    out = asyncio.run(_handle_delegate_capability({"path": "", "instruction": "read it"}))
+    assert "needs both" in out
+
+
+def test_tool_returns_the_delegation_json(pool, aux, tmp_path):
+    import asyncio
+    from tools.capability_delegation_tools import _handle_delegate_capability
+
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+
+    cfg = _config(["primary-model", "reader"])
+    import agent.capability_delegation as mod
+    original = mod._live_config
+    mod._live_config = lambda: cfg  # delegate_capability reads live config when none is passed
+    try:
+        out = asyncio.run(_handle_delegate_capability(
+            {"path": str(doc), "instruction": "extract the totals"}))
+    finally:
+        mod._live_config = original
+
+    payload = json.loads(out)
+    assert payload["success"] is True
+    assert payload["text"] == "SPECIALIST TEXT"
+    assert payload["model"] == "reader"

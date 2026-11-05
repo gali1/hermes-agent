@@ -1,0 +1,495 @@
+"""Specialist task delegation — a capability-specific sub-call the turn's own model owns.
+
+Two different jobs live near each other and must not be confused:
+
+* :mod:`agent.model_router` decides **which model serves a turn**.  One model, one turn, chosen
+  before the model is invoked (``conversation_loop`` calls ``route_turn`` once).
+* this module decides **which model performs one sub-task inside a turn the primary model still
+  owns**.  The primary is not displaced: it asks for one thing (read this scan, transcribe this
+  recording, review this diff), a declared specialist does it out of band, and the text comes
+  back as ordinary context for the primary to answer from.
+
+It is deliberately a thin layer over infrastructure that already exists:
+
+* :mod:`agent.auxiliary_client` — ``call_llm`` / ``async_call_llm`` accept an explicit
+  ``provider`` and ``model`` plus arbitrary ``messages``; the specialist call is that client with
+  the router's pool as its candidate list.  No second provider client is built here.
+* :mod:`agent.model_router` — eligibility, capability declarations, scoring and the
+  preferred-models restriction are reused verbatim, so a specialist is chosen by the same rules
+  that pick a turn's model (capability first, price as the tiebreak).
+
+Honest limits this module encodes rather than hides:
+
+* a model *declaring* a media input does not make the provider accept the transport for it —
+  ``input_audio`` and ``file`` parts are provider-specific, so a rejection is returned as a
+  failure with the provider's own words, never retried into a fake success;
+* video needs frame extraction first; there is no silent fallback that pretends otherwise;
+* an unknown capability is not a capability: a model whose metadata is silent is only eligible
+  when the routing config allows unknown metadata, and that is reported in the choice reason.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import mimetypes
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from agent import model_router as mr
+
+logger = logging.getLogger(__name__)
+
+#: Modalities a specialist call can carry today, and the part shape used for each.
+TRANSPORTED_MODALITIES: Tuple[str, ...] = ("image", "audio", "pdf", "text")
+
+#: Spoken aliases an operator or a model may use.
+MODALITY_ALIASES: Dict[str, str] = {
+    "img": "image", "photo": "image", "picture": "image", "screenshot": "image",
+    "voice": "audio", "sound": "audio", "recording": "audio", "speech": "audio",
+    "doc": "pdf", "document": "pdf", "scan": "pdf", "scanned": "pdf",
+    "movie": "video", "clip": "video", "film": "video",
+}
+
+_SUFFIX_MODALITY: Dict[str, str] = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image", ".webp": "image",
+    ".gif": "image", ".bmp": "image", ".tif": "image", ".tiff": "image", ".heic": "image",
+    ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".ogg": "audio",
+    ".oga": "audio", ".opus": "audio", ".flac": "audio", ".aac": "audio", ".aiff": "audio",
+    ".pdf": "pdf",
+    ".mp4": "video", ".mov": "video", ".mkv": "video", ".webm": "video", ".avi": "video",
+    ".txt": "text", ".md": "text", ".markdown": "text", ".csv": "text", ".tsv": "text",
+    ".json": "text", ".yaml": "text", ".yml": "text", ".log": "text", ".py": "text",
+    ".js": "text", ".ts": "text", ".sh": "text", ".sql": "text", ".html": "text",
+}
+
+_AUDIO_FORMAT: Dict[str, str] = {
+    ".mp3": "mp3", ".mpga": "mp3", ".m4a": "mp4", ".mp4": "mp4", ".mpeg": "mpeg",
+    ".mpga": "mp3", ".wav": "wav", ".webm": "webm", ".ogg": "ogg", ".oga": "ogg",
+    ".flac": "flac", ".aac": "aac", ".opus": "opus", ".aiff": "aiff",
+}
+
+#: Refuse before spending a request on a body no provider accepts.
+DEFAULT_MAX_BYTES = 20 * 1024 * 1024
+#: Inline text is capped so a 40 MB log cannot eat the specialist's whole window.
+MAX_INLINE_TEXT_CHARS = 120_000
+
+
+#: Providers retire models without warning: the catalog cache keeps listing them and the pool
+#: keeps scoring them. A rejected specialty call is therefore remembered for a while so the next
+#: resolve cannot route the same dead model into the same wall.
+UNUSABLE_TTL_S = 24 * 3600
+_DEPRECATED_MARKERS = (
+    "modeldeprecated", "has been deprecated", "model is deprecated", "410",
+    "model access is disabled", "access is disabled", "does not exist", "no such model",
+    "model not found", "404",
+)
+
+
+def unusable_path() -> Path:
+    """Where the "this model refused a specialty call" memo lives."""
+    root = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return Path(root) / "state" / "capability_delegation" / "unusable.json"
+
+
+def _load_unusable() -> Dict[str, Dict[str, Any]]:
+    path = unusable_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    now = time.time()
+    return {k: v for k, v in data.items()
+            if isinstance(v, dict) and (now - float(v.get("at") or 0)) < UNUSABLE_TTL_S}
+
+
+def remembered_unusable() -> set:
+    """``{(provider, model)}`` the provider refused a specialty call for, inside the TTL."""
+    return {tuple(key.split("\x00", 1)) for key in _load_unusable()}
+
+
+def remember_unusable(provider: str, model: str, reason: str = "") -> None:
+    """Record a refusal so the next resolve does not pick the same model again."""
+    path = unusable_path()
+    data = _load_unusable()
+    data[f"{provider}\x00{model}"] = {"at": time.time(), "reason": str(reason)[:200]}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2, sort_keys=True))
+        os.chmod(path, 0o600)
+    except OSError as exc:  # pragma: no cover - a memo that cannot be written must not break a call
+        logger.info("could not persist the unusable-model memo: %s", exc)
+
+
+def forget_unusable(provider: str = "", model: str = "") -> None:
+    """Drop one memo entry (or all of them) - the operator's override after a provider fix."""
+    path = unusable_path()
+    data = _load_unusable()
+    if not provider and not model:
+        data = {}
+    else:
+        data.pop(f"{provider}\x00{model}", None)
+    try:
+        path.write_text(json.dumps(data, indent=2, sort_keys=True))
+    except OSError:
+        pass
+
+
+def looks_unusable_error(error: str) -> bool:
+    low = (error or "").lower()
+    return any(marker in low for marker in _DEPRECATED_MARKERS)
+
+
+def infer_modality(path: str, *, override: str = "") -> str:
+    """Best-effort modality for a file, from an explicit name or its suffix."""
+    explicit = (override or "").strip().lower()
+    if explicit:
+        return MODALITY_ALIASES.get(explicit, explicit)
+    return _SUFFIX_MODALITY.get(Path(path).suffix.lower(), "unknown")
+
+
+@dataclass
+class SpecialistChoice:
+    """Who will do the sub-task, and why the router picked them."""
+
+    provider: str
+    model: str
+    modality: str
+    reason: str
+    score: float = 0.0
+    candidates_considered: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DelegationResult:
+    """The outcome of one specialist call — success is only ever claimed with text in hand."""
+
+    success: bool
+    text: str = ""
+    provider: str = ""
+    model: str = ""
+    modality: str = ""
+    bytes_sent: int = 0
+    reason: str = ""
+    error: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "success": self.success,
+            "text": self.text,
+            "provider": self.provider,
+            "model": self.model,
+            "modality": self.modality,
+            "bytes_sent": self.bytes_sent,
+            "reason": self.reason,
+            "error": self.error,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.as_dict())
+
+
+# ---------------------------------------------------------------------------
+# pool
+# ---------------------------------------------------------------------------
+
+
+def _routing_config(config: Any) -> mr.RoutingConfig:
+    """The live routing block as a validated config object (unknown keys dropped)."""
+    import dataclasses
+
+    block = dict((config or {}).get("smart_model_routing") or {}) if isinstance(config, dict) else {}
+    fields = {f.name for f in dataclasses.fields(mr.RoutingConfig)}
+    return mr.RoutingConfig(**{k: v for k, v in block.items() if k in fields})
+
+
+def _live_config() -> Any:
+    from hermes_cli.config import load_config_readonly
+
+    return load_config_readonly()
+
+
+def _pool(config: Any) -> Tuple[Any, mr.RoutingConfig, List[mr.ModelCandidate], str]:
+    cfg = _routing_config(config)
+    specs, source = mr.specs_from_config(config)
+    pool = mr.candidates_from_specs(config, specs, default_provider=_default_provider(config))
+    return config, cfg, pool, source
+
+
+def _default_provider(config: Any) -> str:
+    model_block = (config or {}).get("model") or {}
+    return str(model_block.get("provider") or model_block.get("provider_name") or "")
+
+
+def _primary(config: Any) -> Tuple[str, str]:
+    model_block = (config or {}).get("model") or {}
+    return (
+        str(model_block.get("provider") or ""),
+        str(model_block.get("default") or model_block.get("model") or ""),
+    )
+
+
+def resolve_specialist(
+    modality: str,
+    *,
+    config: Any = None,
+    exclude: Sequence[Tuple[str, str]] = (),
+    include_primary: bool = False,
+) -> Optional[SpecialistChoice]:
+    """Pick the declared model best suited to carrying ``modality``.
+
+    Uses the routing pool and the routing eligibility rules, so ``preferred_models_only`` is
+    respected: with it on, a model outside the operator's list is never chosen.  The config's
+    own model is skipped by default — delegating a task to the model already holding the
+    conversation is not delegation, and it would be a no-op with a cost.
+    """
+    want = MODALITY_ALIASES.get((modality or "").strip().lower(), (modality or "").strip().lower())
+    if want not in TRANSPORTED_MODALITIES:
+        return None
+
+    cfg_obj = config if config is not None else _live_config()
+    _, cfg, pool, _source = _pool(cfg_obj)
+
+    if not pool and not cfg.preferred_models_only:
+        # Nothing declared: widening is the existing behaviour for a capability gap.
+        provider = _default_provider(cfg_obj) or "opencode"
+        names = mr.widen_pool(provider, [])
+        with_info = [n for n in names]
+        # Candidates still need specs; build minimal ones so metadata does the deciding.
+        specs = [mr.ModelSpec(name=n, provider=provider) for n in with_info]
+        pool = mr.candidates_from_specs(cfg_obj, specs, default_provider=provider)
+
+    profile = mr.classify_request(
+        "delegated capability task",
+        attachments=(want,),
+        tool_available=True,
+    )
+
+    primary_provider, primary_model = _primary(cfg_obj)
+    blocked = {(p.strip().lower(), m) for p, m in exclude}
+    if not include_primary and primary_model:
+        blocked.add((primary_provider.strip().lower(), primary_model))
+
+    dead = remembered_unusable()
+    eligible = [
+        c for c in mr.filter_eligible(pool, profile, cfg)
+        if (c.provider.strip().lower(), c.model) not in blocked
+        and (c.provider.strip().lower(), c.model) not in dead
+    ]
+    if not eligible:
+        logger.info("no declared specialist accepts %s (pool=%d)", want, len(pool))
+        return None
+
+    # Capability first, price as the tiebreak: the same weights `tool_calls_only` uses when it
+    # is forced to replace the primary, because the job here is the same — serve a requirement.
+    deleg_cfg = mr.RoutingConfig(
+        enabled=True,
+        preferred_models_only=cfg.preferred_models_only,
+        allow_unknown_metadata=cfg.allow_unknown_metadata,
+        weights={"capability": 0.60, "cost": 0.25, "reliability": 0.10,
+                 "context": 0.05, "continuity": 0.0},
+        reliability=cfg.reliability,
+        exclude=cfg.exclude,
+    )
+    scored = sorted(
+        ((c, mr.score_candidate(c, profile, deleg_cfg, current_model=primary_model,
+                                current_provider=primary_provider))
+         for c in eligible),
+        key=lambda item: (-item[1], item[0].key),
+    )
+    best, best_score = scored[0]
+    return SpecialistChoice(
+        provider=best.provider,
+        model=best.model,
+        modality=want,
+        reason=(
+            f"capability-first choice for {want} input among {len(eligible)} eligible "
+            f"declared model(s); price only breaks ties"
+        ),
+        score=round(best_score, 4),
+        candidates_considered=[c.key for c, _ in scored],
+    )
+
+
+# ---------------------------------------------------------------------------
+# message building
+# ---------------------------------------------------------------------------
+
+
+def _read_limited(path: Path, max_bytes: int) -> Tuple[bytes, str]:
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(
+            f"{path.name} is {size / (1024 * 1024):.1f} MB, above the {max_bytes / (1024 * 1024):.1f} MB "
+            "delegation limit — convert or split it first"
+        )
+    return path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+
+
+def build_delegation_messages(
+    path: str,
+    instruction: str,
+    modality: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+) -> Tuple[List[Dict[str, Any]], int, str]:
+    """Messages for the specialist: one text part with the task, one part carrying the file.
+
+    Returns ``(messages, bytes_sent, note)``. Raises ``ValueError`` for anything that cannot be
+    transported — a refusal here is cheaper and more honest than a provider 400.
+    """
+    if not (instruction or "").strip():
+        raise ValueError("delegation needs an instruction: what the specialist should return")
+    target = Path(os.path.expanduser(str(path or "")))
+    if not str(path or "").strip():
+        raise ValueError("delegation needs a file path")
+    if not target.exists() or not target.is_file():
+        raise ValueError(f"no such file: {target}")
+
+    want = MODALITY_ALIASES.get((modality or "").strip().lower(), (modality or "").strip().lower())
+    data, mime = _read_limited(target, max_bytes)
+    header = (
+        f"{instruction.strip()}\n\n"
+        f"— Delegated by the primary assistant. Return only the requested result; "
+        f"the assistant will present it to the user."
+    )
+
+    if want == "text":
+        body = data.decode("utf-8", errors="replace")
+        truncated = len(body) > MAX_INLINE_TEXT_CHARS
+        if truncated:
+            body = body[:MAX_INLINE_TEXT_CHARS] + "\n…[truncated by the delegation layer]"
+        note = f"inlined {target.name} as text" + (" (truncated)" if truncated else "")
+        return ([{"role": "user", "content": f"{header}\n\n--- {target.name} ---\n{body}"}],
+                len(body.encode("utf-8")), note)
+
+    if want == "image":
+        url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        note = f"sent {target.name} as an image_url part ({mime})"
+        return ([{"role": "user", "content": [
+            {"type": "text", "text": header},
+            {"type": "image_url", "image_url": {"url": url}},
+        ]}], len(data), note)
+
+    if want == "audio":
+        fmt = _AUDIO_FORMAT.get(target.suffix.lower(), "wav")
+        note = f"sent {target.name} as an input_audio part ({fmt})"
+        return ([{"role": "user", "content": [
+            {"type": "text", "text": header},
+            {"type": "input_audio", "input_audio": {
+                "data": base64.b64encode(data).decode("ascii"), "format": fmt}},
+        ]}], len(data), note)
+
+    if want == "pdf":
+        url = f"data:application/pdf;base64,{base64.b64encode(data).decode('ascii')}"
+        note = f"sent {target.name} as a file part (application/pdf)"
+        return ([{"role": "user", "content": [
+            {"type": "text", "text": header},
+            {"type": "file", "file": {"filename": target.name, "file_data": url}},
+        ]}], len(data), note)
+
+    raise ValueError(
+        f"{want} cannot be delegated as-is: no supported transport part exists for it. "
+        "Extract frames or text first (ffmpeg / read_file), then delegate that."
+    )
+
+
+# ---------------------------------------------------------------------------
+# the call
+# ---------------------------------------------------------------------------
+
+
+async def delegate_capability(
+    path: str,
+    instruction: str,
+    *,
+    modality: str = "",
+    config: Any = None,
+    timeout: float = 120.0,
+    max_tokens: int = 4000,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    exclude: Sequence[Tuple[str, str]] = (),
+    choice: Optional[SpecialistChoice] = None,
+) -> DelegationResult:
+    """Run one capability-specific sub-task on a declared specialist and return its text."""
+    try:
+        want = infer_modality(path, override=modality)
+    except Exception as exc:  # pragma: no cover - defensive
+        return DelegationResult(success=False, error=str(exc))
+
+    if choice is None:
+        choice = resolve_specialist(want, config=config, exclude=exclude)
+    if choice is None:
+        return DelegationResult(
+            success=False,
+            modality=want,
+            error=(
+                f"no declared specialist accepts {want} input — add one to the routing pool "
+                "(smart_model_routing.models) or relax preferred_models_only"
+            ),
+        )
+
+    try:
+        messages, sent, note = build_delegation_messages(
+            path, instruction, want, max_bytes=max_bytes)
+    except ValueError as exc:
+        return DelegationResult(
+            success=False, provider=choice.provider, model=choice.model,
+            modality=want, error=str(exc), reason=choice.reason,
+        )
+
+    from agent import auxiliary_client as aux
+
+    try:
+        response = await aux.async_call_llm(
+            task="capability_delegation",
+            provider=choice.provider,
+            model=choice.model,
+            messages=messages,
+            max_tokens=max_tokens,
+            timeout=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 - the provider's own words are the report
+        detail = f"{type(exc).__name__}: {str(exc)[:400]}"
+        if looks_unusable_error(detail):
+            remember_unusable(choice.provider, choice.model, detail)
+        return DelegationResult(
+            success=False, provider=choice.provider, model=choice.model, modality=want,
+            bytes_sent=sent, reason=f"{choice.reason}; {note}",
+            error=detail,
+        )
+
+    text = ""
+    try:
+        text = aux.extract_content_or_reasoning(response) or ""
+    except Exception as exc:  # noqa: BLE001
+        return DelegationResult(
+            success=False, provider=choice.provider, model=choice.model, modality=want,
+            bytes_sent=sent, reason=f"{choice.reason}; {note}",
+            error=f"could not read the specialist response: {type(exc).__name__}: {exc}",
+        )
+    text = text.strip()
+    if not text:
+        return DelegationResult(
+            success=False, provider=choice.provider, model=choice.model, modality=want,
+            bytes_sent=sent, reason=f"{choice.reason}; {note}",
+            error="the specialist returned no content",
+        )
+    return DelegationResult(
+        success=True, text=text, provider=choice.provider, model=choice.model,
+        modality=want, bytes_sent=sent, reason=f"{choice.reason}; {note}",
+    )
+
+
+def delegate_capability_sync(
+    path: str, instruction: str, **kwargs: Any
+) -> DelegationResult:
+    """Blocking wrapper for callers that are not already inside an event loop."""
+    return asyncio.run(delegate_capability(path, instruction, **kwargs))

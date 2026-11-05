@@ -424,12 +424,42 @@ The fourth strategy is not a weighting of the other three: it removes selection 
 * `providers.<provider>.models` therefore reads as *the assistant plus its specialists*, and a
   model listed there is not thereby a candidate to take over ordinary conversation.
 
-Consequence worth stating in the reply, not just here: on this host the routing hook runs once
-per **turn**, before the model is invoked. `tool_calls_only` decides *which model serves the
-turn*; it does not send a file to a specialist and merge the result back into a primary model's
-context. Capability work inside a turn is done by **tools** (`read_file` extracts PDF text
-locally, `vision_analyze` scores an image). Claiming "the default model delegates to Gemini and
-integrates the result" would describe a mechanism that does not exist in this hook.
+Consequence worth stating in the reply, not just here: the routing hook runs once per **turn**,
+before the model is invoked. `tool_calls_only` decides *which model serves the turn*.
+Sub-task delegation inside a turn is a separate mechanism — see **C21**, which now exists and
+is tested. C20's own limit stands: this hook still never sends a file to a specialist.
+
+## C21 — Capability delegation is a sub-call, not a second router
+
+`agent/capability_delegation.py` answers a different question from C20's: *which model performs one
+sub-task inside a turn the primary model still owns*. The primary is never displaced by it.
+
+* **One transport per modality, and only where a real part exists.** image → `image_url` data URL,
+  audio → `input_audio`, pdf → `file`, text-like files → inlined text (truncated, with a marker).
+  Video has **no** transport: the layer refuses with "extract frames or text first" rather than
+  sending bytes a provider cannot read.
+* **The specialist is chosen by the routing pool and the routing rules.** `preferred_models_only`
+  is honoured, capability leads and price only breaks ties, and the config's own model is excluded —
+  delegating to the model already holding the conversation is a no-op with a price tag.
+* **A refusal is reported verbatim, never retried into a success.** Provider 410/403/404 markers
+  ("deprecated", "access is disabled", "no such model") are recorded in
+  `$HERMES_HOME/state/capability_delegation/unusable.json` for 24 h so the next resolve skips that
+  model instead of walking into the same wall. An ordinary `400` is **not** remembered: that is a
+  malformed part, which is this layer's bug and must stay visible.
+* **No success without text.** Empty content, a decode failure, an oversized body (20 MB default) or
+  a missing specialist all produce `success: false` with a reason; nothing is fabricated.
+
+Verified on this host (live config, deepseek primary, gpt-6-luna specialist):
+
+| case | result |
+|---|---|
+| image → `gpt-6-luna`, asked for the visible string | `DELEGATE-OK-7319` returned |
+| pdf (688 B, built with a real xref) → `gpt-6-luna` | answered from the document text |
+| `gemini-3-flash` (catalog-listed, provider-retired) | 410 `ModelDeprecated` reported, then skipped on the next resolve |
+| audio / video specialists on opencode-zen | **none live**: `gemini-3.5/3.7-flash` answer 403 "model access is disabled" — audio and video delegation are unavailable until a live multimodal specialist exists |
+
+That last row is the honest boundary of this feature on this provider, not a code gap: the layer
+picks correctly and reports what the provider says.
 
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
