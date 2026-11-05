@@ -815,3 +815,20 @@ def test_the_estimate_is_biased_high_not_low(monkeypatch):
     usd, _ = cd._price(choice, {}, bytes_sent=3000, modality="text")
     # 3000 bytes at 4 bytes/token would be 750 tokens = $0.00075; 3 bytes/token gives 1000 = $0.001
     assert usd >= 0.0009, f"estimate {usd} under-counts input"
+
+
+def test_a_video_result_carries_the_verbatim_timeline(tmp_path):
+    """The specialist drops timestamps; the primary must not need vision to recover them."""
+    from agent.capability_delegation import _cache_video_context, cached_video_timeline
+    from agent.video_context import Frame, VideoContext
+
+    ctx = VideoContext(path="v.mp4", duration_s=6.1, audio_duration_s=6.1,
+                       frames=[Frame(index=0, timestamp_s=0.0, path="f0.jpg",
+                                     ocr_text="MAGIC-VIDEO-5510"),
+                               Frame(index=1, timestamp_s=3.0, path="f1.jpg",
+                                     ocr_text="ACTION ITEM ship OCR path")],
+                       transcript="hello", notes=[])
+    _cache_video_context("v.mp4", ctx)
+    line = cached_video_timeline("v.mp4")
+    assert "[  0.00s] MAGIC-VIDEO-5510" in line
+    assert "[  3.00s] ACTION ITEM ship OCR path" in line

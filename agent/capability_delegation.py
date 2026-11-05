@@ -541,6 +541,40 @@ def _read_limited(path: Path, max_bytes: int) -> Tuple[bytes, str]:
     return path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
 
+#: path -> (VideoContext, expiry). The decomposed representation is expensive (STT), so it is built
+#: once and reused to attach the verbatim on-screen timeline to the result the primary receives.
+_VIDEO_CONTEXT_CACHE: Dict[str, tuple] = {}
+_VIDEO_CONTEXT_TTL_S = 900.0
+
+
+def _cache_video_context(path: str, context: Any) -> None:
+    import time as _time
+
+    _VIDEO_CONTEXT_CACHE[str(path)] = (context, _time.time() + _VIDEO_CONTEXT_TTL_S)
+
+
+def cached_video_timeline(path: str, limit: int = 40) -> str:
+    """Verbatim OCR lines with their timestamps, so the primary never has to re-read frames."""
+    import time as _time
+
+    entry = _VIDEO_CONTEXT_CACHE.get(str(path))
+    if not entry:
+        return ""
+    context, expiry = entry
+    if expiry <= _time.time():
+        _VIDEO_CONTEXT_CACHE.pop(str(path), None)
+        return ""
+    lines = []
+    for frame in getattr(context, "frames", [])[:limit]:
+        text = " ".join((frame.ocr_text or "").split())
+        if text:
+            lines.append(f"[{frame.timestamp_s:6.2f}s] {text}")
+    if not lines:
+        return ""
+    return ("RAW ON-SCREEN TIMELINE (verbatim OCR, sampled frames):\n"
+            + "\n".join(lines))
+
+
 def build_delegation_messages(
     path: str,
     instruction: str,
@@ -641,6 +675,7 @@ def build_delegation_messages(
 
         context = build_video_context(str(target), max_frames=max_frames, do_ocr=True,
                                       do_transcribe=True, transcribe=_transcribe_file)
+        _cache_video_context(str(target), context)
         text = context.as_text()
         with_text = sum(1 for frame in context.frames if frame.ocr_text.strip())
         note = (f"decomposed {target.name} locally into a timestamped representation "
@@ -793,6 +828,13 @@ async def delegate_capability(
             bytes_sent=sent, reason=f"{choice.reason}; {note}",
             error="the specialist returned no content",
         )
+    if want == "video":
+        timeline = cached_video_timeline(path)
+        if timeline and "RAW ON-SCREEN TIMELINE" not in text:
+            # The specialist summarises and drops timestamps; the primary then wants to re-read
+            # frames with vision to pin a second (measured: 8 vision calls, an exhausted turn).
+            # Hand it the verbatim timeline instead, at no extra cost.
+            text = f"{text}\n\n{timeline}"
     usage = _usage_of(response)
     usd, basis = _price(choice, usage, bytes_sent=sent, modality=want)
     return DelegationResult(

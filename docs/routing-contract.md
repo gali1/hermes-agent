@@ -526,6 +526,20 @@ Verified: a 6.1 s clip carrying on-screen codes and an audio track → 8 frames,
 answered *"shows MAGIC-VIDEO-5510 until about 3.1 seconds, then ACTION ITEM ship…"*, i.e. it
 reasoned over timestamps it never saw as video.
 
+**Coverage is stated, never implied.** Every stage stops at the wall-clock budget and the payload
+says how much was read: a 4:05 clip transcribed `audio transcribed 0:00-2:25 of 4:05 (budget)`
+under `budget_seconds=240` (STT alone took 222.6 s at RTF 1.53 on CPU). A complete run says
+`(complete)`, a clip with no audio track says `SPEECH: unavailable (no audio track)`.
+
+**Speakers are unavailable, and the payload says so.** Local STT has no diarization, so the block
+carries `SPEAKERS: unavailable (local STT has no diarization; speech is unattributed — do not guess
+who spoke)`. Without that line a primary will happily invent "the second speaker".
+
+**The result carries the verbatim timeline.** A specialist summarises and drops timestamps, and the
+primary then re-reads frames with vision to pin a second (measured: 8 vision calls and an exhausted
+turn). The result therefore appends `RAW ON-SCREEN TIMELINE`, the OCR text with each frame's
+timestamp, from the decomposition that already ran — no extra cost.
+
 ## C25 — Several operations per request, bounded
 
 One request can need more than one capability (a recording that must be transcribed *and* have its
@@ -541,6 +555,12 @@ several, but never unbounded:
 | recursion | thread-local guard on the middleware |
 | partial results | a skipped or failed operation becomes a labelled note; the primary answers from what came back |
 | audit | one `delegation` line per operation + one `delegation_batch` line with `operations`, `est_cost_usd`, `budget_hit` |
+
+**The money bound is fail-safe, not exact.** With `parallel: true` the budget is checked between
+launches and again as results land, so a batch can overshoot by at most *workers × the per-operation
+estimate* (4 × estimate by default). Under-charging is the failure that matters — an unknown cost
+charged as zero means the budget can never trip — so overshoot is accepted and stated rather than
+hidden.
 
 Operations are independent by construction, so they run in parallel (`ThreadPoolExecutor`, max 4);
 `parallel: false` runs them in order. Verified live: one turn with an audio note and a scanned
@@ -642,6 +662,47 @@ Measured after the change, normal prompt, no special instruction, tools enabled:
 `MAGIC-VIDEO-5510` switching to `ACTION ITEM ship OCR path`, **0 tool calls, no leaked XML**. The
 per-turn memo (`_DONE_THIS_TURN`) still guarantees the same file is never delegated twice, and the
 same prompt no longer re-derives the material.
+
+## C32 — The memo key is content plus operation, and failures are never memoised
+
+`<modality>:<sha256(content)[:16]>:<sha256(instruction)[:16]>`. Content, not path: a renamed copy is
+the same operation, a re-recorded file at the same path is a new one. The instruction is in the key
+because the same file asked about differently is a different operation — the exact case a path-only
+key swallowed. Files over the hashing threshold are digested from their first and last megabyte plus
+their size, never read whole; each candidate is hashed once per pass.
+
+**Only success is memoised.** A failure, a timeout or a budget skip leaves the key unclaimed so the
+next model call of that turn tries again instead of the primary being told "already handled" about
+work that never happened. Entries expire after 30 minutes (1800 s).
+
+## C33 — Where the result is injected, and what is allowed to stop re-derivation
+
+The delegated result goes into the **system message**, not the user turn. Measured: appended to the
+user turn the primary treated a finished extraction as a hint and re-ran its own OCR/frame work over
+the same file, exhausting the turn. As a runtime statement in the system message, the same file
+produced **0 tool calls and a correct answer on 3 consecutive runs** (scanned PDF and video).
+
+Two things were tried and rejected on evidence:
+
+* `tool_choice: "none"` on the carrying call — `deepseek-v4.1-flash` then emits the tool call as
+  **XML text**, so the user gets `<tool_calls><invoke name="terminal">…` instead of an answer.
+* Replacing a `read_file` result with the extracted text — the primary called it "a fabricated
+  notice" and refused to give the code even though it was correct.
+
+What stands instead: the note states the material was extracted from the actual file and is
+complete; a `tool_execution` guard answers a *terminal* or *execute_code* call that names a file
+already delegated in the last 30 minutes from the completed extraction, without re-running it. The
+guard never touches `read_file`, the vision tools, or `delegate_capability`.
+
+## C34 — `read_file` decodes text-contract files instead of calling them binary
+
+A cp1252 CSV read through `read_file` used to return *"Binary file (unknown binary, 28 bytes) —
+cannot display as text"* while the same bytes decoded perfectly through the delegation path. Files
+whose extension is text by contract (`.csv .tsv .txt .log .md .json .jsonl .yaml .yml .ini .conf
+.cfg .env .sql .srt .vtt .nfo`) are now decoded `utf-8-sig` → `cp1252` → `latin-1` when the strict
+UTF-8 read fails, with the chosen encoding in the hint and writes still re-encoding as UTF-8. NUL
+bytes still mean binary whatever the extension, and a decode that would produce replacement
+characters keeps the original refusal instead of showing mojibake.
 
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,

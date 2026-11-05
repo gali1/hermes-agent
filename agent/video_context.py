@@ -6,32 +6,56 @@ specialist (or the primary) reasons over. Frames are only sent to a vision model
 because a frame costs tokens and OCR costs nothing.
 
 Real-world clips are long, sometimes silent, and local STT is slower than real time, so every
-stage here is bounded by a wall-clock budget (``time_budget_s``). When a stage cannot finish, it
-stops and says what it actually covered instead of pretending the clip was read end to end.
+stage here is bounded by a wall-clock budget (``time_budget_s``) and speech-to-text by its own
+(``stt_budget_s``, which defaults to the same value). When a stage cannot finish, it stops and
+says what it actually covered instead of pretending the clip was read end to end.
 Speaker labels are *not* produced: the local STT has no diarization, and guessing who spoke is
 worse than saying it is unknown.
+
+Three things make a five-minute clip fit in a few minutes of wall clock instead of never
+finishing: long silences are cut out before any audio reaches the model, the remaining speech is
+split into short chunks that are decoded in parallel across cores (and stitched back in time
+order), and OCR runs alongside STT rather than after it.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_TIME_BUDGET_S = 240.0
-# How much audio the first STT call is allowed to cover: it measures throughput, so it should be
-# a fraction of the clip, not the whole thing, and never more than this many seconds.
+# How much audio a single small-budget STT call may take: when there is not enough time left for
+# a full parallel wave, one short clip measures throughput so the coverage claim stays truthful.
 STT_PROBE_MAX_S = 20.0
-# After the probe, audio is transcribed in chunks this long, checking the deadline between them,
-# so one optimistic throughput estimate can only overrun by one chunk's worth of audio.
-STT_CHUNK_S = 60.0
+# Speech is decoded in chunks this long. Short chunks are what make parallel decoding pay: with
+# four workers a 5-minute clip becomes a handful of 30 s jobs instead of one long queue.
+STT_CHUNK_S = 30.0
+# Runs of silence at least this long are cut out before decoding. Whisper invents text on
+# silence, and VAD inside the model still costs a forward pass per frame, so the cheapest
+# silence is silence that never reaches the model.
+STT_MIN_SILENCE_S = 0.8
+STT_SILENCE_DB = -35.0
+# Default chunk workers: one per core, capped, because past that ctranslate2 spends its time
+# contending (measured: 4 workers 0.81 aggregate RTF vs 8 workers 0.73 on an 8-thread box under
+# load). ``stt.video.workers`` overrides it.
+STT_WORKERS_DEFAULT = max(1, min(4, os.cpu_count() or 1))
+STT_BEAM_SIZE_DEFAULT = 1
+STT_COMPUTE_TYPE_DEFAULT = "int8"
+DEFAULT_STT_MODEL = "base"
+STT_MODEL_ENV = "HERMES_VIDEO_STT_MODEL"
+# A chunk needs about this much budget to be worth starting: below it, one clipped probe is all
+# the time there is.
+STT_MIN_CHUNK_BUDGET_S = 6.0
 
 SPEAKER_LABEL_NOTE = ("SPEAKERS: unavailable (local STT has no diarization; "
                       "speech is unattributed - do not guess who spoke)")
@@ -60,6 +84,14 @@ class VideoContext:
     covered_s: float = 0.0
     stt_realtime_factor: float = 0.0  # measured wall seconds per audio second
     timings: Dict[str, float] = field(default_factory=dict)
+    # Provenance of the speech pass, so a reader (and the measurement script) can tell what ran.
+    silence_skipped_s: float = 0.0
+    stt_chunks: int = 0
+    stt_workers: int = 1
+    stt_model: str = ""
+    stt_backend: str = ""  # "faster-whisper" (in-process) or "provider" (configured STT stack)
+    time_budget_s: float = 0.0
+    stt_budget_s: float = 0.0
 
     def as_text(self, *, max_chars: int = 6000) -> str:
         head = [f"VIDEO: {Path(self.path).name} ({self.duration_s:.1f}s"
@@ -70,7 +102,7 @@ class VideoContext:
             if self.audio_duration_s > 0:
                 span = f", 0:00-{_fmt_mmss(self.covered_s)} of {_fmt_mmss(self.audio_duration_s)}"
                 if self.covered_s >= self.audio_duration_s - 1.0:
-                    span += " (full)"
+                    span += " (complete)"
             body.append(f"SPEECH (local STT{span}):\n" + self.transcript.strip())
             body.append(SPEAKER_LABEL_NOTE)
             if self.transcript_error:
