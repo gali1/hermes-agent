@@ -368,3 +368,94 @@ def test_tool_returns_the_delegation_json(pool, aux, tmp_path):
     assert payload["success"] is True
     assert payload["text"] == "SPECIALIST TEXT"
     assert payload["model"] == "reader"
+
+
+# --------------------------------------------------------------------------- transports
+
+
+def test_pdf_with_a_text_layer_is_extracted_and_sent_as_text(tmp_path, monkeypatch):
+    """Portable by default: extraction works on every provider, a `file` part does not."""
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "VAULT TOTAL: 412 GB")
+    messages, sent, note = cd.build_delegation_messages(str(doc), "extract the total", "pdf")
+    body = messages[0]["content"]
+    assert isinstance(body, str)
+    assert "VAULT TOTAL: 412 GB" in body
+    assert "extracted" in note and "portable path" in note
+    assert sent == len("VAULT TOTAL: 412 GB")
+
+
+def test_a_scan_falls_back_to_the_native_part_and_says_so(tmp_path, monkeypatch):
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    messages, sent, note = cd.build_delegation_messages(str(doc), "read", "pdf")
+    part = messages[0]["content"][1]
+    assert part["type"] == "file"
+    assert "after local extraction produced nothing" in note
+    assert sent == doc.stat().st_size
+
+
+def test_pdf_transport_text_refuses_a_scan(tmp_path, monkeypatch):
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(doc), "read", "pdf", transport="text")
+    assert "no text layer" in str(exc.value)
+
+
+def test_audio_is_transcribed_locally_by_default(tmp_path, monkeypatch):
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (True, "the disk is failing", ""))
+    messages, sent, note = cd.build_delegation_messages(str(voice), "summarise", "audio")
+    body = messages[0]["content"]
+    assert isinstance(body, str) and "the disk is failing" in body
+    assert "transcribed" in note and "STT" in note
+
+
+def test_audio_transport_stt_reports_why_transcription_failed(tmp_path, monkeypatch):
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (False, "", "no STT provider configured"))
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(voice), "transcribe", "audio", transport="stt")
+    assert "no STT provider configured" in str(exc.value)
+
+
+def test_audio_native_skips_transcription(tmp_path, monkeypatch):
+    voice = tmp_path / "memo.mp3"
+    voice.write_bytes(b"ID3" + b"0" * 32)
+    calls = []
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: calls.append(p) or (True, "x", ""))
+    messages, _sent, note = cd.build_delegation_messages(
+        str(voice), "transcribe", "audio", transport="native")
+    assert calls == [], "transport='native' must not spend a transcription"
+    assert messages[0]["content"][1]["type"] == "input_audio"
+    assert "not guaranteed" in note.replace("no audio part shape is guaranteed", "not guaranteed")
+
+
+def test_transport_is_threaded_through_the_call(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    seen = {}
+
+    async def fake(**kwargs):
+        seen["messages"] = kwargs["messages"]
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="OK", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", fake, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "EXTRACTED BODY")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(
+        str(doc), "read it", modality="pdf", config=_config(["primary-model", "reader"]),
+        transport="text"))
+    assert result.success is True
+    assert "EXTRACTED BODY" in seen["messages"][0]["content"]

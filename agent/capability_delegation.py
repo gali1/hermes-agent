@@ -323,6 +323,31 @@ def resolve_specialist(
 # ---------------------------------------------------------------------------
 
 
+def _extract_pdf_text(path: Path) -> str:
+    """Text layer of a PDF/DOCX/XLSX via the repo's own extractor; "" when there is none."""
+    try:
+        from tools.read_extract import extract_document_text
+
+        return extract_document_text(str(path)) or ""
+    except Exception as exc:  # noqa: BLE001 - a scan with no text layer is expected, not a crash
+        logger.info("local extraction failed for %s: %s", path.name, exc)
+        return ""
+
+
+def _transcribe_file(path: Path) -> Tuple[bool, str, str]:
+    """Local/cloud STT through the existing transcription stack. Returns (ok, text, why)."""
+    try:
+        from tools.transcription_tools import transcribe_audio
+
+        result = transcribe_audio(str(path), source="capability_delegation")
+    except Exception as exc:  # noqa: BLE001
+        return False, "", f"{type(exc).__name__}: {str(exc)[:200]}"
+    if isinstance(result, dict) and result.get("success"):
+        return True, str(result.get("transcript") or ""), ""
+    why = result.get("error") if isinstance(result, dict) else "transcription returned no result"
+    return False, "", str(why or "transcription produced no text")[:200]
+
+
 def _read_limited(path: Path, max_bytes: int) -> Tuple[bytes, str]:
     size = path.stat().st_size
     if size > max_bytes:
@@ -339,11 +364,21 @@ def build_delegation_messages(
     modality: str,
     *,
     max_bytes: int = DEFAULT_MAX_BYTES,
+    transport: str = "auto",
 ) -> Tuple[List[Dict[str, Any]], int, str]:
     """Messages for the specialist: one text part with the task, one part carrying the file.
 
     Returns ``(messages, bytes_sent, note)``. Raises ``ValueError`` for anything that cannot be
     transported — a refusal here is cheaper and more honest than a provider 400.
+
+    ``transport`` selects how a pdf/audio is carried:
+
+    * ``"auto"`` (default) — pdf: extract the text layer locally and send the text; if there is
+      no text layer (a scan), send the bytes as a native ``file`` part and say so.  audio:
+      transcribe with the existing STT stack and send the transcript; if STT is unavailable,
+      fall back to a native ``input_audio`` part.
+    * ``"text"`` / ``"stt"`` — the portable path only; raise if it cannot produce text.
+    * ``"native"`` — skip extraction/transcription and send the provider part directly.
     """
     if not (instruction or "").strip():
         raise ValueError("delegation needs an instruction: what the specialist should return")
@@ -379,8 +414,24 @@ def build_delegation_messages(
         ]}], len(data), note)
 
     if want == "audio":
+        stt_why = ""
+        if transport != "native":
+            ok, transcript, stt_why = _transcribe_file(target)
+            if ok and transcript.strip():
+                clipped = transcript[:MAX_INLINE_TEXT_CHARS]
+                note = (f"transcribed {target.name} with the STT stack "
+                        f"({len(transcript)} chars) and sent the transcript")
+                return ([{"role": "user", "content": (
+                    f"{header}\n\n--- {target.name} (transcript) ---\n{clipped}")}],
+                        len(clipped.encode("utf-8")), note)
+            if transport == "stt":
+                raise ValueError(
+                    f"could not transcribe {target.name}: {stt_why}. Configure an STT provider "
+                    "or set transport='native' to send the audio itself.")
         fmt = _AUDIO_FORMAT.get(target.suffix.lower(), "wav")
-        note = f"sent {target.name} as an input_audio part ({fmt})"
+        suffix = f" (after STT failed: {stt_why})" if stt_why else ""
+        note = (f"sent {target.name} as an input_audio part ({fmt}){suffix} — no audio part "
+                "shape is guaranteed on every provider")
         return ([{"role": "user", "content": [
             {"type": "text", "text": header},
             {"type": "input_audio", "input_audio": {
@@ -388,8 +439,21 @@ def build_delegation_messages(
         ]}], len(data), note)
 
     if want == "pdf":
+        extracted = "" if transport == "native" else _extract_pdf_text(target)
+        if extracted.strip():
+            clipped = extracted[:MAX_INLINE_TEXT_CHARS]
+            note = (f"extracted {target.name} locally ({len(extracted)} chars, portable path) "
+                    "and sent the text")
+            return ([{"role": "user", "content": (
+                f"{header}\n\n--- {target.name} (extracted text) ---\n{clipped}")}],
+                    len(clipped.encode("utf-8")), note)
+        if transport == "text":
+            raise ValueError(
+                f"could not extract text from {target.name}: it may be a scan with no text "
+                "layer. Set transport='native' to send the bytes as a file part.")
         url = f"data:application/pdf;base64,{base64.b64encode(data).decode('ascii')}"
-        note = f"sent {target.name} as a file part (application/pdf)"
+        note = (f"sent {target.name} as a file part (application/pdf) after local extraction "
+                "produced nothing — not every provider accepts this part type")
         return ([{"role": "user", "content": [
             {"type": "text", "text": header},
             {"type": "file", "file": {"filename": target.name, "file_data": url}},
@@ -417,6 +481,7 @@ async def delegate_capability(
     max_bytes: int = DEFAULT_MAX_BYTES,
     exclude: Sequence[Tuple[str, str]] = (),
     choice: Optional[SpecialistChoice] = None,
+    transport: str = "auto",
 ) -> DelegationResult:
     """Run one capability-specific sub-task on a declared specialist and return its text."""
     try:
@@ -437,8 +502,10 @@ async def delegate_capability(
         )
 
     try:
-        messages, sent, note = build_delegation_messages(
-            path, instruction, want, max_bytes=max_bytes)
+        # extraction and STT are blocking: keep them off the event loop.
+        messages, sent, note = await asyncio.to_thread(
+            build_delegation_messages, path, instruction, want,
+            max_bytes=max_bytes, transport=transport)
     except ValueError as exc:
         return DelegationResult(
             success=False, provider=choice.provider, model=choice.model,

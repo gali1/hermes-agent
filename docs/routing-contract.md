@@ -434,10 +434,15 @@ is tested. C20's own limit stands: this hook still never sends a file to a speci
 `agent/capability_delegation.py` answers a different question from C20's: *which model performs one
 sub-task inside a turn the primary model still owns*. The primary is never displaced by it.
 
-* **One transport per modality, and only where a real part exists.** image → `image_url` data URL,
-  audio → `input_audio`, pdf → `file`, text-like files → inlined text (truncated, with a marker).
-  Video has **no** transport: the layer refuses with "extract frames or text first" rather than
-  sending bytes a provider cannot read.
+* **Portable first, native part only as an opt-in.** Nothing in this tree builds a `file` or
+  `input_audio` part — `gateway/platforms/api_server.py` rejects both and `agent/image_routing.py`
+  states that a PDF must never become a vision part — so the default path is the one every provider
+  accepts: a **pdf is extracted locally** (`tools.read_extract.extract_document_text`) and the text
+  is sent; an **audio file is transcribed** with the existing STT stack
+  (`tools.transcription_tools.transcribe_audio`) and the transcript is sent; text-like files are
+  inlined (truncated, marked); images travel as `image_url` data URLs. `transport="native"` sends
+  the provider part instead (`file` / `input_audio`) and reports the provider's own words when it
+  refuses. Video has **no** transport at all: the layer refuses with "extract frames or text first".
 * **The specialist is chosen by the routing pool and the routing rules.** `preferred_models_only`
   is honoured, capability leads and price only breaks ties, and the config's own model is excluded —
   delegating to the model already holding the conversation is a no-op with a price tag.
@@ -453,8 +458,9 @@ Verified on this host (live config, deepseek primary, gpt-6-luna specialist):
 
 | case | result |
 |---|---|
-| image → `gpt-6-luna`, asked for the visible string | `DELEGATE-OK-7319` returned |
-| pdf (688 B, built with a real xref) → `gpt-6-luna` | answered from the document text |
+| image (PNG) → `gpt-6-luna`, asked for the visible string | `DELEGATE-OK-7319` returned |
+| pdf (688 B, real xref) → extraction (80 chars) → `gpt-6-luna` | `PDF-OK-4412` returned: the specialist saw text, never bytes |
+| audio on this host | **no STT backend installed** ("faster-whisper or HERMES_LOCAL_STT_COMMAND") and no live audio-capable model — reported as a failure, not faked |
 | `gemini-3-flash` (catalog-listed, provider-retired) | 410 `ModelDeprecated` reported, then skipped on the next resolve |
 | audio / video specialists on opencode-zen | **none live**: `gemini-3.5/3.7-flash` answer 403 "model access is disabled" — audio and video delegation are unavailable until a live multimodal specialist exists |
 
