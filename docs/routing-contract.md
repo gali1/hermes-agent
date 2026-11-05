@@ -178,13 +178,21 @@ part must not select a model whose input modality excludes images, and must not 
   satisfy C9a.
 
 **C9b — output modality and attachment continuity.** An image-edit follow-up must keep
-the original attachment and require image-output capability. oklab-1 now records the
-precondition: `Decision.input_modalities` / `.output_modalities` are populated from the
-profile, so a later turn can ask what the earlier decision promised. What is still
-missing on **both** sides is the second half — recognizing that a turn *asks for* image
-output, and re-attaching the original image on a follow-up. `SPEC_FIELDS` also cannot
-declare `supports_image_output`, so even a correct request could not exclude a text-only
-model; that field has to exist before C9b can be enforced rather than merely recorded.
+the original attachment and require image-output capability.
+
+- *Enforceable on oklab-1*: `supports_image_output` and `supports_audio_output` are
+  declarable `smart_model_routing.models` overrides, so an image-output request
+  (`expects_image`, which puts `image` in `output_modalities` and `output_image` in the
+  required capabilities) excludes a model that declares it cannot emit images —
+  `excluded_reason: unsupported_output_image`. A model that declares nothing stays
+  UNKNOWN and therefore eligible: unknown is not the same claim as unsupported. Verified
+  by test: `test_image_output_request_excludes_a_model_that_cannot_emit_images`.
+- *Recorded on oklab-1*: `Decision.input_modalities` / `.output_modalities` carry what the
+  decision was made for, so a follow-up turn can ask what was promised.
+- *Still missing on BOTH sides*: deriving `expects_image` from the turn itself (nothing
+  sets it outside tests), and re-attaching the original image on a follow-up. Until the
+  first lands, C9b is enforceable when asked for explicitly and inert otherwise — say
+  that, do not imply end-to-end image-edit support.
 
 **Invariant that does hold:** neither side may satisfy a modality requirement by
 dropping the attachment.

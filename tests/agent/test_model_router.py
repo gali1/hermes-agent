@@ -1504,3 +1504,45 @@ def test_decision_records_the_modalities_it_was_made_for():
     assert decision is not None
     assert "image" in decision.input_modalities
     assert decision.output_modalities == ("text",)
+
+
+# ---------------------------------------------------------------------------
+# C9b — an OUTPUT modality has to be declarable, or a text-only model stays
+# UNKNOWN (and therefore eligible) for an image-edit request.
+# ---------------------------------------------------------------------------
+
+
+def test_supports_image_output_is_a_declarable_spec_field():
+    spec = mr.ModelSpec.from_entry({"name": "txt-only", "supports_image_output": False})
+    assert spec is not None and spec.supports_image_output is False
+    cand = mr.ModelCandidate("test", "txt-only", info("txt-only"), spec=spec)
+    assert mr.capability_state(cand, "output_image") is mr.CapabilityState.UNSUPPORTED
+
+
+def test_image_output_request_excludes_a_model_that_cannot_emit_images():
+    profile = mr.classify_request("recolour this chart", expects_image=True)
+    assert "image" in profile.output_modalities
+    assert "output_image" in mr.required_capabilities(profile)
+
+    text_only = mr.ModelCandidate(
+        "test", "txt-only", info("txt-only"),
+        spec=mr.ModelSpec.from_entry({"name": "txt-only", "supports_image_output": False}),
+    )
+    painter = mr.ModelCandidate(
+        "test", "painter", info("painter"),
+        spec=mr.ModelSpec.from_entry({"name": "painter", "supports_image_output": True}),
+    )
+    cfg = mr.RoutingConfig()
+    assert mr._exclusion_reason(text_only, profile, cfg) == "unsupported_output_image"
+    assert mr._exclusion_reason(painter, profile, cfg) == ""
+    assert mr.rank_candidates(profile, [text_only, painter]).best_key == "test/painter"
+
+
+def test_an_undeclared_output_modality_stays_unknown_not_unsupported():
+    """Unknown is not the same claim as unsupported: a model that never declares
+    image output must not be excluded, only unproven."""
+    profile = mr.classify_request("recolour this chart", expects_image=True)
+    # no catalog entry at all: nothing declares what this model can emit
+    silent = mr.ModelCandidate("test", "silent", None)
+    assert mr.capability_state(silent, "output_image") is mr.CapabilityState.UNKNOWN
+    assert mr._exclusion_reason(silent, profile, mr.RoutingConfig()) == ""

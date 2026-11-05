@@ -487,6 +487,8 @@ SPEC_FIELDS = (
     "supports_audio",
     "supports_structured",
     "supports_text_output",
+    "supports_image_output",
+    "supports_audio_output",
     "deprecated",
 )
 
@@ -496,6 +498,8 @@ _BOOL_SPEC_FIELDS = (
     "supports_audio",
     "supports_structured",
     "supports_text_output",
+    "supports_image_output",
+    "supports_audio_output",
     "deprecated",
 )
 _INT_SPEC_FIELDS = ("context_window", "max_output", "tier_rank")
@@ -576,6 +580,8 @@ class ModelSpec:
     supports_audio: Optional[bool] = None
     supports_structured: Optional[bool] = None
     supports_text_output: Optional[bool] = None
+    supports_image_output: Optional[bool] = None
+    supports_audio_output: Optional[bool] = None
     deprecated: Optional[bool] = None
 
     @classmethod
@@ -728,6 +734,14 @@ class ModelCandidate:
             declared_text = self._declared("supports_text_output")
             if declared_text is not None:
                 return CapabilityState.SUPPORTED if declared_text else CapabilityState.UNSUPPORTED
+        else:
+            # C9b needs an operator-declarable OUTPUT capability. Without one a
+            # text-only model stays UNKNOWN (not UNSUPPORTED) and therefore
+            # eligible, so an image-edit request cannot exclude it.
+            declared_out = self._declared(f"supports_{modality}_output")
+            if declared_out is not None:
+                return (CapabilityState.SUPPORTED if declared_out
+                        else CapabilityState.UNSUPPORTED)
         if self.info is None:
             return CapabilityState.UNKNOWN
         mods = self._mods("output_modalities")
