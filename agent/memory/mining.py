@@ -318,6 +318,42 @@ def is_request(text) -> bool:
     return len(body) <= MAX_UNMARKED_QUESTION_CHARS and bool(_LEADING_INTERROGATIVE.match(body))
 
 
+# -- Narration lead-in (added) ------------------------------------------------
+# The explicit "Now <verb>ing" form above misses the same move when a row does
+# not open with "Now": "Adding the algorithmic purge pass to the store:" is
+# narration too.  A gerund opener counts when the line is a lead-in - a
+# colon-terminated header, or a short clause that asserts nothing.  Broad verbs
+# (running/checking/reading) stay out of this path: they open findings as often
+# as they open narration.
+_MAX_NARRATION_LEADIN_CHARS = 80
+_NARRATION_GERUND_RE = re.compile(
+    r"(?i)^\s*(?:adding|updating|writing|patching|editing|wiring|hooking|extending|"
+    r"refactoring|rewriting|tweaking|adjusting|implementing)\b"
+)
+_NARRATION_ASSERT_RE = re.compile(
+    r"(?i)\b(?:means|requires|because|since|is|are|was|were|has|have|must|always|never)\b"
+)
+
+
+def looks_like_narration(text) -> bool:
+    """True when `text` is the agent narrating its own next move."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    stripped = text.strip()
+    if len(stripped) > _MAX_NARRATION_CHARS:
+        return False
+    if _NARRATION_RE.match(stripped):
+        return True
+    if not _NARRATION_GERUND_RE.match(stripped):
+        return False
+    if stripped.endswith(":"):
+        return True
+    return (
+        len(stripped) <= _MAX_NARRATION_LEADIN_CHARS
+        and not _NARRATION_ASSERT_RE.search(stripped)
+    )
+
+
 def looks_like_fallback(text) -> bool:
     """True for assistant status narration and canned failure boilerplate."""
     if not isinstance(text, str) or not text:
@@ -328,7 +364,7 @@ def looks_like_fallback(text) -> bool:
         return True
     if len(stripped) < MAX_REQUEST_CHARS and _STATUS_LINE_RE.match(stripped):
         return True
-    if len(stripped) <= _MAX_NARRATION_CHARS and _NARRATION_RE.match(stripped):
+    if looks_like_narration(stripped):
         return True
     return bool(
         len(stripped) <= MAX_PROGRESS_CHARS
@@ -375,7 +411,7 @@ _ANNOUNCE_REPORT_RE = re.compile(
 # The clause that turns a completion formula into a finding.
 _ANNOUNCE_PAYLOAD_RE = re.compile(
     r"(?i)\b(?:because|since|so that|root cause|due to|came from|turned out|"
-    r"which (?:means|is why))\b"
+    r"which (?:means|is why)|is held by|is (?:set|configured|owned) by)\b"
     r"|(?:[\u2014\u2013-]\s*and|,\s*and(?!\s*(?:nothing|no)\b)|,?\s*which\b|,\s*but\b)"
     r"|;\s*(?!nothing\b|no\b)"
     r"|\bport\s+\d{2,5}\b"

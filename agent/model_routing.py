@@ -48,7 +48,15 @@ _TRIVIAL = re.compile(r"^\s*(hi|hello|thanks|what is \d+ ?[-+*/] ?\d+|define \w+
 
 @dataclass(frozen=True)
 class RequestProfile:
-    """What the request needs, derived deterministically from its text."""
+    """What the request needs, derived deterministically from its text.
+
+    The last four fields are cost-model assumptions, not requirements: they describe how much
+    of the prompt is expected to hit the provider's prompt cache, how many tokens the model is
+    expected to spend thinking, and how many retries a request of this kind is expected to
+    take. All default to zero so a profile built by :func:`classify_request` costs exactly what
+    it always did; a caller that knows better (a cached agent loop, a retry budget) can set
+    them and :func:`estimate_cost` will price the *expected total* rather than one attempt.
+    """
 
     tier: str
     est_input_tokens: int
@@ -58,6 +66,10 @@ class RequestProfile:
     needs_audio: bool = False
     needs_structured: bool = False
     reasons: Tuple[str, ...] = ()
+    cached_input_ratio: float = 0.0
+    cache_write_ratio: float = 0.0
+    reasoning_tokens: int = 0
+    expected_retries: int = 0
 
     @property
     def tier_rank(self) -> int:
@@ -90,6 +102,11 @@ class ModelOption:
     tier_rank: int = 3
     deprecated: bool = False
     supports_text_output: Optional[bool] = None
+    # Prompt-cache prices, per 1M tokens, when the catalog publishes them. ``None`` means
+    # unpublished — never zero — so :func:`estimate_cost` falls back to the normal input rate
+    # instead of pretending cached tokens are free.
+    cost_cache_read: Optional[float] = None
+    cost_cache_write: Optional[float] = None
 
 
 # Skip reasons: the machine-readable answer to "why did nothing switch?". Prose in ``reason``
@@ -278,10 +295,90 @@ def classify_request(
     )
 
 
-def estimate_cost(option: ModelOption, profile: RequestProfile) -> float:
-    """Expected cost in currency units (prices are per 1M tokens)."""
-    return (profile.est_input_tokens * option.cost_in
-            + profile.est_output_tokens * option.cost_out) / 1_000_000.0
+def _clamp_ratio(value: Any) -> float:
+    """A 0..1 share; anything unparsable is 0 so a bad config cannot inflate a cost."""
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clamp_count(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def estimate_cost(
+    option: ModelOption,
+    profile: RequestProfile,
+    *,
+    cached_input_ratio: Optional[float] = None,
+    cache_write_ratio: Optional[float] = None,
+    reasoning_tokens: Optional[int] = None,
+    expected_retries: Optional[int] = None,
+) -> float:
+    """Expected **total** cost of serving the request, in currency units (prices per 1M tokens).
+
+    Spec §7.4: the number ranking compares must be what the request is expected to cost in
+    total for the required quality, not the price of one happy-path attempt. Three terms are
+    added on top of the naive ``input * cost_in + output * cost_out``:
+
+    * **Cached input.** The catalog publishes ``cost.cache_read`` / ``cost.cache_write``
+      (``ModelInfo.cost_cache_read`` / ``cost_cache_write``), so the prompt is split into
+      fresh, cache-read and cache-write shares and each share is priced at its own rate. When
+      the catalog publishes no cache price for a model, cached tokens are charged the normal
+      input rate — a missing price is never read as free.
+    * **Reasoning tokens.** These are billed at the *output* rate: models.dev has **no**
+      reasoning-specific price field (only ``cost.input``/``cost.output``/``cache_read``/
+      ``cache_write``), and providers bill thinking tokens as output. No field was invented
+      here for that reason.
+    * **Expected retries.** A retry re-sends the identical prompt, which is a prompt-cache read
+      when the model publishes a cache price (and a normal input charge when it does not), and
+      regenerates the output. So each expected retry costs
+      ``input * cache_read_rate + output * cost_out``.
+
+    Every parameter defaults to ``None``, meaning "take it from *profile*", and those profile
+    fields default to zero — so existing callers, and any profile built by
+    :func:`classify_request`, get exactly the one-attempt cost they got before.
+
+    This function prices *published* rates only. Charging an unpriced model the median known
+    price stays in :func:`rank_candidates`/:func:`score_model`, where the median is known.
+    """
+    read_ratio = _clamp_ratio(
+        profile.cached_input_ratio if cached_input_ratio is None else cached_input_ratio)
+    write_ratio = _clamp_ratio(
+        profile.cache_write_ratio if cache_write_ratio is None else cache_write_ratio)
+    reasoning = _clamp_count(
+        profile.reasoning_tokens if reasoning_tokens is None else reasoning_tokens)
+    retries = _clamp_count(
+        profile.expected_retries if expected_retries is None else expected_retries)
+
+    # Overlapping shares would bill more than the prompt: scale both down proportionally.
+    total_ratio = read_ratio + write_ratio
+    if total_ratio > 1.0:
+        read_ratio, write_ratio = read_ratio / total_ratio, write_ratio / total_ratio
+
+    prompt_tokens = max(0.0, float(profile.est_input_tokens))
+    read_tokens = prompt_tokens * read_ratio
+    write_tokens = prompt_tokens * write_ratio
+    fresh_tokens = prompt_tokens - read_tokens - write_tokens
+
+    read_rate = option.cost_cache_read if option.cost_cache_read is not None else option.cost_in
+    write_rate = option.cost_cache_write if option.cost_cache_write is not None else option.cost_in
+    output_tokens = max(0.0, float(profile.est_output_tokens)) + reasoning
+
+    input_cost = (fresh_tokens * option.cost_in
+                  + read_tokens * read_rate
+                  + write_tokens * write_rate)
+    output_cost = output_tokens * option.cost_out
+    first_attempt = (input_cost + output_cost) / 1_000_000.0
+    if not retries:
+        return first_attempt
+    # A retry re-sends the same prompt (cache hit when priced) and regenerates the output.
+    retry = (prompt_tokens * read_rate + output_tokens * option.cost_out) / 1_000_000.0
+    return first_attempt + retries * retry
 
 
 def is_eligible(option: ModelOption, profile: RequestProfile,
@@ -365,19 +462,70 @@ def _candidate_key(option: ModelOption) -> str:
     return f"{option.provider}/{option.name}"
 
 
+def widen_for_tools(
+    options: Sequence[ModelOption],
+    profile: RequestProfile,
+    settings: Optional["RoutingSettings"] = None,
+    fallback_options: Optional[Sequence[ModelOption]] = None,
+) -> Tuple[List[ModelOption], bool]:
+    """Apply spec §7.7: a preferred list must not block a tool-capable model. Returns ``(pool, widened)``.
+
+    ``needs_tools`` gates eligibility, but when ``preferred_models_only`` is set and none of the
+    preferred models is *known* to call tools, the preferred pool can only ever yield "no eligible
+    model" — the request fails even though the catalog holds models that can do the job. When the
+    operator opts in (``allow_tool_fallback``), the pool is widened to the catalog and narrowed to
+    models whose ``supports_tools`` is explicitly ``True``: "reliably produces the call" is the
+    requirement, so an unknown capability is not good enough here even though it stays eligible in
+    the ordinary path (§9.2, where missing metadata must not disqualify).
+
+    Nothing happens when any precondition is absent: no tool requirement, no preferred-only
+    restriction, no opt-in, no fallback pool to widen to, or a preferred model that *does* declare
+    tool support. A widened pool that is empty is discarded, so widening can never leave fewer
+    candidates than the caller passed in.
+    """
+    st = settings or RoutingSettings()
+    pool = list(options)
+    if not (profile.needs_tools and st.preferred_models_only and st.allow_tool_fallback):
+        return pool, False
+    if not pool or not fallback_options:
+        return pool, False
+    # The compatibility check uses the real flag: ``True`` means the catalog says it can call
+    # tools. ``None`` (unknown) is not evidence of capability.
+    if any(o.supports_tools is True and is_eligible(o, profile, st.allow_unknown_metadata)
+           for o in pool):
+        return pool, False
+
+    seen = {_candidate_key(o) for o in pool}
+    widened_pool = [o for o in pool if o.supports_tools is True]
+    for option in fallback_options:
+        key = _candidate_key(option)
+        if key in seen or option.supports_tools is not True:
+            continue
+        seen.add(key)
+        widened_pool.append(option)
+    if not widened_pool:
+        return pool, False
+    return widened_pool, True
+
+
 def rank_candidates(
     options: Sequence[ModelOption],
     profile: RequestProfile,
     settings: Optional["RoutingSettings"] = None,
+    *,
+    fallback_options: Optional[Sequence[ModelOption]] = None,
 ) -> Tuple[List[Tuple[float, ModelOption]], float, float]:
     """Rank eligible candidates. The single scoring path shared by selection and ``explain``.
 
     Returns ``(ranked, cheapest, fallback_cost)``. Keeping one implementation is deliberate:
     an explanation that disagrees with the real choice is worse than no explanation.
+    ``fallback_options`` is the catalog pool used for the §7.7 tool fallback; without it the
+    ranking is exactly what it always was.
     """
     st = settings or RoutingSettings()
     cost_weight = st.cost_weight if st.cost_optimization else 0.0
-    eligible = [o for o in options if is_eligible(o, profile, st.allow_unknown_metadata)]
+    pool, _widened = widen_for_tools(options, profile, st, fallback_options)
+    eligible = [o for o in pool if is_eligible(o, profile, st.allow_unknown_metadata)]
     costs = [estimate_cost(o, profile) for o in eligible if (o.cost_in or o.cost_out)]
     cheapest = min(costs) if costs else 0.0
     fallback_cost = statistics.median(costs) if costs else 0.0
@@ -398,18 +546,31 @@ def select_model(
     current_provider: Optional[str] = None,
     min_improvement: float = 0.15,
     settings: Optional["RoutingSettings"] = None,
+    fallback_options: Optional[Sequence[ModelOption]] = None,
 ) -> RoutingDecision:
-    """Pick the best eligible model, holding the current one unless clearly beaten."""
+    """Pick the best eligible model, holding the current one unless clearly beaten.
+
+    ``fallback_options`` is the catalog pool for the §7.7 tool fallback: when the request needs
+    tools, the caller restricted routing to a preferred list, and that list holds no model that
+    is known to call tools, the pool is widened to tool-capable catalog models instead of
+    returning "no eligible model" — and the reason says so.
+    """
     st = settings or RoutingSettings()
     threshold = st.stability_threshold if settings is not None else min_improvement
     if not options:
         return RoutingDecision(
             model=None, provider="", reason="no candidate models configured",
             score=0.0, profile=profile, candidates=0, skip_reason=SKIP_NO_CANDIDATES)
-    ranked, _cheapest, _fallback = rank_candidates(options, profile, st)
+    pool, widened = widen_for_tools(options, profile, st, fallback_options)
+    ranked, _cheapest, _fallback = rank_candidates(pool, profile, st)
     if not ranked:
+        reason = "no eligible model for this request"
+        if profile.needs_tools and st.preferred_models_only:
+            reason += " (preferred list has no tool-capable model"
+            reason += "; tool fallback found none in the catalog)" if st.allow_tool_fallback \
+                else "; set allow_tool_fallback to widen)"
         return RoutingDecision(
-            model=None, provider="", reason="no eligible model for this request",
+            model=None, provider="", reason=reason,
             score=0.0, profile=profile, candidates=0, skip_reason=SKIP_NO_ELIGIBLE)
 
     best_score, best = ranked[0]
@@ -438,18 +599,40 @@ def select_model(
             break
     reason = (f"best of {len(ranked)} eligible for {profile.tier}"
               + (f" ({', '.join(profile.reasons)})" if profile.reasons else ""))
+    if widened:
+        # Prose, not a skip reason: the decision is a real switch, so ``skip_reason`` stays "".
+        reason += ("; tool fallback: preferred list had no tool-capable model, "
+                   f"widened to {len(pool)} catalog candidates")
     return RoutingDecision(
         model=best.name, provider=best.provider, reason=reason,
         score=best_score, profile=profile, candidates=len(ranked))
 
 
 def routing_config(agent: Any) -> Dict[str, Any]:
-    """Read ``smart_model_routing`` from the agent's config; never raises."""
+    """Read ``smart_model_routing`` for this turn; never raises.
+
+    The agent's own config dict wins when it has one (tests and embedded callers
+    build agents that way). A real AIAgent has NO ``config`` attribute, so the old
+    body returned ``{}`` on every production turn and the whole feature was inert
+    no matter what the user configured - the test fake sets ``self.config``, which
+    is exactly why the suite never caught it.
+
+    Falling back to the on-disk user config also means a CLI change takes effect on
+    the next turn without restarting the gateway: the loader caches on the file
+    signature, so an unchanged file costs one stat.
+
+    Trigger is "attribute absent / not a dict", never "empty dict": a caller that
+    explicitly passes ``{}`` means "no routing" and must keep that meaning.
+    """
     try:
         cfg = getattr(agent, "config", None)
-        if not isinstance(cfg, dict):
-            return {}
-        raw = cfg.get("smart_model_routing")
+        if isinstance(cfg, dict):
+            raw = cfg.get("smart_model_routing")
+            return raw if isinstance(raw, dict) else {}
+        from hermes_cli.config import load_config_readonly
+
+        live = load_config_readonly()
+        raw = live.get("smart_model_routing") if isinstance(live, dict) else None
         return raw if isinstance(raw, dict) else {}
     except Exception:  # pragma: no cover - defensive
         return {}
@@ -479,6 +662,10 @@ class RoutingSettings:
     # Key presence, not value: a one-model pool is only widened when the operator
     # actually wrote the key. A default must not silently turn a no-op into a switch.
     preferred_models_only_explicit: bool = False
+    # Spec §7.7, opt-in: when a tools-requiring request has no tool-capable model in the
+    # preferred list, widen to the catalog instead of returning no candidates. False by
+    # default so an existing config routes exactly as before.
+    allow_tool_fallback: bool = False
     models: Tuple[Any, ...] = ()
 
     @property
@@ -508,12 +695,14 @@ def parse_settings(raw: Any) -> RoutingSettings:
         cost_optimization=bool(raw.get("cost_optimization", True)),
         preferred_models_only=bool(raw.get("preferred_models_only", False)),
         preferred_models_only_explicit="preferred_models_only" in raw,
+        allow_tool_fallback=bool(raw.get("allow_tool_fallback", False)),
         models=tuple(models) if isinstance(models, (list, tuple)) else (),
     )
 
 
 ROUTING_STRATEGIES = ("automatic", "cost", "quality")
-_ROUTING_BOOL_KEYS = ("enabled", "preferred_models_only", "allow_unknown_metadata", "cost_optimization")
+_ROUTING_BOOL_KEYS = ("enabled", "preferred_models_only", "allow_unknown_metadata",
+                      "cost_optimization", "allow_tool_fallback")
 
 
 def validate_routing_config(raw: Any) -> List[str]:
@@ -590,6 +779,21 @@ def _catalog_attr(info: Any, attr: str, default: Any = 0) -> Any:
     return getattr(info, attr, default) or default
 
 
+def _optional_price(info: Any, attr: str) -> Optional[float]:
+    """A per-1M-token price the catalog publishes, or ``None`` when it is silent.
+
+    Zero is treated as unpublished, matching ``has_cost``: a model that publishes no price is
+    charged the median, so reading ``0.0`` as "free" here would leak a free model into ranking.
+    """
+    if info is None:
+        return None
+    try:
+        price = float(getattr(info, attr, None))
+    except (TypeError, ValueError):
+        return None
+    return price if price > 0 else None
+
+
 def options_from_config(cfg: Dict[str, Any]) -> List[ModelOption]:
     """Build candidates from ``models: [{name, provider, ...}]``; malformed entries skipped.
 
@@ -650,6 +854,10 @@ def options_from_config(cfg: Dict[str, Any]) -> List[ModelOption]:
                 else (str(_catalog_attr(info, "status", "")).lower() == "deprecated"),
                 supports_text_output=flag(
                     "supports_text_output", (("text" in outputs) if outputs else None)),
+                cost_cache_read=float(entry["cost_cache_read"]) if stated("cost_cache_read")
+                else _optional_price(info, "cost_cache_read"),
+                cost_cache_write=float(entry["cost_cache_write"]) if stated("cost_cache_write")
+                else _optional_price(info, "cost_cache_write"),
             ))
         except (TypeError, ValueError):
             logger.warning("smart_model_routing: skipping malformed model entry %r", entry)
@@ -719,6 +927,8 @@ def options_from_catalog(provider: str, models: Optional[Sequence[str]] = None) 
             tier_rank=_tier_from_capabilities(info),
             deprecated=str(getattr(info, "status", "") or "").lower() == "deprecated",
             supports_text_output=(("text" in outputs) if outputs else None),
+            cost_cache_read=_optional_price(info, "cost_cache_read"),
+            cost_cache_write=_optional_price(info, "cost_cache_write"),
         ))
     return out
 
@@ -740,11 +950,14 @@ def moa_active(agent: Any) -> bool:
     return False
 
 
-def maybe_apply_model_routing(agent: Any, text: Any) -> Optional[RoutingDecision]:
+def maybe_apply_model_routing(agent: Any, text: Any, *,
+                              needs_tools: bool = False) -> Optional[RoutingDecision]:
     """Apply routing for one turn when enabled. Returns the decision, or None if inert.
 
     ``text`` is normally a string but may be a multi-part content list (vision via the
     OpenAI-compatible server), so it is passed through unmodified rather than coerced.
+    ``needs_tools`` says the turn will require a tool call; it is what makes the §7.7 tool
+    fallback reachable from the real path instead of only from direct ``select_model`` calls.
 
     Switches through the agent's existing ``switch_model`` so credential pools, prompt-cache
     flags and the compressor are rebuilt exactly as a manual switch would rebuild them. Any
@@ -780,12 +993,19 @@ def maybe_apply_model_routing(agent: Any, text: Any) -> Optional[RoutingDecision
             options = options_from_catalog(str(getattr(agent, "provider", "") or ""))
         if not options:
             return None
-        profile = classify_request(text or "")
+        profile = classify_request(text or "", needs_tools=needs_tools)
+        # §7.7: the catalog is only consulted when the opt-in can actually matter — a
+        # preferred-only pool, a tool requirement, and allow_tool_fallback. Cache-only, so a
+        # turn never waits on a network fetch.
+        fallback_options = None
+        if st.preferred_models_only and st.allow_tool_fallback and profile.needs_tools:
+            fallback_options = options_from_catalog(str(getattr(agent, "provider", "") or ""))
         current_provider = getattr(agent, "provider", None)
         decision = select_model(
             options, profile,
             current=getattr(agent, "model", None),
-            current_provider=current_provider, settings=st)
+            current_provider=current_provider, settings=st,
+            fallback_options=fallback_options)
         # Same identity rule as the selector: switching to an identically named model on a
         # different provider is a real switch, so the name alone is not "unchanged".
         same_identity = (
@@ -831,6 +1051,15 @@ def explain_routing(
     if not cands:
         cands = options_from_catalog(provider)
         source = "catalog"
+    # §7.7: widen exactly as selection does, so the report cannot describe a pool the engine
+    # would not have used. An explicit ``options`` list is widened against the same provider
+    # catalog, because selection would do so too when the opt-in is on.
+    fallback_pool = None
+    if st.preferred_models_only and st.allow_tool_fallback and prof.needs_tools:
+        fallback_pool = options_from_catalog(provider)
+    cands, widened = widen_for_tools(cands, prof, st, fallback_pool)
+    if widened:
+        source = f"{source}+catalog (tool fallback)"
     ranked, cheapest, fallback_cost = rank_candidates(cands, prof, st)
     decision = select_model(cands, prof, current=current, current_provider=provider, settings=st)
     # Keyed by identity: two providers can expose the same model name, and a name-keyed map
@@ -869,8 +1098,11 @@ def explain_routing(
             "allow_unknown_metadata": st.allow_unknown_metadata,
             "cost_optimization": st.cost_optimization,
             "preferred_models_only": st.preferred_models_only,
+            "allow_tool_fallback": st.allow_tool_fallback,
         },
         "candidate_source": source,
+        # True when §7.7 widened the pool past a preferred list that held no tool-capable model.
+        "widened_for_tools": widened,
         "request": {
             "tier": prof.tier, "est_input_tokens": prof.est_input_tokens,
             "est_output_tokens": prof.est_output_tokens,

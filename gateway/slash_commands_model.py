@@ -866,26 +866,128 @@ class GatewayModelCommandsMixin:
             return None  # Picker sent — adapter handles the response
         return t("gateway.fast.status", mode=status)
 
+    # --------------------------------------------------- /model-routing buttons
+
+    # Entry-view actions. The callback payload stays the shared choice-picker form ``cp:<index>``
+    # (4 bytes for <10 actions), so no action can approach Telegram's 64-byte callback cap and no
+    # model name ever rides in a payload. Labels are the message text; the wire carries the index.
+    _ROUTING_ACTIONS = (
+        ("enable", "Enable routing"),
+        ("disable", "Disable routing"),
+        ("change_models", "Change models"),
+        ("cancel", "Close"),
+    )
+
+    # Second step for enabling: a tap here is the only thing that writes ``enabled: true``.
+    _ROUTING_CONFIRM_ACTIONS = (("confirm", "Confirm enable", False), ("cancel", "Cancel", False))
+
+    def _routing_authorized(self, event: MessageEvent) -> bool:
+        """The command's own gate, re-checked by every button callback (fail closed)."""
+        try:
+            return bool(self._is_user_authorized_for_source(event.source))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _routing_snapshot() -> tuple:
+        """``(full_config, routing_block)`` read fresh: a tap can land long after the view."""
+        from hermes_cli.config import get_config_path, read_user_config_raw
+
+        data = dict(read_user_config_raw(get_config_path()) or {})
+        raw = data.get("smart_model_routing")
+        return data, (raw if isinstance(raw, dict) else {})
+
+    @staticmethod
+    def _routing_snapshot_checked() -> tuple:
+        """``(data, block, error)`` for button callbacks — an unreadable config writes nothing."""
+        try:
+            data, block = GatewayModelCommandsMixin._routing_snapshot()
+        except Exception as exc:
+            return {}, {}, f"routing: config unreadable ({exc.__class__.__name__}: {exc})"
+        return data, block, ""
+
+    def _routing_picker_adapter(self, event: MessageEvent):
+        """The delivery adapter when its *type* exposes the /model picker's button API, else None."""
+        try:
+            adapter = self._delivery_adapter_for(event.source)
+        except Exception:
+            return None
+        if adapter is None or getattr(type(adapter), "send_choice_picker", None) is None:
+            return None
+        return adapter
+
+    async def _send_routing_picker(self, event, chat_id, title, choices, on_selected) -> bool:
+        """Send the routing view as inline buttons; False means "keep the text reply"."""
+        adapter = self._routing_picker_adapter(event)
+        if adapter is None:
+            return False
+        chat_id = chat_id if chat_id is not None else getattr(event.source, "chat_id", None)
+        if chat_id is None:
+            return False
+        try:
+            result = await adapter.send_choice_picker(
+                chat_id=chat_id, title=title,
+                choices=[{"value": v, "label": label, "is_current": cur} for v, label, cur in choices],
+                session_key=self._session_key_for_source(event.source),
+                on_choice_selected=on_selected, metadata=self._reply_metadata(event))
+            return bool(getattr(result, "success", False))
+        except Exception as e:
+            logger.warning("model-routing picker failed, falling back to text: %s", e)
+            return False
+
+    @staticmethod
+    def _routing_enable_now(data: dict) -> str:
+        """Apply ``enabled: true`` through the shared writer and render what landed."""
+        from hermes_cli.subcommands.model import _render_routing, _routing_report, write_routing_config
+
+        result = write_routing_config({"enabled": True})
+        if not result["ok"]:
+            return "routing: " + "; ".join(result["problems"])
+        return "Routing enabled.\n\n" + _render_routing(_routing_report(data, result["saved"]))
+
+    @staticmethod
+    def _routing_disable_now(data: dict) -> str:
+        """Apply ``enabled: false`` — the safe direction, so it needs no confirmation."""
+        from hermes_cli.subcommands.model import _render_routing, _routing_report, write_routing_config
+
+        result = write_routing_config({"enabled": False})
+        if not result["ok"]:
+            return "routing: " + "; ".join(result["problems"])
+        return ("Routing disabled — single-model behaviour restored.\n\n"
+                + _render_routing(_routing_report(data, result["saved"])))
+
+    async def _send_routing_confirm_picker(self, event, chat_id, preview_text: str) -> bool:
+        """Enabling's second step: the preview *is* the message, the buttons only apply it."""
+
+        async def _on_confirm(_chat_id: str, value: str) -> str:
+            if not self._routing_authorized(event):
+                return "routing: not authorized."
+            if value != "confirm":
+                return "Cancelled — nothing changed."
+            data_now, _block, error = self._routing_snapshot_checked()
+            if error:
+                return error
+            return self._routing_enable_now(data_now)
+
+        return await self._send_routing_picker(
+            event, chat_id, preview_text, list(self._ROUTING_CONFIRM_ACTIONS), _on_confirm)
+
     async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
         """Handle ``/model-routing`` — view, enable, or disable smart model routing.
 
-        Stateless on purpose: enabling requires the literal word ``confirm`` in the same
-        message, so the preview is always shown before the write and no per-chat pending state
-        can go stale or be answered by a different user. Disabling is the safe direction and
-        applies immediately. Every write goes through the shared ``write_routing_config``.
+        Stateless on purpose: enabling always needs an explicit confirmation *after* the preview,
+        so no per-chat pending state can go stale or be answered by a different user. Typed
+        ``on confirm`` and the two-tap button flow (Enable → Confirm) reach the same writer.
+        Disabling is the safe direction and applies immediately. Every write goes through the
+        shared ``write_routing_config``. On a platform whose adapter exposes the /model picker's
+        buttons the view is interactive; everywhere else the numbered text reply is unchanged.
         """
-        from hermes_cli.config import get_config_path, read_user_config_raw
-        from hermes_cli.subcommands.model import (
-            _render_routing, _routing_report, write_routing_config)
+        from hermes_cli.subcommands.model import _render_routing, _routing_report
 
         # Config-changing command: fail closed. The dispatch path already drops unauthorized
         # senders, but this handler writes the user's config, so it re-checks rather than
         # trusting that the caller did.
-        try:
-            authorized = self._is_user_authorized_for_source(event.source)
-        except Exception:
-            authorized = False
-        if not authorized:
+        if not self._routing_authorized(event):
             return "routing: not authorized."
 
         try:
@@ -894,15 +996,45 @@ class GatewayModelCommandsMixin:
             args = []
 
         try:
-            data = dict(read_user_config_raw(get_config_path()) or {})
+            data, block = self._routing_snapshot()
         except Exception as exc:
             return f"routing: config unreadable ({exc.__class__.__name__}: {exc})"
 
-        raw = data.get("smart_model_routing")
-        block = raw if isinstance(raw, dict) else {}
         current = _routing_report(data, block)
 
+        async def _on_action(chat_id: str, value: str) -> str:
+            """One tap per entry action. ``enable`` only opens the confirm step — it never writes."""
+            if not self._routing_authorized(event):
+                return "routing: not authorized."
+            if value == "enable":
+                data_now, block_now, error = self._routing_snapshot_checked()
+                if error:
+                    return error
+                preview_text = (
+                    "Enabling routing changes the model on every turn.\n\n"
+                    + _render_routing(_routing_report(data_now, {**block_now, "enabled": True})))
+                if await self._send_routing_confirm_picker(event, chat_id, preview_text + "\n\nApply?"):
+                    return "Preview sent above — confirm there to apply. Nothing has changed yet."
+                return preview_text + "\n\nReply `/model-routing on confirm` to apply."
+            if value == "disable":
+                data_now, _block_now, error = self._routing_snapshot_checked()
+                if error:
+                    return error
+                return self._routing_disable_now(data_now)
+            if value == "change_models":
+                return ("Routing chooses between the models in your config. Change the session model "
+                        "with `/model`, the configured default with `hermes model`; per-route "
+                        "overrides are not editable here yet.")
+            return "Closed. Nothing changed."
+
         if not args or args[0] == "status":
+            enabled = bool(current["enabled"])
+            if await self._send_routing_picker(
+                    event, None, _render_routing(current) + "\n\nChoose an action:",
+                    [(v, label, (v == "enable" and enabled) or (v == "disable" and not enabled))
+                     for v, label in self._ROUTING_ACTIONS],
+                    _on_action):
+                return None
             return (_render_routing(current) + "\n\n"
                     "Usage:\n"
                     "  /model-routing on          preview enabling\n"
@@ -911,22 +1043,16 @@ class GatewayModelCommandsMixin:
 
         action = args[0]
         if action in ("off", "disable", "single"):
-            result = write_routing_config({"enabled": False})
-            if not result["ok"]:
-                return "routing: " + "; ".join(result["problems"])
-            return ("Routing disabled — single-model behaviour restored.\n\n"
-                    + _render_routing(_routing_report(data, result["saved"])))
+            return self._routing_disable_now(data)
 
         if action in ("on", "enable"):
             preview = _routing_report(data, {**block, "enabled": True})
             if "confirm" not in args[1:]:
-                return ("Enabling routing changes the model on every turn.\n\n"
-                        + _render_routing(preview)
-                        + "\n\nReply `/model-routing on confirm` to apply.")
-            result = write_routing_config({"enabled": True})
-            if not result["ok"]:
-                return "routing: " + "; ".join(result["problems"])
-            return ("Routing enabled.\n\n"
-                    + _render_routing(_routing_report(data, result["saved"])))
+                preview_text = ("Enabling routing changes the model on every turn.\n\n"
+                                + _render_routing(preview))
+                if await self._send_routing_confirm_picker(event, None, preview_text + "\n\nApply?"):
+                    return None
+                return preview_text + "\n\nReply `/model-routing on confirm` to apply."
+            return self._routing_enable_now(data)
 
         return "Unknown option. Use `/model-routing [status|on [confirm]|off]`."

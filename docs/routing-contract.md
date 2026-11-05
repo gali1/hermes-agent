@@ -64,6 +64,28 @@ ties. It cannot alone dislodge an incumbent **at the default `stability_threshol
 0.15** — that is a threshold-dependent statement, not an absolute one: any configured
 threshold below 0.15 makes the 0.15 quality-strategy swing decisive on its own.
 
+### C4a — What "cost" means (oklab-1)
+
+`estimate_cost` is the total of `estimate_cost_breakdown`'s terms, all in USD per
+million tokens (the catalog's unit): uncached input at `cost_in`; cache-hit input at
+`cost_cache_read` (declared override or catalog) **falling back to `cost_in`** when no
+discount is published; the answer at `cost_out`; reasoning tokens at `cost_out` and
+only for a model reporting reasoning support; images as a fixed 1600-token input
+equivalent (`_IMAGE_TOKEN_EQUIVALENT`) because models.dev has no per-image price; and
+**expected retries** = subtotal × `(1−p)/p` from a declared `reliability`, capped at
+1.0, and `0` when no reliability is declared. Cache credit is caller-supplied and only
+from the second routed turn (turn 0 populates the cache), and is clamped to the input
+estimate. `charge` (the pool median for an unpriced model) prices every term, so an
+unpriced model can never claim a discount.
+
+With no cache credit, no reasoning tokens, no images and no declared reliability the
+total is exactly the old `input*in + output*out` — a config that declares none of the
+new terms prices identically to before. A model whose required capability is
+**UNKNOWN** gets no cost credit on a reasoning task (`cost_score = 0`): honestly
+priced reasoning tokens would otherwise let an unconfirmed non-reasoner win hard
+prompts on price, which items 3/4 forbid. bro-2's cost penalty is unchanged.
+
+
 ## C5 — Stability (anti-flapping)
 The incumbent model keeps the turn unless a rival beats it by more than
 `stability_threshold` (default `0.15`; `min_improvement` is the same knob under
@@ -98,6 +120,13 @@ worse fresh-install surprise than routing across the eligible catalog. bro-2
 already defaults to `false`; fastembed changes its default or documents `true`
 as a deliberate local override. Until then, both hosts should still set the key
 explicitly in `config.yaml` rather than relying on the default.
+**The flag — not the shape of the model list — decides whether the catalog may be
+consulted.** A non-empty `smart_model_routing.models` is the preferred pool, and
+with `true` it is the *whole* pool: a modality/tool gap must keep the incumbent,
+never reach the provider catalog. Reporting the list's key name as the pool scope
+was a real defect on oklab-1 (a strict config still widened, and the CLI preview
+disagreed with the runtime); any implementation that returns a scope value must
+return one the widening guard recognises.
 
 ## C7 — Mixture-of-agents
 If MoA is active for the turn, routing is skipped: the operator chose a
@@ -121,7 +150,7 @@ pool cleared, prompt-cache flags, compressor) and is verified by the same falsif
 without that, "otherwise managed in place" becomes a permanent way for one side to
 stay put.
 
-## C9 — Multimodal continuity — **C9a: implemented on both; C9b: nowhere**
+## C9 — Multimodal continuity — **C9a: implemented on oklab-1, partial on bro-2; C9b: nowhere**
 
 **C9a — input modality.** The requirement must be derived from the attachments present
 at the turn boundary, never from message text. Falsifier: a message carrying an image
@@ -136,30 +165,40 @@ part must not select a model whose input modality excludes images, and must not 
   UNDECLARED `supports_vision` reads as unknown and is still allowed (unknown ≠
   unsupported), and `SPEC_FIELDS` cannot declare image *output*, so an image-edit request
   is not yet protected on the output side (that is C9b).
-- *bro-2*: **IMPLEMENTED.** [`agent/model_routing.py:212`] `classify_request` reads a
-  multi-part content list *and* asks `image_routing.extract_image_refs` about a **string**
-  prompt, so an image named in the payload — the same reference that later becomes an
-  `image_url` part — sets `needs_vision` before selection. This mirrors oklab-1's helper
-  without importing it: the requirement is derived from what will be attached, never from the
-  words, and a path that is not a file is prose. An image attachment makes `vision` a hard
-  requirement: a model declaring `supports_vision: false` is excluded (bro-2's prose
-  `excluded_reason` is `no vision input`; oklab-1's machine token is `unsupported_vision`) and
-  cannot win the turn. An UNDECLARED `supports_vision` reads as unknown and is still allowed on
-  both sides (unknown ≠ unsupported). Falsifiers:
-  `test_string_prompt_with_image_path_requires_vision`,
-  `test_string_prompt_with_missing_path_does_not_require_vision`,
-  `test_explain_agrees_with_selection_on_string_image_path`.
-  Limit that remains: with `image_input_mode: text` the image is described up-front by
-  `vision_analyze`, so the hard requirement is stricter than that turn strictly needs —
-  conservative, never wrong.
-- **Shared limit.** `image_routing.build_native_content_parts` still runs *after* selection on
-  both sides; what moved before selection is the *requirement*, not the part construction. And
-  `SPEC_FIELDS` cannot declare image *output*, so an image-edit request is not yet protected on
-  the output side (that is C9b).
+- *bro-2*: NOT IMPLEMENTED for string prompts, but the crash is fixed. The turn boundary
+  (`agent/turn_context.py:1117-1118`) forwards the payload verbatim, and that payload can be a
+  multi-part content list — vision via the OpenAI-compatible server, per
+  `agent/agent_runtime_helpers.py:3358` — so `classify_request` used to raise `AttributeError`
+  (`body.strip()` on a list, swallowed at `model_routing.py:731`) and every such turn was
+  routing-inert by accident. It now reads text, image, audio and file parts and ORs their
+  flags with the caller's, so a list payload neither raises nor selects a text-only model for
+  an image part. Still missing: attachments delivered beside a *string* prompt are handled by
+  `image_routing.py` after selection, so the string path cannot state its modality.
+- Both: `image_routing.py` is a **separate axis applied after selection**, which cannot
+  satisfy C9a.
 
 **C9b — output modality and attachment continuity.** An image-edit follow-up must keep
-the original attachment and require image-output capability. Neither side records a
-modality on the decision (`Decision` has no such field), so this cannot be tested yet.
+the original attachment and require image-output capability.
+
+- *Enforceable on oklab-1*: `supports_image_output` and `supports_audio_output` are
+  declarable `smart_model_routing.models` overrides, so an image-output request
+  (`expects_image`, which puts `image` in `output_modalities` and `output_image` in the
+  required capabilities) excludes a model that declares it cannot emit images —
+  `excluded_reason: unsupported_output_image`. A model that declares nothing stays
+  UNKNOWN and therefore eligible: unknown is not the same claim as unsupported. Verified
+  by test: `test_image_output_request_excludes_a_model_that_cannot_emit_images`.
+- *Recorded on oklab-1*: `Decision.input_modalities` / `.output_modalities` carry what the
+  decision was made for, so a follow-up turn can ask what was promised.
+- *Derived from the turn on oklab-1*: the classifier now recognises an image-output
+  request from the prompt itself (a generation verb within 40 characters of an artefact
+  noun: generate/create/make/draw/paint/render/produce/design + image/picture/
+  illustration/drawing/artwork/logo/icon/poster/avatar). Negative controls are pinned by
+  test, because the naive "contains the word image" rule would route every attachment
+  question through an image-output gate: "what is in this image?" and "explain how image
+  generation works" both stay text.
+- *Still missing on BOTH sides*: re-attaching the original image on a follow-up edit
+  turn. Until that lands, an image-edit turn is routed correctly but the attachment
+  continuity is the caller's job, so do not imply end-to-end image-edit support.
 
 **Invariant that does hold:** neither side may satisfy a modality requirement by
 dropping the attachment.
@@ -183,7 +222,7 @@ dict there can carry the reason. C10 is satisfied on oklab-1 and open on bro-2.
 
 **The machine surface is a dict, and it is normative.** oklab-1 calls it
 `routing_report()` (`model_router.py:2361-2455`), bro-2 calls it `explain_routing()`
-(`model_routing.py:757-844`): same shape, different name. Either name is acceptable
+(`model_routing.py:735-821`): same shape, different name. Either name is acceptable
 locally, but the dict — not any text renderer — is what automation may parse, and a
 text renderer must be derived from it so the two cannot disagree. oklab-1's
 `explain()` (`:1486-1513`) is **text only** and is not an automation surface.
@@ -204,11 +243,112 @@ Canonical key first, explicit legacy alias second, and **no silent ignores**:
 Unknown keys under a routing/tool-search section produce one warning naming the
 key and stating it is not in effect.
 
+## C12 — One applier per setting, whatever the input surface
+A routing setting is applied by exactly one function. Text (`/model-routing 3`), a
+numbered reply, and an inline button must reach the same applier and the same writer
+(`update_routing`); a button is an input method, never a second code path. Platforms that
+render buttons are an optimisation: where an adapter exposes no picker (or a send fails),
+the command must still work as the numbered text flow, and no setting may exist only
+behind a button. Correspondingly, a button flow applies nothing until the final
+confirmation, and its result text is the block read back from disk — not the caller's
+optimistic echo.
+
+## C13 — Consent before routing is switched on
+`enabled` is the one routing key that changes behaviour on every later turn, so the write
+that sets it to true needs the operator's agreement on any surface a human is driving:
+* The CLI's `enable` verb prints the resolved settings and candidate pool (the same
+  `_print_routing_status` renderer `status` uses) and asks before writing. `-y/--yes` is
+  the assume-yes escape hatch, matching `configure`.
+* A caller with no terminal — a script, cron, the gateway — is never prompted: it cannot
+  answer, and a prompt there would hang instead of doing what was asked. Its behaviour is
+  unchanged from before this contract.
+* Turning it off never prompts. Disabling restores the single-model path, so there is
+  nothing to warn about, and a gate there would only make recovery slower.
+* Asking to enable something already enabled is not a state change and is not prompted.
+* A preview is not a write: the renderer is called with `saved_note=False` before the
+  question, so the "Saved in: config.yaml" line can never appear on a state that is not
+  on disk.
+
+## C14 — A refresh is a cache operation, and the footer is a claim about the file
+Two small truths that the CLI surface must keep:
+
+* **Catalog refresh reuses the engine's cache.** `hermes model routing refresh`
+  force-refreshes the same `agent.models_dev` registry that `_catalog_models` resolves
+  candidates from — no second cache, no second network path, and selection itself never
+  fetches (C1). A refresh writes the catalog cache only: `smart_model_routing` is not
+  touched, so a refresh can never enable, narrow or widen a pool by itself. When the
+  catalog cannot be fetched the verb says so and exits non-zero rather than reporting a
+  success it did not have; the cached copy keeps being used either way.
+* **"Saved in: config.yaml" is a statement about the file.** The renderer prints that
+  footer only when the loaded config actually contains a `smart_model_routing` section
+  (`saved_note=None` means *ask the file*). An absent section is off-by-default, not
+  saved — printing the footer there would describe a block the operator does not have.
+  `saved_note=False` remains the pre-write preview form (C13).
+* **Bare `hermes model routing` follows `hermes model`.** With a terminal it opens the
+  interactive flow; with no terminal it prints the read-only status instead of blocking.
+  `status` stays reachable as its own verb in both cases.
+
+## C15 — Every runtime-read setting is reachable, and nothing else is a control
+Directive §4 in one line: a control exists only for a setting the engine reads, and
+every setting the engine reads has a control. On oklab-1 that means:
+
+* **Reachable from both interactive surfaces.** `enabled`, `strategy`,
+  `stability_threshold`, `cost_optimization`, `preferred_models_only`,
+  `switch_on_cost`, `allow_unknown_metadata`, `exclude`, `weights` and `reliability`
+  are settable from `hermes model routing configure` (flags **and** the interactive
+  flow) and from `/model-routing` → Preferences. Every one of them is also settable
+  without a TTY, so the gateway, scripts and people share one code path.
+* **One parser, one writer.** Typed values (`exclude a,b`, `weights dim=value`,
+  `reliability model=rate`) are parsed by `agent.model_router.parse_model_ids` /
+  `parse_weights` / `parse_reliability` and written by `update_routing`. A surface
+  renders and dispatches; it does not decide what a payload means. The chat accepts
+  exactly what the CLI accepts, and both reject with `validate_routing`'s message.
+* **Weights are merged, never re-derived.** An edit starts from the values *as
+  written* in `smart_model_routing.weights`, so repeating the same command is a
+  no-op. Merging over the normalised effective mapping (which the reader rescales to
+  sum to 1) moves every number on each run and would rewrite the file forever.
+  `weights` applies under `strategy: automatic`; `cost` and `quality` substitute their
+  own fixed vectors by design, so a custom weight set under those strategies is inert
+  — the menu says which strategy is active for exactly that reason.
+* **No control for a key nothing reads.** `llm_assisted_classification` is still
+  parsed and round-tripped (an operator's file keeps its value) but no code path
+  consults it, so no menu offers it any more. C2 keeps classification deterministic.
+* **Nothing is written before the confirmation.** Pending values live in the flow
+  state only; Cancel, and a flow that times out, leave `config.yaml` byte-identical
+  (C13).
+
+## C16 — A verb that changes nothing does not change the file
+`disable` is the OFF state, and an *absent* `smart_model_routing` block is also the OFF
+state (`routing_settings` reads it as `enabled: false`; absence is the shipped default).
+So `disable` on a config that never carried a block has nothing to do. This tree must not
+materialise the section for it:
+
+* `hermes model routing disable` on an absent block → exit 0, prints `already off — nothing
+  to change`, reads nothing but the state, and leaves `config.yaml` byte-identical.
+* `hermes model routing configure --disable` on an absent block → the same rule in the
+  shared writer: `written: false`, `changed: []`, `no_op` naming the reason.
+* The rule is scoped to the *absent* case. A present block is still written when the
+  value changes (`disable` while on turns it off and keeps every other preference), and a
+  present block already at `enabled: false` is not rewritten.
+* `enable` is unaffected: an absent block plus `enabled: true` is a real change and writes.
+
+Why it matters: every later reader treats a present block as an opt-in record, `status`
+prints the "Saved in: config.yaml" footer for it, and `setup_quick.py` writes its own
+explicit `enabled: False` on purpose. A `disable` that manufactures one blurs "the user
+opted in and turned it off" with "the user never opted in", for a command with no effect.
+
+Residual, deliberately not changed: when the state already matches and the block *is*
+present, the verb still prints `Saved to config.yaml`. That statement is about the
+resulting config, which does hold that state; it was left alone rather than widening the
+diff.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
 extensions. They may change *which eligible model wins* — an additive term promotes as
-well as demotes — but none may relax C1–C3 or C6.
+well as demotes — but none may relax C1–C3 or C6. Of these,
+`llm_assisted_classification` has no caller on either tree: it is accepted in config and
+reported, never acted on, and therefore has no control on any surface (C15).
 
 ## Verification
 ```bash
@@ -217,7 +357,7 @@ well as demotes — but none may relax C1–C3 or C6.
     tests/agent/test_model_router_cross_provider.py tests/agent/test_image_routing.py \
     tests/hermes_cli/test_model_routing_cli.py -q
 
-# bro-2 (this copy): 88 passed
+# bro-2 (this copy): 85 passed
 /home/bro/hermes-venv/bin/python -m pytest tests/agent/test_model_routing.py -q
 ```
 
@@ -231,22 +371,20 @@ identity stated (C5), explain surface named with the dict normative (C10), and t
 joined tie-break key, fixed the content-parts crash, and refreshed the line references in
 the commit that carries this revision.
 
-Resolved next round — bro-2 `0cca5df303` (C9a string path): `classify_request` now derives
-`needs_vision` from `image_routing.extract_image_refs` for a string payload, with three
-falsifiers, so C9a is implemented on both hosts and bro-2's content-parts defect is closed
-end to end. Helpers stay per-host (`message_text_and_attachments` vs `_string_image_refs` +
-`extract_image_refs`); the contract fixes the behaviour, not the function name.
-
 Still open:
 
-1. **C10 `moa_active` dict row** — done on oklab-1 (`routing_report(moa_active=True)`);
+1. **C9a** — oklab-1 done (`message_text_and_attachments` → hard `vision` requirement).
+   bro-2 still cannot state modality for attachments delivered beside a *string* prompt,
+   because `image_routing.py` runs after selection. Owner: bro-2, using oklab-1's helper
+   as the reference shape.
+2. **C10 `moa_active` dict row** — done on oklab-1 (`routing_report(moa_active=True)`);
    bro-2 returns before a decision object exists, so it needs the same early-skip record.
-   bro-2's `explain_routing()` already carries `skip_reason` / `selected` / `kept_current` /
-   `reason` / `candidates` as top-level keys — the skip is decision-level, not a candidate
-   row — so the record is the only missing piece. Owner: bro-2.
-2. **C9b modality on the decision** — neither side records image-output capability on
-   `Decision`, so an image-edit follow-up cannot be protected yet. Owner: both, after C10.
-3. **Name collision to document** — C4 `reliability` (routing preference) and the tool
+   Owner: bro-2.
+2. **bro-2 defect — fixed, wiring still open** — `classify_request` no longer raises on a
+   content-parts list and derives the modality flags from the parts (regression tests in
+   `tests/agent/test_model_routing.py`). What remains is item 1's string-prompt path.
+   Owner: bro-2, then both.
+4. **C8 form (closed)** — delegation-first agreed; see C8 above.
+5. **Name collision to document** — C4 `reliability` (routing preference) and the tool
    search's `reliability_rerank` (call-outcome re-rank) are unrelated knobs with similar
    names; never let one config imply the other.
-4. **C8 form (closed)** — delegation-first agreed; see C8 above.

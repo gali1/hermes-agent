@@ -7,13 +7,15 @@ disabled config is a strict no-op.
 
 from __future__ import annotations
 
+import statistics
+
 import pytest
 
 import agent.model_routing as model_routing
 from agent.model_routing import (
     TIERS, ModelOption, RequestProfile, classify_request, estimate_cost, estimate_tokens,
     _exclusion_reason, explain_routing, is_eligible, maybe_apply_model_routing,
-    options_from_config, parse_settings, score_model, select_model,
+    options_from_config, parse_settings, rank_candidates, score_model, select_model,
 )
 
 CHEAP_WEAK = ModelOption(name="cheap", cost_in=0.1, cost_out=0.2, tier_rank=0)
@@ -642,3 +644,227 @@ class TestValidatorFindings:
         monkeypatch.setattr(model_routing, "options_from_config",
                             lambda cfg: (_ for _ in ()).throw(RuntimeError("corrupt cache")))
         assert maybe_apply_model_routing(agent, "hello") is None
+
+
+class TestExpectedTotalCost:
+    """§7.4: rank on the expected TOTAL cost, not the price of one happy-path attempt.
+
+    Three terms were missing: cached-input pricing (the catalog publishes ``cost.cache_read``
+    and ``cost.cache_write``), reasoning tokens (billed at the output rate — models.dev has no
+    reasoning price field, so none was invented) and expected retries.
+    """
+
+    PROFILE = RequestProfile("routine", est_input_tokens=100_000, est_output_tokens=1_000)
+
+    def test_defaults_keep_the_old_one_attempt_formula(self):
+        """Cache prices on the model must not change the number unless a caller asks."""
+        option = ModelOption(name="m", cost_in=1.0, cost_out=2.0,
+                             cost_cache_read=0.01, cost_cache_write=0.02)
+        assert estimate_cost(option, RequestProfile("routine", 1_000, 1_000)) == pytest.approx(0.003)
+
+    def test_cached_input_price_reorders_two_models(self):
+        cached = ModelOption(name="cached", cost_in=5.0, cost_out=1.0, cost_cache_read=0.05)
+        plain = ModelOption(name="plain", cost_in=1.0, cost_out=1.0)
+        # One uncached attempt: the plain model is much cheaper.
+        assert estimate_cost(plain, self.PROFILE) < estimate_cost(cached, self.PROFILE)
+        # With 90% of the prompt served from cache, the cache-friendly model wins.
+        assert estimate_cost(cached, self.PROFILE, cached_input_ratio=0.9) < estimate_cost(
+            plain, self.PROFILE, cached_input_ratio=0.9)
+
+    def test_cached_tokens_without_a_published_cache_price_are_not_free(self):
+        """A silent cache price falls back to the input rate; it must never read as zero."""
+        option = ModelOption(name="m", cost_in=1.0, cost_out=2.0)
+        assert estimate_cost(option, self.PROFILE, cached_input_ratio=1.0) == pytest.approx(
+            estimate_cost(option, self.PROFILE))
+
+    def test_cache_write_is_priced_at_its_own_rate(self):
+        option = ModelOption(name="m", cost_in=1.0, cost_out=0.0, cost_cache_write=2.0)
+        assert estimate_cost(option, self.PROFILE, cache_write_ratio=0.5) == pytest.approx(
+            (50_000 * 1.0 + 50_000 * 2.0) / 1_000_000.0)
+
+    def test_overlapping_cache_shares_cannot_bill_more_than_the_prompt(self):
+        option = ModelOption(name="m", cost_in=10.0, cost_out=0.0, cost_cache_read=0.0,
+                             cost_cache_write=0.0)
+        assert estimate_cost(option, self.PROFILE, cached_input_ratio=1.0,
+                             cache_write_ratio=1.0) == pytest.approx(0.0)
+
+    def test_reasoning_tokens_are_charged_at_the_output_rate(self):
+        """No reasoning price exists in the catalog, so thinking is billed as output."""
+        option = ModelOption(name="m", cost_in=1.0, cost_out=10.0)
+        base = estimate_cost(option, self.PROFILE)
+        with_reasoning = estimate_cost(option, self.PROFILE, reasoning_tokens=2_000)
+        assert with_reasoning - base == pytest.approx(2_000 * 10.0 / 1_000_000.0)
+
+    def test_reasoning_tokens_flip_the_ranking_toward_a_lower_output_rate(self):
+        flat = ModelOption(name="flat", cost_in=0.01, cost_out=2.0, tier_rank=3)
+        premium = ModelOption(name="premium", cost_in=10.0, cost_out=0.5, tier_rank=3)
+        base = RequestProfile("routine", est_input_tokens=1_000, est_output_tokens=100)
+        thinking = RequestProfile("routine", est_input_tokens=1_000, est_output_tokens=100,
+                                  reasoning_tokens=50_000)
+        assert estimate_cost(flat, base) < estimate_cost(premium, base)
+        assert estimate_cost(premium, thinking) < estimate_cost(flat, thinking)
+
+    def test_a_retry_reuses_the_prompt_cache(self):
+        option = ModelOption(name="m", cost_in=10.0, cost_out=1.0, cost_cache_read=0.1)
+        once = estimate_cost(option, self.PROFILE)
+        twice = estimate_cost(option, self.PROFILE, expected_retries=1)
+        retry = (100_000 * 0.1 + 1_000 * 1.0) / 1_000_000.0
+        assert twice - once == pytest.approx(retry)
+        # A retry is not a second full attempt: the prompt is a cache hit.
+        assert 0 < twice - once < once
+
+    def test_profile_assumptions_apply_when_arguments_are_omitted(self):
+        option = ModelOption(name="m", cost_in=5.0, cost_out=1.0, cost_cache_read=0.05)
+        profile = RequestProfile("routine", est_input_tokens=100_000, est_output_tokens=1_000,
+                                 cached_input_ratio=0.9, expected_retries=1)
+        assert estimate_cost(option, profile) == pytest.approx(
+            estimate_cost(option, profile, cached_input_ratio=0.9, expected_retries=1))
+        assert estimate_cost(option, profile) < estimate_cost(
+            option, RequestProfile("routine", 100_000, 1_000))
+
+    def test_unpriced_model_is_still_charged_the_median_of_expected_costs(self):
+        """The §7.4 extension must not weaken the "median, never zero" invariant."""
+        profile = RequestProfile("routine", est_input_tokens=100_000, est_output_tokens=1_000,
+                                 cached_input_ratio=0.9)
+        unknown = ModelOption(name="unknown")           # publishes no price at all
+        cheap = ModelOption(name="cheap", cost_in=5.0, cost_out=1.0, cost_cache_read=0.05)
+        pricey = ModelOption(name="pricey", cost_in=9.0, cost_out=9.0)
+        ranked, cheapest, median = rank_candidates([unknown, cheap, pricey], profile,
+                                                   parse_settings({}))
+        scores = {o.name: s for s, o in ranked}
+        expected = [estimate_cost(cheap, profile), estimate_cost(pricey, profile)]
+        assert cheapest == pytest.approx(min(expected))
+        assert median == pytest.approx(statistics.median(expected))
+        assert median > 0
+        # Charged at the median, the unpriced model loses to the genuinely cheaper one.
+        assert scores["unknown"] < scores["cheap"]
+
+    def test_catalog_cache_prices_reach_the_option(self, monkeypatch):
+        from types import SimpleNamespace
+        import agent.models_dev as models_dev
+        info = SimpleNamespace(cost_input=1.0, cost_output=2.0, cost_cache_read=0.1,
+                               cost_cache_write=0.5, context_window=100_000, max_output=8_000,
+                               input_modalities=("text",), output_modalities=("text",),
+                               tool_call=True, structured_output=False, reasoning=False,
+                               status="active")
+        monkeypatch.setattr(models_dev, "get_model_info", lambda *a, **k: info)
+        option = options_from_config({"models": [{"name": "m", "provider": "p"}]})[0]
+        assert option.cost_cache_read == 0.1 and option.cost_cache_write == 0.5
+
+
+class TestToolFallback:
+    """§7.7: a preferred list must not block a tool-capable model when the operator allows it."""
+
+    PREFERRED = [ModelOption(name="chat-only", provider="p", cost_in=0.1, cost_out=0.2,
+                             tier_rank=3, supports_tools=False)]
+    CATALOG = [
+        ModelOption(name="tool-pricey", provider="p", cost_in=5.0, cost_out=15.0,
+                    tier_rank=3, supports_tools=True),
+        ModelOption(name="tool-cheap", provider="p", cost_in=1.0, cost_out=2.0,
+                    tier_rank=3, supports_tools=True),
+    ]
+    TOOL_PROFILE = classify_request("use the shell to list the files", needs_tools=True)
+    NO_TOOL_PROFILE = classify_request("hello")
+
+    def test_without_the_opt_in_the_preferred_list_still_blocks(self):
+        """Unchanged behaviour: opt-in is what widens, and the default is off."""
+        st = parse_settings({"preferred_models_only": True})
+        assert st.allow_tool_fallback is False
+        decision = select_model(self.PREFERRED, self.TOOL_PROFILE, settings=st,
+                                fallback_options=self.CATALOG)
+        assert decision.model is None
+        assert decision.skip_reason == "no_eligible_model" and decision.candidates == 0
+
+    def test_opt_in_widens_and_picks_the_cheapest_tool_capable_model(self):
+        st = parse_settings({"preferred_models_only": True, "allow_tool_fallback": True})
+        decision = select_model(self.PREFERRED, self.TOOL_PROFILE, settings=st,
+                                fallback_options=self.CATALOG)
+        assert decision.model == "tool-cheap"
+        assert decision.skip_reason == ""            # a real switch, not a skip
+        assert "tool fallback" in decision.reason
+
+    def test_rank_candidates_widens_the_same_way(self):
+        st = parse_settings({"preferred_models_only": True, "allow_tool_fallback": True})
+        ranked, _, _ = rank_candidates(self.PREFERRED, self.TOOL_PROFILE, st,
+                                       fallback_options=self.CATALOG)
+        assert [o.name for _, o in ranked] == ["tool-cheap", "tool-pricey"]
+
+    def test_no_widening_when_the_request_needs_no_tools(self):
+        st = parse_settings({"preferred_models_only": True, "allow_tool_fallback": True})
+        decision = select_model(self.PREFERRED, self.NO_TOOL_PROFILE, settings=st,
+                                fallback_options=self.CATALOG)
+        assert decision.model == "chat-only"
+
+    def test_no_widening_when_a_preferred_model_already_calls_tools(self):
+        st = parse_settings({"preferred_models_only": True, "allow_tool_fallback": True})
+        preferred = [ModelOption(name="pref-tools", provider="p", cost_in=5.0, cost_out=15.0,
+                                 tier_rank=3, supports_tools=True)]
+        decision = select_model(preferred, self.TOOL_PROFILE, settings=st,
+                                fallback_options=self.CATALOG)
+        assert decision.model == "pref-tools"
+        assert "tool fallback" not in decision.reason
+
+    def test_unknown_tool_support_is_not_capability(self):
+        """The check reads the real flag: ``None`` is not evidence a model can call tools."""
+        st = parse_settings({"preferred_models_only": True, "allow_tool_fallback": True})
+        preferred = [ModelOption(name="unknown-tools", provider="p", cost_in=0.1, cost_out=0.2,
+                                 tier_rank=3)]
+        decision = select_model(preferred, self.TOOL_PROFILE, settings=st,
+                                fallback_options=self.CATALOG)
+        assert decision.model == "tool-cheap"
+
+    def test_no_widening_without_a_catalog_pool(self):
+        st = parse_settings({"preferred_models_only": True, "allow_tool_fallback": True})
+        decision = select_model(self.PREFERRED, self.TOOL_PROFILE, settings=st)
+        assert decision.model is None and decision.skip_reason == "no_eligible_model"
+
+    def test_setting_defaults_and_validation(self):
+        from agent.model_routing import validate_routing_config
+        assert parse_settings({}).allow_tool_fallback is False
+        assert parse_settings({"allow_tool_fallback": True}).allow_tool_fallback is True
+        assert validate_routing_config({"allow_tool_fallback": "yes"}) == [
+            "allow_tool_fallback must be true or false"]
+        assert validate_routing_config({"allow_tool_fallback": True}) == []
+
+    def test_wiring_widens_to_the_catalog_when_the_opt_in_is_set(self, monkeypatch):
+        switched = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda a, m, p: switched.append((m, p)))
+        monkeypatch.setattr(model_routing, "options_from_catalog",
+                            lambda *a, **k: list(self.CATALOG))
+        agent = _Agent({"smart_model_routing": {
+            "enabled": True, "preferred_models_only": True, "allow_tool_fallback": True,
+            "models": [{"name": "chat-only", "provider": "p", "cost_in": 0.1, "cost_out": 0.2,
+                        "tier_rank": 3, "supports_tools": False}]}},
+            model="chat-only", provider="p")
+        decision = maybe_apply_model_routing(agent, "use the shell to list the files",
+                                             needs_tools=True)
+        assert decision is not None and decision.model == "tool-cheap"
+        assert switched == [("tool-cheap", "p")]
+
+    def test_wiring_does_not_touch_the_catalog_without_the_opt_in(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(model_routing, "options_from_catalog",
+                            lambda *a, **k: calls.append(a) or [])
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model", lambda *a, **k: None)
+        agent = _Agent({"smart_model_routing": {
+            "enabled": True, "preferred_models_only": True,
+            "models": [{"name": "chat-only", "provider": "p", "cost_in": 0.1, "cost_out": 0.2,
+                        "tier_rank": 3, "supports_tools": False}]}},
+            model="chat-only", provider="p")
+        decision = maybe_apply_model_routing(agent, "use the shell", needs_tools=True)
+        assert decision is not None and decision.model is None
+        assert calls == []
+
+    def test_explain_reports_the_widened_pool(self, monkeypatch):
+        """The report must not describe a pool the engine would not have used."""
+        monkeypatch.setattr(model_routing, "options_from_catalog",
+                            lambda *a, **k: list(self.CATALOG))
+        cfg = {"enabled": True, "preferred_models_only": True, "allow_tool_fallback": True,
+               "models": [{"name": "chat-only", "provider": "p", "cost_in": 0.1,
+                           "cost_out": 0.2, "tier_rank": 3, "supports_tools": False}]}
+        report = explain_routing(cfg, "use the shell", provider="p", needs_tools=True)
+        assert report["widened_for_tools"] is True
+        assert report["selected"] == "tool-cheap"
+        assert report["settings"]["allow_tool_fallback"] is True
+        assert "tool-cheap" in {c["model"] for c in report["candidates"]}

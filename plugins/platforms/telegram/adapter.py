@@ -4368,7 +4368,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
         await self._edit_result_text(query, result_text)
         await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+        # Drop only the state this tap consumed: a handler may have opened a follow-up picker
+        # (e.g. /model-routing's Enable → Confirm step) that registered its own state here.
+        if self._choice_picker_state.get(chat_id) is state:
+            self._choice_picker_state.pop(chat_id, None)
 
     _MODEL_PAGE_SIZE = 8
 
