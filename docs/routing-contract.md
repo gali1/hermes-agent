@@ -409,6 +409,28 @@ Control that keeps this honest: a button platform's typed `3` must send the pick
 this page (C12: same interaction as the 🎛 button), so the page only exists where the line
 above is the only guidance available.
 
+## C20 — `tool_calls_only` keeps the default model primary
+
+The fourth strategy is not a weighting of the other three: it removes selection from the turn.
+
+* An **eligible incumbent is never displaced** — not for price, not for a higher score, not for
+  a closer capability fit, and not by `switch_on_cost`. `rank_candidates` returns it before the
+  hysteresis block, so none of those knobs are consulted.
+* The only thing that moves the turn is **ineligibility**: the incumbent failed a hard
+  requirement (a modality it does not accept, a context window it cannot hold, a tier floor),
+  so it never reaches the "keep the incumbent" branch and the specialist is chosen instead.
+* The specialist is then chosen **capability-first, cost as tiebreak** — the pool's job in this
+  strategy is to cover a requirement, not to win on price.
+* `providers.<provider>.models` therefore reads as *the assistant plus its specialists*, and a
+  model listed there is not thereby a candidate to take over ordinary conversation.
+
+Consequence worth stating in the reply, not just here: on this host the routing hook runs once
+per **turn**, before the model is invoked. `tool_calls_only` decides *which model serves the
+turn*; it does not send a file to a specialist and merge the result back into a primary model's
+context. Capability work inside a turn is done by **tools** (`read_file` extracts PDF text
+locally, `vision_analyze` scores an image). Claiming "the default model delegates to Gemini and
+integrates the result" would describe a mechanism that does not exist in this hook.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

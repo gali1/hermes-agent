@@ -124,9 +124,9 @@ def build_model_parser(
     )
     _enable.add_argument(
         "--strategy",
-        choices=["automatic", "cost", "quality"],
+        choices=["automatic", "cost", "quality", "tool_calls_only"],
         default=None,
-        help="Selection bias (default: automatic — capability first, then cost)",
+        help="Selection bias (default: automatic — capability first, then cost; tool_calls_only keeps the default model primary)",
     )
     _enable.add_argument(
         "--stability-threshold",
@@ -265,9 +265,9 @@ def build_model_parser(
         help="Turn dynamic model selection off")
     _configure.add_argument(
         "--strategy",
-        choices=["automatic", "cost", "quality"],
+        choices=["automatic", "cost", "quality", "tool_calls_only"],
         default=None,
-        help="Selection bias (default: automatic — capability first, then cost)",
+        help="Selection bias (default: automatic — capability first, then cost; tool_calls_only keeps the default model primary)",
     )
     _configure.add_argument(
         "--stability-threshold",

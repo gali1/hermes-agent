@@ -2011,6 +2011,7 @@ _STRATEGY_CHOICES = (
     ("automatic", "automatic — capability first, then cost"),
     ("cost", "cost — cheapest model that can still serve the request"),
     ("quality", "quality — strongest capable model"),
+    ("tool_calls_only", "tool_calls_only — default model stays primary; capability-only delegation"),
 )
 
 

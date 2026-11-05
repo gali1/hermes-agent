@@ -8,6 +8,7 @@ import os
 import sys
 
 import pytest
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -1650,4 +1651,79 @@ def test_route_turn_switches_mid_session_when_the_operator_opted_in(patched_cand
     agent.switch_calls.clear()
     mr.route_turn(agent, "What is 15 multiplied by 8?", config=cfg)   # turn 1, opted in
     assert agent.switch_calls, "switch_on_cost=True must permit the mid-session downgrade"
+    assert agent.model == "weak"
+
+
+# -- tool_calls_only: the default model is the assistant, the pool is its delegates -------
+
+
+def test_tool_calls_only_never_displaces_the_default_model_for_price():
+    """The strategy's whole promise: a cheaper rival does not take the conversation."""
+    profile = mr.classify_request("summarise this paragraph", tool_available=False)
+    selection = mr.rank_candidates(
+        profile,
+        [spec_cand(spec("default", cost_in=50.0, cost_out=50.0)),
+         spec_cand(spec("cheap", cost_in=0.01, cost_out=0.01))],
+        # cost-heavy weights so the price gap is unmissable, and no stability band to hide in
+        mr.RoutingConfig(strategy="tool_calls_only", stability_threshold=0.0,
+                         weights={"capability": 0.05, "cost": 0.95, "reliability": 0.0,
+                                  "context": 0.0, "continuity": 0.0}),
+        current_model="default",
+        mid_session=False,
+    )
+    assert selection.model == "default"
+    assert selection.skip_reason == "already_current"
+    assert "tool_calls_only" in selection.reason
+
+
+def test_tool_calls_only_ignores_switch_on_cost():
+    profile = mr.classify_request("summarise this paragraph", tool_available=False)
+    selection = mr.rank_candidates(
+        profile,
+        [spec_cand(spec("default", cost_in=50.0, cost_out=50.0)),
+         spec_cand(spec("cheap", cost_in=0.01, cost_out=0.01))],
+        mr.RoutingConfig(strategy="tool_calls_only", switch_on_cost=True, stability_threshold=0.0),
+        current_model="default",
+        mid_session=True,
+    )
+    assert selection.model == "default", "the mid-session cost opt-in cannot move the default model"
+
+
+def test_tool_calls_only_replaces_the_default_model_when_it_cannot_serve_the_turn():
+    """Capability-only displacement: the incumbent cannot read a pdf, so a delegate that can."""
+    profile = mr.classify_request("read this pdf", tool_available=True, attachments=("pdf",))
+    # `info` is the normalized catalog record: capability lookups read attributes off it.
+    text_only = mr.ModelCandidate(
+        provider="test", model="default",
+        info=SimpleNamespace(input_modalities=("text",), output_modalities=("text",)),
+        spec=spec("default", cost_in=0.1, cost_out=0.1),
+    )
+    pdf_capable = mr.ModelCandidate(
+        provider="test", model="reader",
+        info=SimpleNamespace(input_modalities=("text", "pdf"), output_modalities=("text",)),
+        spec=spec("reader", cost_in=9.0, cost_out=9.0),
+    )
+    selection = mr.rank_candidates(
+        profile, [text_only, pdf_capable],
+        mr.RoutingConfig(strategy="tool_calls_only"),
+        current_model="default",
+        mid_session=True,
+    )
+    assert selection.model == "reader"
+    assert selection.kept_current is False
+
+
+def test_tool_calls_only_is_an_accepted_strategy():
+    assert "tool_calls_only" in mr.ROUTING_STRATEGIES
+    assert mr.RoutingConfig.from_dict({"strategy": "tool_calls_only"}).strategy == "tool_calls_only"
+    # an unknown value still degrades to automatic rather than pinning a typo
+    assert mr.RoutingConfig.from_dict({"strategy": "tool_calls_onyl"}).strategy == "automatic"
+
+
+def test_route_turn_tool_calls_only_leaves_the_session_model_alone(patched_candidates):
+    agent = _StubAgent(model="weak")
+    cfg = _route_config(models=("weak", "strong"), default="weak")
+    cfg["smart_model_routing"]["strategy"] = "tool_calls_only"
+    mr.route_turn(agent, "what is 15 multiplied by 8?", config=cfg)
+    assert agent.switch_calls == [], "tool_calls_only must not switch an eligible default model"
     assert agent.model == "weak"

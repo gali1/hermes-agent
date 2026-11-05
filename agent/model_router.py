@@ -879,7 +879,7 @@ class RoutingConfig:
     """
 
     enabled: bool = False
-    strategy: str = "automatic"  # automatic | cost | quality
+    strategy: str = "automatic"  # automatic | cost | quality | tool_calls_only
     #: Shared contract default with bro-2 (docs/routing-contract.md C6): a restriction needs an
     #: explicit opt-in. With ``true`` and no ``models`` list, routing silently stops selecting,
     #: which is a worse fresh-install surprise than routing across the eligible catalog.
@@ -929,7 +929,9 @@ class RoutingConfig:
 
         cfg.enabled = _flag("enabled", cfg.enabled)
         strategy = str(raw.get("strategy", cfg.strategy) or cfg.strategy).lower()
-        cfg.strategy = strategy if strategy in ("automatic", "cost", "quality") else "automatic"
+        cfg.strategy = strategy if strategy in (
+            "automatic", "cost", "quality", "tool_calls_only"
+        ) else "automatic"
         cfg.preferred_models_only = _flag("preferred_models_only", cfg.preferred_models_only)
         cfg.preferred_models_only_explicit = "preferred_models_only" in raw
         cfg.cost_optimization = _flag("cost_optimization", cfg.cost_optimization)
@@ -1030,7 +1032,17 @@ ROUTING_KEYS: Tuple[str, ...] = (
 ROUTING_LEGACY_KEYS: Tuple[str, ...] = ("candidates", "min_improvement")
 
 #: Accepted ``strategy`` values (see :class:`RoutingConfig`).
-ROUTING_STRATEGIES: Tuple[str, ...] = ("automatic", "cost", "quality")
+#:
+#: ``automatic`` / ``cost`` / ``quality`` choose the best model for the *turn* and may
+#: displace the current model. ``tool_calls_only`` treats the current model as the assistant
+#: and the rest of the pool as capability delegates: it is displaced only when it cannot
+#: serve the turn at all, never for price, score or fit.
+ROUTING_STRATEGIES: Tuple[str, ...] = (
+    "automatic",
+    "cost",
+    "quality",
+    "tool_calls_only",
+)
 
 _BOOLEAN_ROUTING_KEYS: Tuple[str, ...] = (
     "enabled",
@@ -1983,6 +1995,10 @@ def score_candidate(
         w = {"capability": 0.35, "cost": 0.55, "reliability": 0.05, "context": 0.05, "continuity": 0.0}
     elif cfg.strategy == "quality":
         w = {"capability": 0.65, "cost": 0.05, "reliability": 0.15, "context": 0.10, "continuity": 0.05}
+    elif cfg.strategy == "tool_calls_only":
+        # Only reached when the default model cannot serve the turn, so the specialist is
+        # chosen to satisfy a requirement: capability leads, price breaks the tie.
+        w = {"capability": 0.60, "cost": 0.25, "reliability": 0.10, "context": 0.05, "continuity": 0.0}
 
     return (
         w.get("capability", 0) * capability
@@ -2304,6 +2320,20 @@ def rank_candidates(
         selection.skip_reason = skip_reason
         selection.kept_current = True
         return selection
+
+    # ---- tool_calls_only: the default model is the assistant, not a rival -----------
+    # An eligible incumbent is never displaced: not for price, not for a better score, not for a
+    # closer fit, and not by `switch_on_cost`. The pool exists to cover capabilities the default
+    # model lacks, so a replacement happens only when the incumbent is ineligible for this turn
+    # and therefore never reached this point.
+    if cfg.strategy == "tool_calls_only" and incumbent is not None:
+        return _keep(
+            incumbent,
+            f"tool_calls_only: default model {incumbent.key} stays primary "
+            f"(best alternative {best.key} not used — the default model is replaced only "
+            "when it cannot serve the turn)",
+            "already_current",
+        )
 
     if incumbent is not None and incumbent is best:
         return _keep(

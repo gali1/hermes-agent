@@ -1443,7 +1443,14 @@ class GatewayBusySessionMixin:
     #: Words that discard the pending flow without applying anything.
     _MODEL_ROUTING_CANCEL_WORDS = frozenset({"cancel", "close", "exit", "quit", "abort", "discard"})
     _MODEL_ROUTING_YES_WORDS = frozenset({"yes", "y", "apply", "confirm", "save", "doit", "do-it"})
-    _MODEL_ROUTING_STRATEGIES = ("automatic", "cost", "quality")
+    _MODEL_ROUTING_STRATEGIES = ("automatic", "cost", "quality", "tool_calls_only")
+    #: Short labels for the strategy step; the token is what gets saved to config.yaml.
+    _MODEL_ROUTING_STRATEGY_LABELS = {
+        "automatic": "automatic — capability first, then cost",
+        "cost": "cost — cheapest capable model",
+        "quality": "quality — strongest capable model",
+        "tool_calls_only": "tool_calls_only — default model stays primary; capability-only delegation",
+    }
 
     def _model_routing_flows(self) -> Dict[str, Dict[str, Any]]:
         """Per chat+user flow state (``platform:chat:user`` → flow), lazily created."""
@@ -2017,8 +2024,11 @@ class GatewayBusySessionMixin:
             if token in {"1", "strategy"}:
                 flow["step"] = "prefs_strategy"
                 touch(flow)
-                return ("Which strategy? Reply /model-routing automatic, /model-routing cost or "
-                        "/model-routing quality (or cancel).")
+                opts = "\n".join(
+                    f"  · {self._MODEL_ROUTING_STRATEGY_LABELS.get(name, name)}"
+                    for name in self._MODEL_ROUTING_STRATEGIES
+                )
+                return (f"Which strategy? Reply /model-routing <name> (or cancel):\n{opts}")
             if token in {"2", "threshold"}:
                 flow["step"] = "prefs_threshold"
                 touch(flow)
