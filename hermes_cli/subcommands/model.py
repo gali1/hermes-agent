@@ -145,15 +145,20 @@ def _routing_report(cfg, raw, text: str = _PROBE_PROMPT):
 def _render_routing(report) -> str:
     """The one renderer, matching `status` so the two can never disagree."""
     label = "would select" if report["enabled"] else "would select if enabled"
-    return (
-        f"enabled: {str(report['enabled']).lower()}\n"
+    lines = [
+        f"enabled: {str(report['enabled']).lower()}",
         f"strategy: {report['settings']['strategy']} "
-        f"(stability_threshold={report['settings']['stability_threshold']})\n"
-        f"request tier: {report['request']['tier']}\n"
-        f"candidates: {report['eligible_count']} eligible from {report['candidate_source']}\n"
-        f"{label}: {report['selected'] or '(none)'}\n"
-        f"skip_reason: {report['skip_reason'] or '(switches)'}")
-
+        f"(stability_threshold={report['settings']['stability_threshold']})",
+        f"request tier: {report['request']['tier']}",
+        f"candidates: {report['eligible_count']} eligible from {report['candidate_source']}",
+        f"{label}: {report['selected'] or '(none)'}",
+        f"skip_reason: {report['skip_reason'] or '(switches)'}",
+    ]
+    if report.get("moa_active"):
+        # Say it in words, not just as a skip_reason code: the selection shown above will not
+        # happen while the fan-out is running, and a reader must not take it as a prediction.
+        lines.append("moa: active — routing is skipped while Mixture-of-Agents runs")
+    return "\n".join(lines)
 
 def write_routing_config(changes: dict) -> dict:
     """Apply *changes* to ``smart_model_routing`` and return the outcome.

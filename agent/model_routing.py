@@ -134,6 +134,12 @@ SKIP_NO_ELIGIBLE = "no_eligible_model"            # every candidate failed a har
 SKIP_ALREADY_CURRENT = "already_current"          # the current model is the top-ranked one
 SKIP_WITHIN_THRESHOLD = "within_stability_threshold"  # a better model exists but not by enough
 SKIP_ERROR = "error"                              # routing raised and the current model was kept
+# The agent is running the Mixture-of-Agents facade. Routing is skipped deliberately: MoA is a
+# runtime the user chose, and scoring a replacement would dismantle the fan-out. This is a
+# distinct reason from "disabled" — a status view that reported "disabled" while MoA was active
+# would be describing the wrong cause.
+SKIP_MOA_ACTIVE = "moa_active"
+
 
 
 @dataclass(frozen=True)
@@ -998,6 +1004,14 @@ def maybe_apply_model_routing(agent: Any, text: Any, *,
         # MoA is a runtime the user chose explicitly; scoring a replacement model would
         # silently dismantle the fan-out. Both implementations skip routing here.
         logger.debug("model routing skipped: mixture-of-agents is active")
+        # Record the reason on the agent so an in-session surface (status, /model-routing) can
+        # report WHY nothing switched. Without this the skip was invisible: a debug line is not
+        # a record, and a status view would have blamed "disabled" or shown a hypothetical
+        # selection that would never happen.
+        try:
+            agent._routing_skip_reason = SKIP_MOA_ACTIVE
+        except Exception:  # pragma: no cover - defensive
+            pass
         return None
     cfg = routing_config(agent)
     st = parse_settings(cfg)
@@ -1068,6 +1082,7 @@ def explain_routing(
     has_audio: bool = False,
     has_files: bool = False,
     needs_tools: bool = False,
+    moa_active: bool = False,
 ) -> Dict[str, Any]:
     """Explain a routing decision without performing one.
 
@@ -1149,7 +1164,16 @@ def explain_routing(
         # Machine-readable counterpart of ``reason``: one of the SKIP_* constants, or "" when
         # the decision switches. Stable across implementations; the prose is not. A disabled
         # section reports "disabled" even though the hypothetical selection is still computed.
-        "skip_reason": decision.skip_reason if st.enabled else SKIP_DISABLED,
+        # MoA wins over every other reason when enabled: it is the cause the runtime will act
+        # on, and reporting "already_current" or a hypothetical selection beside it would be a
+        # statement about a decision that cannot happen this turn.
+        "skip_reason": (
+            SKIP_MOA_ACTIVE if (st.enabled and moa_active)
+            else (decision.skip_reason if st.enabled else SKIP_DISABLED)
+        ),
+        # Whether the Mixture-of-Agents facade is what suppresses routing. Kept as its own row
+        # so a caller can render "MoA active" without parsing skip_reason.
+        "moa_active": bool(moa_active),
         "current": current,
         "kept_current": bool(
             decision.model and decision.model == current
