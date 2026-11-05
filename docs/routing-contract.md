@@ -367,6 +367,29 @@ Control that keeps the assertions honest: `enable` on the same blockless config 
 still print `✅ Saved smart_model_routing` and must still write, and `single` with the
 flag genuinely on must still turn it off.
 
+## C18 — Picker state is per (chat, message), and one finished picker is finished
+
+`/model-routing` sends a toggle list whose buttons carry indexes into server-side state. Two
+pickers can be alive in one chat (the user asks again before finishing), Telegram can deliver
+the same callback twice, and a plugin reload can replace the adapter between the send and the
+tap. The state therefore belongs to a message, not to a chat:
+
+* **A tap applies to the picker it came from.** The handler resolves state by
+  `(chat_id, message_id)`; a chat slot belonging to a *different* message is not this tap's
+  state, and the process-wide registry is the fallback (it survives an adapter swap).
+* **Finishing retires that message's entry, and only that entry.** Done and Cancel retire the
+  tapped message in both the chat slot (only when the slot *is* that message) and the
+  registry. Leaving the registry entry behind lets a repeat Done tap find the consumed state
+  and run `on_selection_done` a second time — a second write for one confirmation, which is
+  C17's class of defect reached through the adapter instead of the writer.
+* **Retirement is not a chat-wide reset.** Tapping Done on an older picker while a newer one
+  is live must leave the newer one's slot intact, or a live picker becomes answerable only
+  through the registry and dies if its entry is pruned (bounded size, 30-minute TTL).
+
+Control that keeps the assertions honest: a tap from an older message must still apply to
+that message's options, and a picker must still answer after the adapter's per-chat maps are
+cleared (simulating a plugin reload).
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local

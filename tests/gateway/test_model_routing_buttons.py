@@ -102,19 +102,26 @@ def _make_runner(adapter=None):
 # ─────────────────────────── adapter: multi-select ───────────────────────────
 
 
-def _make_adapter() -> TelegramAdapter:
+def _make_adapter(first_msg_id: int = 101) -> TelegramAdapter:
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._bot = AsyncMock()
-    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=101))
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=first_msg_id))
     adapter._app = MagicMock()
     return adapter
 
 
-def _query(data: str = "") -> AsyncMock:
+def _query(data: str = "", msg_id: int = 101) -> AsyncMock:
+    """A callback tap. ``msg_id`` is the message the tapped button lives on.
+
+    The adapter routes a tap by (chat, message): a tap whose message id does not match the
+    picker's is answered "expired" rather than being applied to another picker's state. The
+    default matches ``_make_adapter``'s send (message_id 101).
+    """
     query = AsyncMock()
     query.data = data
     query.message = MagicMock()
     query.message.chat_id = 12345
+    query.message.message_id = msg_id
     query.from_user = MagicMock()
     query.answer = AsyncMock()
     query.edit_message_text = AsyncMock()
@@ -273,6 +280,124 @@ class TestMultiSelectPicker:
 
         done.assert_awaited_once()
         assert "12345" not in adapter._multi_select_state
+
+
+# ─────────────────── adapter: one picker must not act for another ───────────────────
+
+
+class TestMultiSelectRetirement:
+    """State is per (chat, message): finishing one picker retires only its own entry.
+
+    Two picks in one chat are normal (the user asks again before finishing, or a second
+    surface sends one), and Telegram can deliver the same tap twice. A Done that leaves its
+    registry entry behind lets a repeat tap re-apply a selection that was already written.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        import plugins.platforms.telegram.adapter as adapter_mod
+
+        adapter_mod._PICKER_STATE_REGISTRY.clear()
+        yield
+        adapter_mod._PICKER_STATE_REGISTRY.clear()
+
+    @staticmethod
+    def _lookup(chat_id, msg_id):
+        import plugins.platforms.telegram.adapter as adapter_mod
+
+        return adapter_mod._picker_state_lookup(chat_id, msg_id)
+
+    @pytest.mark.asyncio
+    async def test_done_retires_the_registry_entry_for_that_message(self):
+        adapter = _make_adapter()
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="Pick", options=_options("m1", "m2"), selected=[],
+            session_key="s", on_selection_done=AsyncMock(return_value="saved"),
+        )
+        assert self._lookup("12345", 101) is not None
+        await adapter._handle_multi_select_callback(_query("mrsd", 101), "mrsd", "12345")
+        assert self._lookup("12345", 101) is None
+
+    @pytest.mark.asyncio
+    async def test_a_repeated_done_tap_cannot_apply_the_selection_twice(self):
+        adapter = _make_adapter()
+        done = AsyncMock(return_value="saved")
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="Pick", options=_options("m1", "m2"), selected=[],
+            session_key="s", on_selection_done=done,
+        )
+        await adapter._handle_multi_select_callback(_query("mrsd", 101), "mrsd", "12345")
+        await adapter._handle_multi_select_callback(_query("mrsd", 101), "mrsd", "12345")
+        assert done.await_count == 1  # one Done, one write
+
+    @pytest.mark.asyncio
+    async def test_cancel_retires_the_registry_entry(self):
+        adapter = _make_adapter()
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="Pick", options=_options("m1"), selected=[],
+            session_key="s", on_selection_done=AsyncMock(),
+        )
+        await adapter._handle_multi_select_callback(_query("mrsx", 101), "mrsx", "12345")
+        assert self._lookup("12345", 101) is None
+
+    @pytest.mark.asyncio
+    async def test_done_on_an_older_picker_leaves_a_newer_pickers_slot_alone(self):
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[SimpleNamespace(message_id=101), SimpleNamespace(message_id=202)]
+        )
+        older = AsyncMock(return_value="older saved")
+        newer = AsyncMock(return_value="newer saved")
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="A", options=_options("m1"), selected=[],
+            session_key="a", on_selection_done=older,
+        )
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="B", options=_options("m2"), selected=[],
+            session_key="b", on_selection_done=newer,
+        )
+        await adapter._handle_multi_select_callback(_query("mrsd", 101), "mrsd", "12345")
+        assert adapter._multi_select_state["12345"]["msg_id"] == 202
+        assert self._lookup("12345", 101) is None  # the finished one is retired
+        assert self._lookup("12345", 202) is not None  # the live one is not
+
+    @pytest.mark.asyncio
+    async def test_a_tap_from_an_older_message_uses_that_messages_state(self):
+        """The control for the (chat, message) routing: the tap must land on ITS picker."""
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(
+            side_effect=[SimpleNamespace(message_id=101), SimpleNamespace(message_id=202)]
+        )
+        older = AsyncMock(return_value="older saved")
+        newer = AsyncMock(return_value="newer saved")
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="A", options=_options("m1"), selected=[],
+            session_key="a", on_selection_done=older,
+        )
+        await adapter.send_multi_select_picker(
+            chat_id="12345", title="B", options=_options("m2"), selected=[],
+            session_key="b", on_selection_done=newer,
+        )
+        # the chat slot holds B (202); this tap is on A's message (101)
+        await adapter._handle_multi_select_callback(_query("mrs:0", 101), "mrs:0", "12345")
+        await adapter._handle_multi_select_callback(_query("mrsd", 101), "mrsd", "12345")
+        assert older.await_args.args[1] == ["m1"]  # A's option, not B's
+        newer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_picker_still_answers_after_an_adapter_swap(self):
+        """A plugin reload builds a new adapter with empty per-chat maps; the registry survives."""
+        first = _make_adapter()
+        done = AsyncMock(return_value="saved")
+        await first.send_multi_select_picker(
+            chat_id="12345", title="Pick", options=_options("m1", "m2"), selected=[],
+            session_key="s", on_selection_done=done,
+        )
+        second = _make_adapter(first_msg_id=999)
+        second._multi_select_state.clear()
+        await second._handle_multi_select_callback(_query("mrs:1", 101), "mrs:1", "12345")
+        await second._handle_multi_select_callback(_query("mrsd", 101), "mrsd", "12345")
+        assert done.await_args.args[1] == ["m2"]
 
 
 # ─────────────────────────── runner: button surface ───────────────────────────

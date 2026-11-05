@@ -4506,6 +4506,18 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             "send_multi_select_picker", chat_id, metadata, build,
             thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
 
+    def _retire_multi_select(self, chat_id: str, msg_id) -> None:
+        """Forget the picker the tap came from — and only that one.
+
+        A chat can hold two live pickers, so finishing the older one must not drop the newer
+        one's slot, and the finished message must leave the registry (otherwise a repeated
+        Done tap finds it again and re-applies a selection that was already written).
+        """
+        _picker_state_retire(chat_id, msg_id)
+        slot = self._multi_select_state.get(str(chat_id))
+        if msg_id is None or slot is None or slot.get("msg_id") in (None, msg_id):
+            self._multi_select_state.pop(str(chat_id), None)
+
     async def _handle_multi_select_callback(self, query, data: str, chat_id: str) -> None:
         """``mrs:<idx>`` toggle · ``mrsv:<page>`` · ``mrsa``/``mrsn`` · ``mrsd`` done · ``mrsx`` cancel."""
         msg_id = getattr(getattr(query, "message", None), "message_id", None)
@@ -4537,7 +4549,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             selected.clear()
         elif data == "mrsd":
             callback = state.get("on_selection_done")
-            self._multi_select_state.pop(str(chat_id), None)
+            self._retire_multi_select(chat_id, msg_id)
             if not callable(callback):
                 await query.answer(text=_toast("platform.telegram.picker.expired"))
                 return
@@ -4552,7 +4564,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             await query.answer(text=_toast("platform.telegram.picker.switched"))
             return
         elif data == "mrsx":
-            self._multi_select_state.pop(str(chat_id), None)
+            self._retire_multi_select(chat_id, msg_id)
             await self._edit_result_text(query, "Cancelled — nothing applied.")
             await query.answer()
             return
