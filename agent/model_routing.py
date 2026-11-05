@@ -45,6 +45,15 @@ _DEEP_REASON = re.compile(
     r"compare|evaluate|why does|optimi[sz]e|migrate|benchmark|prove)\b", re.I)
 _TRIVIAL = re.compile(r"^\s*(hi|hello|thanks|what is \d+ ?[-+*/] ?\d+|define \w+)\s*[?.!]?\s*$", re.I)
 
+#: Phrases that ask for an image BACK (C9b). Requires a generation verb within 40 chars
+#: of an artefact noun, because an unanchored "image" match fires on every attachment
+#: question and would route description requests through an image-output gate.
+_IMAGE_OUTPUT_SIGNALS = re.compile(
+    r"(?:\b(?:generate|create|make|draw|paint|render|produce|design)\b[^.?!\n]{0,40}"
+    r"\b(?:image|picture|illustration|drawing|artwork|logo|icon|poster|avatar)\b)",
+    re.I,
+)
+
 
 @dataclass(frozen=True)
 class RequestProfile:
@@ -65,6 +74,9 @@ class RequestProfile:
     needs_vision: bool = False
     needs_audio: bool = False
     needs_structured: bool = False
+    # C9b: the turn asks for an IMAGE back, not merely about one. Kept separate from
+    # needs_vision because one is an input requirement and the other an output one.
+    needs_image_output: bool = False
     reasons: Tuple[str, ...] = ()
     cached_input_ratio: float = 0.0
     cache_write_ratio: float = 0.0
@@ -102,6 +114,11 @@ class ModelOption:
     tier_rank: int = 3
     deprecated: bool = False
     supports_text_output: Optional[bool] = None
+    # C9b (parity with oklab-1): an output modality must be DECLARABLE, or a model that
+    # can only emit text stays unknown (None) and therefore eligible for an image-output
+    # request. Unknown stays different from unsupported: only an explicit False excludes.
+    supports_image_output: Optional[bool] = None
+    supports_audio_output: Optional[bool] = None
     # Prompt-cache prices, per 1M tokens, when the catalog publishes them. ``None`` means
     # unpublished — never zero — so :func:`estimate_cost` falls back to the normal input rate
     # instead of pretending cached tokens are free.
@@ -244,6 +261,9 @@ def classify_request(
     not from the surrounding words.
     """
     body, part_images, part_audio, part_files = _content_parts(text)
+    # C9b: a generation verb near an artefact noun asks for an image back. Deliberately
+    # narrow - "what is in this image?" is an INPUT question and must not trip this.
+    needs_image_output = bool(_IMAGE_OUTPUT_SIGNALS.search(body))
     if not part_images and _string_image_refs(text):
         part_images = True
     has_images = has_images or part_images
@@ -291,6 +311,7 @@ def classify_request(
         needs_vision=has_images,
         needs_audio=has_audio,
         needs_structured=False,
+        needs_image_output=needs_image_output,
         reasons=tuple(reasons),
     )
 
@@ -394,6 +415,11 @@ def is_eligible(option: ModelOption, profile: RequestProfile,
     # A model that only emits images cannot answer a text request.
     if option.supports_text_output is False:
         return False
+    # C9b: an image-output request cannot be served by a model that declares it cannot
+    # emit images. Undeclared (None) still passes here and is penalised elsewhere, so a
+    # sparse catalogue cannot silently empty the candidate set.
+    if profile.needs_image_output and option.supports_image_output is False:
+        return False
     if not allow_unknown:
         # Strict mode: an unknown capability counts as unsupported.
         if profile.needs_tools and option.supports_tools is not True:
@@ -401,6 +427,8 @@ def is_eligible(option: ModelOption, profile: RequestProfile,
         if profile.needs_vision and option.supports_vision is not True:
             return False
         if profile.needs_audio and option.supports_audio is not True:
+            return False
+        if profile.needs_image_output and option.supports_image_output is not True:
             return False
     if profile.needs_vision and option.supports_vision is False:
         return False
@@ -854,6 +882,8 @@ def options_from_config(cfg: Dict[str, Any]) -> List[ModelOption]:
                 else (str(_catalog_attr(info, "status", "")).lower() == "deprecated"),
                 supports_text_output=flag(
                     "supports_text_output", (("text" in outputs) if outputs else None)),
+                supports_image_output=flag("supports_image_output", None),
+                supports_audio_output=flag("supports_audio_output", None),
                 cost_cache_read=float(entry["cost_cache_read"]) if stated("cost_cache_read")
                 else _optional_price(info, "cost_cache_read"),
                 cost_cache_write=float(entry["cost_cache_write"]) if stated("cost_cache_write")
@@ -927,6 +957,7 @@ def options_from_catalog(provider: str, models: Optional[Sequence[str]] = None) 
             tier_rank=_tier_from_capabilities(info),
             deprecated=str(getattr(info, "status", "") or "").lower() == "deprecated",
             supports_text_output=(("text" in outputs) if outputs else None),
+            supports_image_output=((("image" in outputs) if outputs else None)),
             cost_cache_read=_optional_price(info, "cost_cache_read"),
             cost_cache_write=_optional_price(info, "cost_cache_write"),
         ))
@@ -1134,6 +1165,8 @@ def _exclusion_reason(option: ModelOption, profile: RequestProfile,
         return "deprecated"
     if option.supports_text_output is False:
         return "cannot emit text"
+    if profile.needs_image_output and option.supports_image_output is False:
+        return "unsupported_output_image"
     if profile.needs_vision and option.supports_vision is False:
         return "no vision input"
     if profile.needs_audio and option.supports_audio is False:
@@ -1152,8 +1185,11 @@ def _exclusion_reason(option: ModelOption, profile: RequestProfile,
             ("vision", option.supports_vision, profile.needs_vision),
             ("audio", option.supports_audio, profile.needs_audio),
             ("structured", option.supports_structured, profile.needs_structured),
+            ("image_output", option.supports_image_output, profile.needs_image_output),
         )
         for label, value, required in needs:
             if required and value is None:
                 return f"{label} capability unknown (strict mode)"
-    return "not eligible"
+    # Callers only ask after ``is_eligible`` already said no, so this is "no specific
+    # reason matched", never "eligible". Wording must not read as the verdict itself.
+    return "unclassified"
