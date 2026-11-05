@@ -1648,6 +1648,14 @@ class GatewayBusySessionMixin:
         return "\n".join(lines)
 
     @classmethod
+    def _model_routing_state_oneliner(cls, settings: Dict[str, Any]) -> str:
+        """`Routing is ON . automatic . N models in effect` - the one line a pending reply needs."""
+        models = [str(m) for m in (settings.get("models") or []) if m]
+        pool = f"{len(models)} models selected" if models else "all eligible models"
+        return (f"Live now: routing {'ON' if settings.get('enabled') else 'OFF'} \u00b7 "
+                f"{settings.get('strategy') or 'automatic'} \u00b7 {pool}")
+
+    @classmethod
     def _model_routing_pending_block(cls, settings: Dict[str, Any],
                                      changes: Dict[str, Any]) -> str:
         """One short block for "you have unsaved changes" - same wording everywhere."""
@@ -1864,10 +1872,11 @@ class GatewayBusySessionMixin:
                 # There is unsaved work: show it and how to finish, and leave the step alone so
                 # the next `confirm` applies rather than restarting the menu.
                 touch(state)
-                # Pending first: it is the reason the user is typing, and the saved state
-                # underneath can say something the pending change is about to replace.
+                # Pending first, and a one-line summary of what is live - printing the full
+                # state block here repeated 'Models: all eligible models' right under a
+                # pending line that says the models are about to change.
                 return (expired_note + self._model_routing_pending_block(settings, state["changes"])
-                        + "\n\n" + self._model_routing_state_text(report, settings))
+                        + "\n\n" + self._model_routing_state_oneliner(settings))
             state["step"] = "menu"
             touch(state)
             text = (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
