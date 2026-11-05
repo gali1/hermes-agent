@@ -458,3 +458,72 @@ class TestNoOpWriteIsNotAClaim:
 
         assert "✅ Saved" not in reply, reply
         assert _config_text(blockless_home) == before
+
+
+# ------------------------------------------------- models: completeness, add, remove
+
+
+class TestModelPoolIsComplete:
+    def test_the_picker_pool_is_not_truncated_to_the_selection_bound(self, monkeypatch):
+        """`widen_pool` bounds runtime *selection* to 60 catalog entries. A picker that inherits
+        that bound silently hides every model past the sixtieth - which is how gpt-6-luna
+        (entry 101 of 132) was missing from the list."""
+        seen = {}
+
+        def fake_widen(provider, models, **kwargs):
+            seen.update(provider=provider, limit=kwargs.get("limit"))
+            return list(models) + ["catalog-model"]
+
+        monkeypatch.setattr(mr, "widen_pool", fake_widen)
+        instance = object.__new__(gateway_run.GatewayRunner)
+        instance._model_routing_load_config = lambda: {
+            "model": {"provider": "opencode-zen", "default": "deepseek-v4.1-flash"}}
+        pool = instance._model_routing_model_choices({"models": ["deepseek-v4.1-flash"]})
+        assert seen["provider"] == "opencode-zen"
+        assert seen["limit"] is not None and seen["limit"] > 60, seen["limit"]
+        assert pool[0] == "deepseek-v4.1-flash"
+
+    @pytest.mark.asyncio
+    async def test_add_stages_a_model_outside_the_current_list(
+            self, routing_home, runner, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["openai/gpt-5-mini", "openai/gpt-5-nano",
+                                                    "anthropic/claude-haiku", "brand-new-model"])
+        reply = await _dispatch(runner, "/model-routing add brand-new-model")
+        assert "Added: brand-new-model" in reply
+        assert "brand-new-model" in reply.split("Models routing may choose from")[1]
+        confirm = await _dispatch(runner, "/model-routing confirm")
+        assert "Applied" in confirm or "applied" in confirm or "Routing" in confirm
+        assert "brand-new-model" in _config_text(routing_home)
+
+    @pytest.mark.asyncio
+    async def test_remove_drops_the_model_from_the_pending_list(
+            self, routing_home, runner, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["openai/gpt-5-mini", "openai/gpt-5-nano",
+                                                    "anthropic/claude-haiku"])
+        reply = await _dispatch(runner, "/model-routing remove anthropic/claude-haiku")
+        assert "Removed: anthropic/claude-haiku" in reply
+        await _dispatch(runner, "/model-routing confirm")
+        assert "anthropic/claude-haiku" not in _config_text(routing_home)
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_name_is_reported_not_silently_ignored(
+            self, routing_home, runner, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["openai/gpt-5-mini"])
+        reply = await _dispatch(runner, "/model-routing add gpt-6-lunaa")
+        assert "Not in the provider catalog: gpt-6-lunaa" in reply
+        assert "refresh" in reply
+
+    @pytest.mark.asyncio
+    async def test_removing_the_last_model_is_refused(self, routing_home, runner, monkeypatch):
+        """An empty list means 'the whole eligible catalog' (section 4), so a removal must never
+        produce one - that would quietly widen the pool instead of emptying it."""
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["only-model"])
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_current_models",
+                            lambda self, settings, changes: ["only-model"])
+        reply = await _dispatch(runner, "/model-routing remove only-model")
+        assert reply.startswith("Refused:")
+        assert "only-model" in reply

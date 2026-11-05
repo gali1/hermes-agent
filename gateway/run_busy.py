@@ -1437,6 +1437,8 @@ class GatewayBusySessionMixin:
     #: An abandoned flow applies nothing after this long.
     _MODEL_ROUTING_FLOW_TTL = 900.0
     #: Candidate rows per page in the model step.
+    # Picker-only bound: the whole catalog, deliberately far above _CATALOG_POOL_LIMIT.
+    _PICKER_POOL_LIMIT = 5000
     _MODEL_ROUTING_PAGE_SIZE = 10
     #: Words that discard the pending flow without applying anything.
     _MODEL_ROUTING_CANCEL_WORDS = frozenset({"cancel", "close", "exit", "quit", "abort", "discard"})
@@ -1677,7 +1679,11 @@ class GatewayBusySessionMixin:
         if default_model and default_model not in declared:
             declared.insert(0, default_model)
         try:
-            pool = mr.widen_pool(provider, declared)
+            # `widen_pool` defaults to _CATALOG_POOL_LIMIT (60) because *runtime selection*
+            # must stay cheap. A picker is not selection: truncating here silently hid every
+            # model past the sixtieth catalog entry (gpt-6-luna is entry 101).
+            pool = mr.widen_pool(provider, declared,
+                                 limit=getattr(self, "_PICKER_POOL_LIMIT", 5000))
         except Exception:  # a catalog miss must not break the picker
             pool = list(declared)
         return [str(m) for m in pool if m]
@@ -1695,8 +1701,10 @@ class GatewayBusySessionMixin:
             lines.append(f"  {page * size + offset + 1} {name}")
         if pages > 1:
             lines.append("Reply /model-routing next or /model-routing prev to page.")
-        lines.append("Reply /model-routing 1,3 (numbers, first = highest priority), all, none, "
-                     "back or cancel.")
+        lines.append(f"Reply /model-routing 1,3 (numbers, first = highest priority), all, none, "
+                     f"back or cancel. {len(candidates)} models available \u2014 "
+                     f"or name one directly: /model-routing add <model>, "
+                     f"/model-routing remove <model>.")
         return "\n".join(lines)
 
     async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
@@ -1732,9 +1740,16 @@ class GatewayBusySessionMixin:
             expired = True
 
         def start(step: str, **extra) -> Dict[str, Any]:
+            # Candidates are the pool routing COULD choose. They used to come from
+            # report["candidates"], which only holds the models currently being evaluated - so
+            # every step that offered a choice could only re-offer what was already configured.
+            try:
+                pool = self._model_routing_model_choices(settings)
+            except Exception:  # pragma: no cover - defensive: never break the flow
+                pool = []
             state = {"step": step, "changes": {}, "ts": now, "page": 0,
-                     "candidates": [str(c.get("model")) for c in (report.get("candidates") or [])
-                                    if c.get("model")],
+                     "candidates": pool or [str(c.get("model")) for c in
+                                            (report.get("candidates") or []) if c.get("model")],
                      "settings": dict(settings)}
             state.update(extra)
             flows[key] = state
@@ -1748,6 +1763,75 @@ class GatewayBusySessionMixin:
             flows.pop(key, None)
 
         expired_note = "⌛ That routing session timed out — nothing was applied.\n\n" if expired else ""
+
+        # `add <model>` / `remove <model>`: 132 catalog models is eleven pages of eight, so an
+        # exact name has to be expressible in one line. Both verbs stage the same change-set the
+        # picker produces, so confirm/apply is unchanged.
+        verb = args.split()[0].lower() if args.split() else ""
+        if verb in {"add", "remove", "rm", "del", "delete"} and len(args.split()) > 1:
+            names = [n for n in args.split()[1].replace(",", " ").split() if n]
+            state = flow or start("menu")
+            state["step"] = "menu"
+            touch(state)
+            changes_now: Dict[str, Any] = state.setdefault("changes", {})
+            pool = self._model_routing_model_choices(settings)
+            if not pool:  # never override a real pool with an empty one
+                pool = [str(c) for c in (state.get("candidates") or []) if c]
+            state["candidates"] = pool
+            current = self._model_routing_current_models(settings, changes_now)
+            added, dropped, unknown, already = [], [], [], []
+            for name in names:
+                if verb == "add":
+                    match = next((m for m in pool if m.lower() == name.lower()), None)
+                    if match is None:
+                        unknown.append(name)
+                    elif match in current:
+                        already.append(match)
+                    else:
+                        current.append(match)
+                        added.append(match)
+                else:
+                    match = next((m for m in current if m.lower() == name.lower()), None)
+                    if match is None:
+                        unknown.append(name)
+                    else:
+                        current.remove(match)
+                        dropped.append(match)
+            if not current and dropped:
+                # An empty list does not mean "no models", it means "the whole eligible
+                # catalog" (section 4) - never let a removal quietly widen the pool.
+                current.extend(dropped)
+                dropped = []
+                return ("Refused: that would empty the list, and an empty list means *every* "
+                        "eligible model rather than none. Disable routing instead "
+                        "(/model-routing disable) if you want routing off.\n\n"
+                        + self._model_routing_models_page(state))
+            changes_now["models"] = list(current)
+            changes_now["preferred_models_only"] = bool(current)
+            flow = state
+            state["page"] = max(0, next((i for i, m in enumerate(pool) if m in current), 0)
+                                // self._MODEL_ROUTING_PAGE_SIZE) if pool else 0
+            notes = []
+            if added:
+                notes.append("Added: " + ", ".join(added))
+            if dropped:
+                notes.append("Removed: " + ", ".join(dropped))
+            if already:
+                notes.append("Already in the list: " + ", ".join(already))
+            if unknown:
+                notes.append("Not in the provider catalog: " + ", ".join(unknown)
+                             + " (check the spelling, or run `hermes model routing refresh` "
+                               "if the model is new)")
+            body = self._model_routing_models_page(state)
+            head = "\n".join(notes) + "\n\n" if notes else ""
+            if added or dropped:
+                # Park the flow in the confirm step so the next `/model-routing confirm`
+                # (or yes) applies it; adding or removing again re-enters this block first.
+                state["step"] = "confirm"
+                touch(state)
+                return (head + body + "\n\nReply /model-routing confirm (or yes) to save "
+                        "these models, add/remove more, or cancel.")
+            return head + body
 
         # Bare ``/model-routing``: show the state and the actions, keeping any pending
         # (unsaved) changes.  This is also how a user re-anchors after a wrong keypress.
@@ -2114,7 +2198,8 @@ class GatewayBusySessionMixin:
             result = await adapter.send_multi_select_picker(
                 chat_id=event.source.chat_id,
                 title=("Models routing may choose from — tap to toggle; the order shown is used "
-                       "as the priority order:"),
+                       "as the priority order. Faster for a long list: type "
+                       "`/model-routing add <model>` or `/model-routing remove <model>`."),
                 options=options,
                 selected=[str(m) for m in current if str(m) in known],
                 session_key=self._model_routing_flow_key(event),
