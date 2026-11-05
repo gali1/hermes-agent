@@ -491,7 +491,7 @@ class TestModelPoolIsComplete:
                                                     "anthropic/claude-haiku", "brand-new-model"])
         reply = await _dispatch(runner, "/model-routing add brand-new-model")
         assert "Added: brand-new-model" in reply
-        assert "brand-new-model" in reply.split("Models routing may choose from")[1]
+        assert "Selected (4):" in reply and "brand-new-model" in reply.split("Selected (4):")[1]
         confirm = await _dispatch(runner, "/model-routing confirm")
         assert "Applied" in confirm or "applied" in confirm or "Routing" in confirm
         assert "brand-new-model" in _config_text(routing_home)
@@ -527,3 +527,52 @@ class TestModelPoolIsComplete:
         reply = await _dispatch(runner, "/model-routing remove only-model")
         assert reply.startswith("Refused:")
         assert "only-model" in reply
+
+
+class TestConfirmActuallyConfirms:
+    """The reported loop: add, then confirm/yes forever, same reply, nothing saved.
+
+    A bare `/model-routing` did `state["step"] = "menu"` unconditionally, which discarded the
+    confirm state; `confirm` then matched nothing and fell through to the state text. The
+    change-set was stranded and the reply never changed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_then_bare_then_confirm_saves(self, routing_home, runner, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["openai/gpt-5-mini", "brand-new-model"])
+        await _dispatch(runner, "/model-routing add brand-new-model")
+        bare = await _dispatch(runner, "/model-routing")
+        assert "Not saved yet" in bare, "a bare command must show the pending change, not drop it"
+        assert "brand-new-model" in bare
+        assert "brand-new-model" not in _config_text(routing_home)
+        saved = await _dispatch(runner, "/model-routing confirm")
+        assert "Not saved yet" not in saved
+        assert "brand-new-model" in _config_text(routing_home)
+
+    @pytest.mark.asyncio
+    async def test_confirm_works_from_any_step(self, routing_home, runner):
+        await _dispatch(runner, "/model-routing 1")          # stages enabled: true
+        await _dispatch(runner, "/model-routing 4")          # walks into the prefs step
+        reply = await _dispatch(runner, "/model-routing yes")
+        assert "Not saved yet" not in reply
+        assert "enabled: true" in _config_text(routing_home)
+
+    @pytest.mark.asyncio
+    async def test_a_number_keeps_its_meaning_while_changes_are_pending(
+            self, routing_home, runner, monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: ["openai/gpt-5-mini", "brand-new-model"])
+        await _dispatch(runner, "/model-routing add brand-new-model")
+        await _dispatch(runner, "/model-routing")            # must NOT restart the menu
+        reply = await _dispatch(runner, "/model-routing 5")
+        assert "enabled: on → off" not in reply, "5 must not silently become 'single-model mode'"
+
+    @pytest.mark.asyncio
+    async def test_replies_do_not_advertise_paging_syntax(self, routing_home, runner,
+                                                          monkeypatch):
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_model_routing_model_choices",
+                            lambda self, settings: [f"m{i}" for i in range(40)])
+        reply = await _dispatch(runner, "/model-routing 3")
+        assert "next or /model-routing prev" not in reply
+        assert "1,3 (numbers" not in reply

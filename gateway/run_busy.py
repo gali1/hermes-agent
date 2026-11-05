@@ -1625,7 +1625,10 @@ class GatewayBusySessionMixin:
             "  10 Back to the main menu",
         ]
         if pending:
-            lines += ["", "Pending (not saved yet):", pending]
+            # Say how to finish, right where the pending change is shown. Without this the
+            # prefs page looked like a dead end and confirm/yes appeared to do nothing.
+            lines += ["", "Not saved yet:", pending, "",
+                      "Reply /model-routing confirm to save, or /model-routing cancel to discard."]
         return "\n".join(lines)
 
     @classmethod
@@ -1638,12 +1641,21 @@ class GatewayBusySessionMixin:
             "Save these routing changes?",
             diff,
             "",
-            f"Preview for a sample prompt: tier {((preview.get('request') or {}).get('tier') or 'unknown')} "
-            f"→ would select {selected}" + (f" — {reason}" if reason else ""),
+            f"A sample prompt would select {selected}" + (f" ({reason})" if reason else ""),
             "",
-            "Reply /model-routing yes to save, or /model-routing cancel to discard.",
+            "Reply /model-routing confirm to save, or /model-routing cancel to discard.",
         ]
         return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_pending_block(cls, settings: Dict[str, Any],
+                                     changes: Dict[str, Any]) -> str:
+        """One short block for "you have unsaved changes" - same wording everywhere."""
+        diff = cls._model_routing_pending_text(settings, changes)
+        if not diff:
+            return ""
+        return ("Not saved yet:\n" + diff
+                + "\n\nReply /model-routing confirm to save, or /model-routing cancel to discard.")
 
     def _model_routing_current_models(self, settings: Dict[str, Any],
                                       changes: Dict[str, Any]) -> List[str]:
@@ -1700,11 +1712,8 @@ class GatewayBusySessionMixin:
         for offset, name in enumerate(window):
             lines.append(f"  {page * size + offset + 1} {name}")
         if pages > 1:
-            lines.append("Reply /model-routing next or /model-routing prev to page.")
-        lines.append(f"Reply /model-routing 1,3 (numbers, first = highest priority), all, none, "
-                     f"back or cancel. {len(candidates)} models available \u2014 "
-                     f"or name one directly: /model-routing add <model>, "
-                     f"/model-routing remove <model>.")
+            line = f"Models {page * size + 1}\u2013{page * size + len(window)} of {len(candidates)}"
+            lines.append(line + "  \u00b7  next / prev")
         return "\n".join(lines)
 
     async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
@@ -1822,21 +1831,28 @@ class GatewayBusySessionMixin:
                 notes.append("Not in the provider catalog: " + ", ".join(unknown)
                              + " (check the spelling, or run `hermes model routing refresh` "
                                "if the model is new)")
-            body = self._model_routing_models_page(state)
-            head = "\n".join(notes) + "\n\n" if notes else ""
+            head = "\n".join(notes)
             if added or dropped:
-                # Park the flow in the confirm step so the next `/model-routing confirm`
-                # (or yes) applies it; adding or removing again re-enters this block first.
                 state["step"] = "confirm"
                 touch(state)
-                return (head + body + "\n\nReply /model-routing confirm (or yes) to save "
-                        "these models, add/remove more, or cancel.")
-            return head + body
+                chosen = ", ".join(current)
+                return (f"{head}\n\nSelected ({len(current)}): {chosen}"
+                        "\n\nReply /model-routing confirm to save, "
+                        "/model-routing cancel to discard, or add/remove another model.")
+            return head
 
         # Bare ``/model-routing``: show the state and the actions, keeping any pending
         # (unsaved) changes.  This is also how a user re-anchors after a wrong keypress.
         if not token:
             state = flow or start("menu")
+            if state.get("changes"):
+                # There is unsaved work: show it and how to finish, and leave the step alone so
+                # the next `confirm` applies rather than restarting the menu.
+                touch(state)
+                # Pending first: it is the reason the user is typing, and the saved state
+                # underneath can say something the pending change is about to replace.
+                return (expired_note + self._model_routing_pending_block(settings, state["changes"])
+                        + "\n\n" + self._model_routing_state_text(report, settings))
             state["step"] = "menu"
             touch(state)
             text = (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
@@ -1853,6 +1869,14 @@ class GatewayBusySessionMixin:
             finish()
             return (expired_note + self._model_routing_state_text(report, settings)
                     + "\n\nCancelled — nothing applied.")
+
+        # Apply from wherever the user is. `confirm` only used to be honoured in the confirm
+        # step, so a bare `/model-routing` in between stranded the change-set and answered the
+        # same text forever.
+        pending_changes = dict((flow or {}).get("changes") or {})
+        if pending_changes and token in self._MODEL_ROUTING_YES_WORDS:
+            finish()
+            return await self._model_routing_commit(pending_changes)
 
         if flow is None:
             if token in {"1", "enable", "on", "2", "disable", "off", "3", "models",
@@ -1893,7 +1917,12 @@ class GatewayBusySessionMixin:
                 # step reported "no eligible models" and the list could never be changed.
                 flow["candidates"] = self._model_routing_model_choices(settings)
                 touch(flow)
-                return self._model_routing_state_text(report, settings) + "\n\n" + self._model_routing_models_page(flow)
+                # Same interaction as the 🎛 button: on a platform with a toggle picker, the
+                # numbered text list is never the reply (it is 132 rows of prose).
+                if await self._model_routing_send_models_picker(event, flow, settings):
+                    return None
+                return (self._model_routing_state_text(report, settings) + "\n\n"
+                        + self._model_routing_models_page(flow))
             elif token in {"4", "preferences", "prefs"}:
                 flow["step"] = "prefs"
                 touch(flow)
@@ -2183,6 +2212,18 @@ class GatewayBusySessionMixin:
         return await self._try_send_choice_picker(
             event, self._model_routing_flow_key(event), title=title, choices=choices,
             on_choice_selected=_on_action)
+
+    async def _model_routing_send_models_picker(self, event, flow: Dict[str, Any],
+                                                settings: Dict[str, Any]) -> bool:
+        """Show the toggle picker for the current pool; False when the platform has none."""
+        candidates = [str(c) for c in (flow.get("candidates") or []) if c]
+        if not candidates:
+            return False
+        changes = flow.setdefault("changes", {})
+        current = self._model_routing_current_models(settings, changes)
+        return await self._try_send_routing_model_select(
+            event, candidates, current,
+            lambda _chat_id, picked: self._model_routing_models_picked(event, picked, changes))
 
     async def _try_send_routing_model_select(self, event, candidates: List[str],
                                              current: List[str], on_done) -> bool:
