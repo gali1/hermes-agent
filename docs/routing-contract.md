@@ -527,7 +527,7 @@ answered *"shows MAGIC-VIDEO-5510 until about 3.1 seconds, then ACTION ITEM ship
 reasoned over timestamps it never saw as video.
 
 **Coverage is stated, never implied.** Every stage stops at the wall-clock budget and the payload
-says how much was read: a 4:05 clip transcribed `audio transcribed 0:00-2:25 of 4:05 (budget)`
+says how much was read: a 4:05 clip transcribed `audio transcribed 0:00-2:25 of 4:05 (budget) — the parenthetical now also **names the cause**: `; speech ran on 1 of 4 workers because the host was loaded (load 34.8 on 8 cores)` or `; the 240s wall budget ran out on a loaded host (…)`, so a short coverage line is never mistaken for a defect`
 under `budget_seconds=240` (STT alone took 222.6 s at RTF 1.53 on CPU). A complete run says
 `(complete)`, a clip with no audio track says `SPEECH: unavailable (no audio track)`.
 
@@ -758,3 +758,22 @@ Still open:
 5. **Name collision to document** — C4 `reliability` (routing preference) and the tool
    search's `reliability_rerank` (call-outcome re-rank) are unrelated knobs with similar
    names; never let one config imply the other.
+
+## C35 — A refusal the model cannot see is only half a refusal
+
+On a remote surface (`telegram`, `api_server`) a path the adapter did not produce is refused: no
+delegation, no fetch, no re-read. Logging that for the operator is not enough — the primary does not
+read our log. Measured: an api_server turn whose prompt named a scanned PDF answered correctly but
+spent **220k prompt tokens** re-deriving the file with its own tools, because nothing told it the
+surface could not carry material.
+
+So the plan result now carries its refusals (`Plan.refusals`), and when a remote request planned
+nothing *because of a refusal* the system message gains one sentence naming the surface and the
+materials: no delegation is available here, no local path in text is trusted here either, answer from
+the text and say plainly if that is not enough — do not search the filesystem, do not render or OCR
+anything. The note is absent when nothing was refused, so a working surface is never told it cannot
+delegate.
+
+api_server carries no delegatable material by design: `file`/`input_file` and `data:application/pdf`
+are refused, and images are native to the incumbent — so the surface's honest row is "parts accepted,
+answered natively", never "delegated".

@@ -90,6 +90,8 @@ class VideoContext:
     silence_skipped_s: float = 0.0
     stt_chunks: int = 0
     stt_workers: int = 1
+    stt_workers_requested: int = 0  # what the configuration asked for, before the load guard
+    host_load_start: float = 0.0    # load1 when the pass began, so "partial" names its cause
     stt_model: str = ""
     stt_backend: str = ""  # "faster-whisper" (in-process) or "provider" (configured STT stack)
     time_budget_s: float = 0.0
@@ -635,6 +637,17 @@ def _available_cpu_slots() -> int:
     return max(1, min(cores, free))
 
 
+def _requested_workers(explicit: Optional[int], config: Dict[str, Any]) -> int:
+    """What was asked for, before the load guard trimmed it — only used to explain a shortfall."""
+    for candidate in (explicit, config.get("workers")):
+        try:
+            if candidate is not None:
+                return max(1, min(16, int(candidate)))
+        except (TypeError, ValueError):
+            continue
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
 def _resolve_stt_workers(explicit: Optional[int], config: Dict[str, Any]) -> int:
     """Workers: explicit, then ``stt.video.workers``, then half the free cores (never more)."""
     requested = None
@@ -968,6 +981,15 @@ def _apply_stt_outcome(context: VideoContext, outcome: SttOutcome) -> None:
         # The parenthetical must not lie about why the span stopped: a failed decode is not a
         # budget stop, and saying so is the difference between "read less" and "broke".
         reason = "budget" if not outcome.error or "budget" in outcome.error.lower() else "partial"
+        if reason == "budget":
+            # "partial" without a cause reads as a defect. Name it: a loaded host is the usual one.
+            if context.stt_workers_requested and context.stt_workers < context.stt_workers_requested:
+                reason += (f"; speech ran on {context.stt_workers} of "
+                           f"{context.stt_workers_requested} workers because the host was loaded "
+                           f"(load {context.host_load_start:.1f} on {os.cpu_count()} cores)")
+            elif context.host_load_start >= 1.0:
+                reason += (f"; the {context.time_budget_s:.0f}s wall budget ran out on a loaded host "
+                           f"(load {context.host_load_start:.1f} on {os.cpu_count()} cores)")
         context.notes.append(
             f"audio transcribed 0:00-{_fmt_mmss(outcome.covered_s)} of {_fmt_mmss(total)} "
             f"({reason})")
@@ -1019,9 +1041,14 @@ def build_video_context(path: str, *, max_frames: int = 8, do_ocr: bool = True,
     deadline = started + max(0.0, budget - (1.0 if budget > 2.0 else 0.0))
     stt_deadline = started + max(0.0, speech_budget - (1.0 if speech_budget > 2.0 else 0.0))
     target = Path(path)
+    try:
+        _load1 = float(os.getloadavg()[0])
+    except (OSError, AttributeError):
+        _load1 = 0.0
     context = VideoContext(path=str(target), time_budget_s=round(budget, 2),
                            stt_budget_s=round(speech_budget, 2), stt_workers=workers,
-                           stt_model=model)
+                           stt_model=model, host_load_start=round(_load1, 2),
+                           stt_workers_requested=_requested_workers(stt_workers, config))
     if not ffmpeg_available():
         context.notes.append("ffmpeg/ffprobe not installed")
         context.timings["total_s"] = round(time.monotonic() - started, 2)

@@ -95,7 +95,7 @@ def test_stt_stops_at_budget_and_states_the_covered_span(clips, monkeypatch):
     assert 0 < ctx.covered_s < ctx.audio_duration_s - 0.5
     budget_notes = [n for n in ctx.notes if n.startswith("audio transcribed 0:00-")]
     assert budget_notes, f"no coverage note in {ctx.notes!r}"
-    assert budget_notes[0].endswith("(budget)")
+    assert "(budget" in budget_notes[0]
     assert budget_notes[0] in ctx.as_text()
     assert f"of {vc._fmt_mmss(ctx.audio_duration_s)}" in budget_notes[0]
     assert ctx.stt_realtime_factor > 0
@@ -106,8 +106,8 @@ def test_budget_exhausted_before_frames_states_coverage(clips):
                                  transcribe=lambda audio: pytest.fail("STT ran past the budget"))
 
     assert ctx.frames == []
-    assert any(n.startswith("frames: 0 of ") and n.endswith("(budget)") for n in ctx.notes)
-    assert any(n.startswith("audio transcribed 0:00-0:00 of ") and n.endswith("(budget)")
+    assert any(n.startswith("frames: 0 of ") and "(budget" in n for n in ctx.notes)
+    assert any(n.startswith("audio transcribed 0:00-0:00 of ") and "(budget" in n
                for n in ctx.notes)
     assert "time budget exhausted" in ctx.transcript_error
 
@@ -306,7 +306,7 @@ def test_stt_budget_is_separable_from_the_overall_budget(clips):
     assert generous.covered_s >= generous.audio_duration_s - 1.0
     assert any(n.endswith("(complete)") for n in generous.notes), generous.notes
     assert tight.covered_s < generous.covered_s
-    assert any(n.endswith("(budget)") for n in tight.notes), tight.notes
+    assert any("(budget" in n for n in tight.notes), tight.notes
 
 
 def test_complete_coverage_line_states_the_exact_span(clips):
@@ -363,3 +363,19 @@ def test_engine_resolution_keeps_a_supplied_transcriber_and_honours_config():
     backend, python, callable_ = vc._resolve_stt_engine(
         transcribe=None, config={"backend": "provider"})
     assert backend == "provider" and python is None and callable_ is not None
+
+
+def test_a_partial_coverage_line_names_the_loaded_host_as_the_cause(clips):
+    """A truncated row must say WHY, so "partial" is not read as a defect."""
+    def slow(audio):
+        time.sleep(2.5)
+        return True, "word", ""
+
+    ctx = vc.build_video_context(str(clips["short"]), max_frames=2, transcribe=slow,
+                                 time_budget_s=1.5, stt_budget_s=1.5, stt_workers=1)
+    if ctx.covered_s < ctx.audio_duration_s - 1.0:
+        note = " ".join(ctx.notes)
+        assert "(budget" in note
+        assert "loaded" in note, note
+        assert ctx.stt_workers_requested >= 1
+        assert ctx.host_load_start >= 0.0
