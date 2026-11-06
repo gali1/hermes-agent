@@ -531,6 +531,14 @@ says how much was read: a 4:05 clip transcribed `audio transcribed 0:00-2:25 of 
 under `budget_seconds=240` (STT alone took 222.6 s at RTF 1.53 on CPU). A complete run says
 `(complete)`, a clip with no audio track says `SPEECH: unavailable (no audio track)`.
 
+**Speech yields to live traffic.** Worker count follows *free* cores, not all cores: the default is
+half the cores clamped to `cores - round(load1)` (minimum 1), an explicitly configured
+`stt.video.workers` is honoured as written, and the worker processes run at `nice 10`. Measured on a
+loaded host (load 12-15 from qBittorrent and Plex, 8 cores): a 5:01 clip covered 1:30-2:00 and the
+note said `(budget)`, while a live one-word turn took 11 s with no STT running and 13 s with the
+workers going — ~2 s of interference instead of a stall. On a quiet host the same clip is
+`(complete)` in 197.6 s.
+
 **Speakers are unavailable, and the payload says so.** Local STT has no diarization, so the block
 carries `SPEAKERS: unavailable (local STT has no diarization; speech is unattributed — do not guess
 who spoke)`. Without that line a primary will happily invent "the second speaker".

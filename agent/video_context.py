@@ -546,7 +546,8 @@ def _parallel_worker_decode(wav: str, chunks: Sequence[Tuple[float, float]], *, 
             processes.append((subprocess.Popen(
                 [python, str(worker_script), wav, str(plan_path), str(result_path),
                  str(config_path)],
-                stdout=subprocess.DEVNULL, stderr=log_handle), result_path, len(block),
+                stdout=subprocess.DEVNULL, stderr=log_handle,
+                preexec_fn=lambda: os.nice(10)), result_path, len(block),
                 log_path))
 
     try:
@@ -618,14 +619,37 @@ def _resolve_stt_model(explicit: Optional[str], config: Dict[str, Any]) -> str:
     return DEFAULT_STT_MODEL
 
 
+def _available_cpu_slots() -> int:
+    """Cores that are actually free right now, not cores that exist.
+
+    Measured: with the box at load 16 and four STT workers, a 5-minute clip covered only 60 s of
+    audio in 239 s (RTF 10.2) and a one-word live turn took 19 s. STT must yield to live traffic,
+    so the worker count follows the load average instead of the core count.
+    """
+    cores = os.cpu_count() or 2
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return max(1, cores // 2)
+    free = cores - int(round(load1))
+    return max(1, min(cores, free))
+
+
 def _resolve_stt_workers(explicit: Optional[int], config: Dict[str, Any]) -> int:
+    """Workers: explicit, then ``stt.video.workers``, then half the free cores (never more)."""
+    requested = None
     for candidate in (explicit, config.get("workers")):
         try:
             if candidate is not None:
-                return max(1, min(16, int(candidate)))
+                requested = max(1, min(16, int(candidate)))
+                break
         except (TypeError, ValueError):
             continue
-    return STT_WORKERS_DEFAULT
+    if requested is not None:
+        # An operator who names a worker count gets it: the load guard is for the default path,
+        # where nobody chose anything and starving live traffic would be our decision, not theirs.
+        return requested
+    return max(1, min(max(1, (os.cpu_count() or 2) // 2), _available_cpu_slots()))
 
 
 def _resolve_stt_budget(explicit: Optional[float], config: Dict[str, Any],
