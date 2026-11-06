@@ -774,6 +774,14 @@ the text and say plainly if that is not enough — do not search the filesystem,
 anything. The note is absent when nothing was refused, so a working surface is never told it cannot
 delegate.
 
+A refusal carries a **reason**, because the two failures need different advice: `untrusted` (a path
+this surface cannot carry — including one spelled out in prose, which path trust refuses and which is
+now detected only so the note can name it) and `unsupported` (an adapter-delivered type nothing on
+this host can read, e.g. `.zip`). Before this, both were silent: the prose-path case planned nothing
+and refused nothing, and the `.zip` case planned nothing and said nothing, leaving the model to
+discover the dead end itself. Edge-case sweep (`edge_cases.json`, 17 cases): every case now yields
+either a delegation or a named note — no silence, no loop.
+
 api_server carries no delegatable material by design: `file`/`input_file` and `data:application/pdf`
 are refused, and images are native to the incumbent — so the surface's honest row is "parts accepted,
 answered natively", never "delegated".
