@@ -757,7 +757,8 @@ class SttOutcome:
     text: str = ""
     covered_s: float = 0.0
     error: str = ""
-    rtf: float = 0.0
+    rtf: float = 0.0  # wall seconds per covered audio second (see _apply_stt_outcome)
+    transcribed_s: float = 0.0  # audio seconds actually decoded by the workers
     silence_skipped_s: float = 0.0
     audio_duration_s: float = 0.0
     chunks: int = 0
@@ -920,7 +921,13 @@ def _stt_job(target: Path, tmp: Path, *, deadline: float,
     complete = done == len(chunks) and full_plan
     outcome.covered_s = duration if complete else covered_end
     outcome.silence_skipped_s = max(0.0, outcome.covered_s - transcribed_s)
-    outcome.rtf = (wall_total / transcribed_s) if transcribed_s > 0.05 else 0.0
+    # Wall seconds per SECOND OF AUDIO ACTUALLY COVERED. The old denominator was transcribed_s —
+    # the sum of decoded chunk durations — which ignores that N workers decode N chunks in the same
+    # wall time and that a truncated run covers more audio than it finished decoding. Divided that
+    # way it reported 10.2 for a run whose real cost was 3.98 s of wall per covered second, which
+    # made a timing row unreconcilable.
+    outcome.rtf = (wall_total / outcome.covered_s) if outcome.covered_s > 0.05 else 0.0
+    outcome.transcribed_s = transcribed_s
     outcome.wall_s = time.monotonic() - started
     if done < len(chunks):
         outcome.error = chunk_failure or failure or (
@@ -934,6 +941,8 @@ def _apply_stt_outcome(context: VideoContext, outcome: SttOutcome) -> None:
         context.audio_duration_s = outcome.audio_duration_s
     context.covered_s = round(outcome.covered_s, 2)
     context.stt_realtime_factor = round(outcome.rtf, 3)
+    context.timings["covered_s"] = round(outcome.covered_s, 2)
+    context.timings["decoded_audio_s"] = round(outcome.transcribed_s, 2)
     context.silence_skipped_s = round(outcome.silence_skipped_s, 2)
     context.stt_chunks = outcome.chunks
     if outcome.text.strip():

@@ -255,12 +255,25 @@ def test_all_silence_audio_is_declared_not_transcribed(clips):
 
 
 def test_ocr_and_stt_stages_run_concurrently(clips, monkeypatch):
+    """Overlap is asserted from stage intervals, not from wall-clock arithmetic.
+
+    The original version compared total_s against ocr_s + stt_s with a 0.5 s margin. On a loaded
+    host (load 33-47 from qBittorrent and Plex scans) the sleeps overshoot and that margin vanishes,
+    so the test failed 2 runs in 6 while the behaviour was correct. Intervals cannot be inflated
+    into a false negative that way.
+    """
+    spans = {}
+
     def slow_ocr(frame, *, lang="eng", timeout_s=120.0):
+        start = time.monotonic()
         time.sleep(0.6)
+        spans.setdefault("ocr", []).append((start, time.monotonic()))
         return frame
 
     def slow_stt(audio):
+        start = time.monotonic()
         time.sleep(1.2)
+        spans.setdefault("stt", []).append((start, time.monotonic()))
         return True, "overlap", ""
 
     monkeypatch.setattr(vc, "ocr_frame", slow_ocr)
@@ -269,9 +282,11 @@ def test_ocr_and_stt_stages_run_concurrently(clips, monkeypatch):
                                  time_budget_s=60)
 
     assert len(ctx.frames) >= 2
-    assert ctx.timings["ocr_s"] >= 1.2 and ctx.timings["stt_s"] >= 1.2
-    # Sequential stages would cost ocr+stt; overlapping ones cost about the slower stage.
-    assert ctx.timings["total_s"] <= ctx.timings["ocr_s"] + ctx.timings["stt_s"] - 0.5, ctx.timings
+    ocr_start = min(s for s, _ in spans["ocr"])
+    ocr_end = max(e for _, e in spans["ocr"])
+    stt_start, stt_end = spans["stt"][0]
+    assert stt_start < ocr_end and ocr_start < stt_end, (
+        f"stages did not overlap: ocr={ocr_start:.2f}-{ocr_end:.2f} stt={stt_start:.2f}-{stt_end:.2f}")
 
 
 def test_stt_budget_is_separable_from_the_overall_budget(clips):
