@@ -934,12 +934,13 @@ def _stt_job(target: Path, tmp: Path, *, deadline: float,
     complete = done == len(chunks) and full_plan
     outcome.covered_s = duration if complete else covered_end
     outcome.silence_skipped_s = max(0.0, outcome.covered_s - transcribed_s)
-    # Wall seconds per SECOND OF AUDIO ACTUALLY COVERED. The old denominator was transcribed_s —
-    # the sum of decoded chunk durations — which ignores that N workers decode N chunks in the same
-    # wall time and that a truncated run covers more audio than it finished decoding. Divided that
-    # way it reported 10.2 for a run whose real cost was 3.98 s of wall per covered second, which
-    # made a timing row unreconcilable.
-    outcome.rtf = (wall_total / outcome.covered_s) if outcome.covered_s > 0.05 else 0.0
+    # Elapsed wall seconds per second of audio ACTUALLY COVERED. Two wrong denominators came before
+    # this one: transcribed_s (decoded chunk seconds, which ignores parallelism and truncation) and
+    # wall_total in the parallel path, which is the SUM of per-chunk decode times, not the clock. With
+    # one worker a 5:01 clip reported 2.59 for a pass that really took 238.89 s over 60 s of audio —
+    # the stage clock is the only numerator that means what the name says.
+    stage_wall = time.monotonic() - started
+    outcome.rtf = (stage_wall / outcome.covered_s) if outcome.covered_s > 0.05 else 0.0
     outcome.transcribed_s = transcribed_s
     outcome.wall_s = time.monotonic() - started
     if done < len(chunks):

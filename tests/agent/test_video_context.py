@@ -379,3 +379,24 @@ def test_a_partial_coverage_line_names_the_loaded_host_as_the_cause(clips):
         assert "loaded" in note, note
         assert ctx.stt_workers_requested >= 1
         assert ctx.host_load_start >= 0.0
+
+
+def test_realtime_factor_is_the_stage_clock_not_the_summed_decode_time(clips):
+    """timings["stt_s"] is the stage clock; the factor must be that clock divided by covered audio.
+
+    The defect this pins: in the parallel path the numerator was the SUM of per-chunk decode times,
+    so a 5:01 clip covered 60 s and reported 2.59 for a pass whose stage clock was 229.53 s (3.83).
+    """
+    def slow(audio):
+        time.sleep(0.4)
+        return True, "word", ""
+
+    ctx = vc.build_video_context(str(clips["short"]), max_frames=2, transcribe=slow,
+                                 time_budget_s=60, stt_workers=2, stt_chunk_s=1.0)
+    assert ctx.covered_s > 0.5
+    stage = ctx.timings["stt_s"]
+    assert stage > 0.0
+    # absolute seconds, tight: on the old denominator this was ~0.7 s out for a 4 s clip
+    assert abs(ctx.stt_realtime_factor * ctx.covered_s - stage) <= 0.30, (
+        f"factor*covered={ctx.stt_realtime_factor * ctx.covered_s:.2f}s should equal the stage "
+        f"clock {stage:.2f}s")
