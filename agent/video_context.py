@@ -604,7 +604,19 @@ def _parallel_worker_decode(wav: str, chunks: Sequence[Tuple[float, float]], *, 
             if tail:
                 detail = tail.splitlines()[-1][:200]
                 break
-        error = f"faster-whisper worker produced no output ({detail or 'see worker log'})"
+        # A worker that dies before its first line is the one failure nobody can diagnose later:
+        # the temp log is gone by the time anyone looks. Record how it died, now, in the answer.
+        exits = []
+        for proc, _path, _expected, _log in processes:
+            code = proc.poll()
+            if code is None:
+                exits.append("still running")
+            elif code < 0:
+                exits.append(f"killed by signal {-code}")
+            else:
+                exits.append(f"exit {code}")
+        error = (f"faster-whisper worker produced no output "
+                 f"({detail or 'no stderr'}; {'; '.join(sorted(set(exits))) or 'status unknown'})")
     elif all(result is not None and not result[1] and not result[2].strip()
              for result in results):
         first = results[0]
@@ -981,7 +993,14 @@ def _apply_stt_outcome(context: VideoContext, outcome: SttOutcome) -> None:
     else:
         # The parenthetical must not lie about why the span stopped: a failed decode is not a
         # budget stop, and saying so is the difference between "read less" and "broke".
-        reason = "budget" if not outcome.error or "budget" in outcome.error.lower() else "partial"
+        error_text = (outcome.error or "").strip()
+        if not error_text or "budget" in error_text.lower():
+            reason = "budget"
+        elif "worker" in error_text.lower():
+            # A dead decoder is not a budget stop, and "partial" alone hides that: say it.
+            reason = "decoder failed: " + error_text[:120]
+        else:
+            reason = "partial: " + error_text[:120]
         if reason == "budget":
             # "partial" without a cause reads as a defect. Name it: a loaded host is the usual one.
             if context.stt_workers_requested and context.stt_workers < context.stt_workers_requested:

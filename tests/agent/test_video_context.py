@@ -237,7 +237,7 @@ def test_a_failed_chunk_stops_the_coverage_claim_at_the_gap(clips):
     assert ctx.covered_s < ctx.audio_duration_s - 1.0
     assert "decoder blew up" in ctx.transcript_error
     line = next(n for n in ctx.notes if n.startswith("audio transcribed 0:00-"))
-    assert line.endswith("(partial)"), line  # not a budget stop - say what it was
+    assert "(partial" in line and "decoder blew up" in line, line  # not a budget stop - say what it was
 
 
 def test_all_silence_audio_is_declared_not_transcribed(clips):
@@ -400,3 +400,35 @@ def test_realtime_factor_is_the_stage_clock_not_the_summed_decode_time(clips):
     assert abs(ctx.stt_realtime_factor * ctx.covered_s - stage) <= 0.30, (
         f"factor*covered={ctx.stt_realtime_factor * ctx.covered_s:.2f}s should equal the stage "
         f"clock {stage:.2f}s")
+
+
+def test_a_worker_that_dies_before_output_is_named_not_lost(clips, tmp_path):
+    """The temp worker log is deleted before anyone reads it, so the death must be recorded here.
+
+    One loaded run produced 'produced no output (see worker log)' and the log was already gone; the
+    exit status is the only durable evidence that a worker died rather than ran out of budget.
+    """
+    error = vc._parallel_worker_decode(
+        str(tmp_path / "none.wav"), [(0.0, 2.0)], out_dir=tmp_path / "out", deadline=time.monotonic() + 30,
+        python="/bin/false", model="base", workers=1, beam_size=1, compute_type="int8",
+        device="cpu", cpu_threads=1, language="en")
+    results, wall, message = error
+    assert all(r is None for r in results)
+    assert "no output" in message, message
+    assert "exit " in message or "signal" in message, message
+
+
+def test_a_dead_decoder_is_named_in_the_coverage_line(clips, monkeypatch):
+    """'partial' with no cause hides a decoder crash; the line must say the decoder failed."""
+    monkeypatch.setattr(vc, "_parallel_worker_decode",
+                        lambda *a, **k: ([None], 0.0,
+                                         "faster-whisper worker produced no output "
+                                         "(no stderr; exit 1)"))
+    monkeypatch.setattr(vc, "_resolve_stt_engine",
+                        lambda **_k: ("faster-whisper", "/bin/false", None))
+    ctx = vc.build_video_context(str(clips["short"]), max_frames=1, stt_workers=1,
+                                 time_budget_s=30)
+    note = " ".join(ctx.notes)
+    if ctx.covered_s < ctx.audio_duration_s - 1.0:
+        assert "decoder failed" in note, note
+        assert "worker" in note, note
