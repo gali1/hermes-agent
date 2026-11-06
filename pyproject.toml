@@ -554,6 +554,13 @@ dev = [
 test = [
   "distlib==0.4.3; sys_platform == 'win32'",
   "anthropic==0.87.0",
+  # tests/acp_adapter/* import acp and acp.schema directly. Without the pin the whole directory
+  # fails at collection (16 errors, 216 static tests never executed) and the reason looks like a
+  # code defect rather than a missing dependency.
+  "agent-client-protocol==0.9.0",
+  # tests/tools/test_schema_boolean_required.py imports jsonschema; it was never declared, so the
+  # module could not even be collected.
+  "jsonschema==4.26.0",
 ]
 
 [build-system]
