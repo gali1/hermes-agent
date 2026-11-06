@@ -432,3 +432,22 @@ def test_a_dead_decoder_is_named_in_the_coverage_line(clips, monkeypatch):
     if ctx.covered_s < ctx.audio_duration_s - 1.0:
         assert "decoder failed" in note, note
         assert "worker" in note, note
+
+
+def test_a_decoder_we_stop_at_the_deadline_reads_as_a_budget_stop(tmp_path):
+    """The defect lane1 proved: our own SIGTERM was reported as 'the worker produced no output'.
+
+    A starved single worker misses the deadline; the parent stops it; because no chunk line exists
+    yet the old branch overwrote the correct 'budget' diagnosis with a decoder-failure message and
+    quoted a shutdown warning as the cause. Same event, opposite meaning.
+    """
+    sleeper = tmp_path / "fake_python"
+    sleeper.write_text("#!/bin/sh\nexec sleep 30\n")
+    sleeper.chmod(0o755)
+    results, wall, message = vc._parallel_worker_decode(
+        str(tmp_path / "none.wav"), [(0.0, 2.0)], out_dir=tmp_path / "out",
+        deadline=time.monotonic() + 0.6, python=str(sleeper), model="base", workers=1,
+        beam_size=1, compute_type="int8", device="cpu", cpu_threads=1, language="en")
+    assert all(r is None for r in results)
+    assert "budget" in message, message
+    assert "produced no output" not in message, message

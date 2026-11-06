@@ -552,6 +552,7 @@ def _parallel_worker_decode(wav: str, chunks: Sequence[Tuple[float, float]], *, 
                 preexec_fn=lambda: os.nice(10)), result_path, len(block),
                 log_path))
 
+    stopped_at_deadline = False
     try:
         while True:
             alive = [item for item in processes if item[0].poll() is None]
@@ -564,6 +565,9 @@ def _parallel_worker_decode(wav: str, chunks: Sequence[Tuple[float, float]], *, 
     finally:
         for proc, _path, _expected, _log in processes:
             if proc.poll() is None:
+                # Remember that the stop was ours, not the worker's: the diagnosis below must not
+                # report our own SIGTERM as a decoder failure (lane1: starved worker, not a crash).
+                stopped_at_deadline = True
                 proc.terminate()
         for proc, _path, _expected, _log in processes:
             try:
@@ -615,8 +619,14 @@ def _parallel_worker_decode(wav: str, chunks: Sequence[Tuple[float, float]], *, 
                 exits.append(f"killed by signal {-code}")
             else:
                 exits.append(f"exit {code}")
-        error = (f"faster-whisper worker produced no output "
-                 f"({detail or 'no stderr'}; {'; '.join(sorted(set(exits))) or 'status unknown'})")
+        if stopped_at_deadline:
+            # A starved decoder we stopped at the deadline is a budget stop, not a dead decoder.
+            # Saying otherwise sends the reader looking for a crash that never happened.
+            error = ("time budget reached before a chunk finished (budget; the decoder was still "
+                     "running and was stopped at the deadline)")
+        else:
+            error = (f"faster-whisper worker produced no output "
+                     f"({detail or 'no stderr'}; {'; '.join(sorted(set(exits))) or 'status unknown'})")
     elif all(result is not None and not result[1] and not result[2].strip()
              for result in results):
         first = results[0]
