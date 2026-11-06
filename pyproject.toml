@@ -294,6 +294,12 @@ matrix = [
 # Local embedding backend for the enhanced memory layer's optional vector arm
 # (memory.enhanced.vector_backend: fastembed). Opt-in only; deliberately not
 # in [all], mirroring the other heavy/niche backends.
+# INSTALL SITE: the gateway imports third-party packages from the PM env
+# (~/.hermes/installs/<id>/environments/<hash>/venv), not the repo .venv, and that env is built
+# from its own extras list. A PM env built without this extra degrades retrieval to lexical-only
+# while the service still starts and says nothing. Two guards: ~/.hermes/tools/ensure_pm_deps.sh
+# runs as a systemd ExecStartPre (drop-in 10-ensure-pm-deps.conf) and installs it if the selected
+# env lacks it, and `python -c "import fastembed"` in that env is the dry check.
 fastembed = ["fastembed>=0.4,<1"]
 wecom = ["defusedxml==0.7.1"]
 tts-premium = ["elevenlabs==1.59.0"]
