@@ -389,7 +389,14 @@ def decode_text_payload(data: bytes) -> Tuple[str, str]:
     try:
         return data.decode("utf-8"), "utf-8"
     except UnicodeDecodeError:
-        return data.decode("cp1252", errors="replace"), "cp1252"
+        pass
+    try:
+        return data.decode("cp1252"), "cp1252"
+    except UnicodeDecodeError:
+        pass
+    # latin-1 cannot fail, so this always answers — but say that it was a guess, because the same
+    # bytes read through read_file are refused rather than shown as mojibake.
+    return data.decode("latin-1", errors="replace"), "latin-1"
 
 
 def clip_text_with_counts(body: str, limit: int) -> Tuple[str, str]:

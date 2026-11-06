@@ -832,3 +832,30 @@ def test_a_video_result_carries_the_verbatim_timeline(tmp_path):
     line = cached_video_timeline("v.mp4")
     assert "[  0.00s] MAGIC-VIDEO-5510" in line
     assert "[  3.00s] ACTION ITEM ship OCR path" in line
+
+
+def test_both_readers_decode_the_same_corpus_the_same_way(tmp_path):
+    """The delegation path and read_file are two implementations; they must agree on encoding.
+
+    Measured divergence: a cp1252 CSV decoded to 'René Müller' on the delegation path and was
+    reported as a binary file through read_file. That is a second reader, so it is checked here
+    rather than trusted.
+    """
+    import codecs
+
+    from agent.capability_delegation import decode_text_payload
+    from tools.file_tools import read_file_tool
+
+    corpus = {
+        "utf8.csv": "1,René Müller\n".encode("utf-8"),
+        "utf8bom.csv": codecs.BOM_UTF8 + "1,René Müller\n".encode("utf-8"),
+        "cp1252.csv": "1,René Müller\n".encode("cp1252"),
+        "utf16.csv": codecs.BOM_UTF16_LE + "1,René Müller\n".encode("utf-16-le"),
+    }
+    for name, payload in corpus.items():
+        path = tmp_path / name
+        path.write_bytes(payload)
+        expected, encoding = decode_text_payload(payload)
+        text = read_file_tool(str(path), 1, 50)
+        assert "René Müller" in text, f"{name} lost the accented name via read_file ({encoding})"
+        assert "René Müller" in expected, f"{name} lost the accented name via decode_text_payload"
