@@ -108,15 +108,46 @@ def _lazy_ensure_quietly(extra: str) -> None:
         pass
 
 
+_BANNER_PREFIXES = (
+    "ffmpeg version", "built with", "configuration:", "libav", "libsw", "libpostproc",
+    "WARNING: library configuration mismatch", "  configuration:",
+)
+
+
+def _meaningful_binary_error(detail: str, limit: int = 300) -> str:
+    """Drop a tool's build banner and keep the line that says what actually went wrong.
+
+    Measured before this: a truncated .ogg surfaced as 1.5 kB of ffmpeg build configuration ending in
+    the one useful word, "End of file". The caller — and the model reading it — got a wall of
+    compiler flags where a cause belonged.
+    """
+    kept = []
+    for line in (detail or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(prefix) for prefix in _BANNER_PREFIXES):
+            continue
+        if stripped.startswith(("avcodec", "avformat", "avdevice", "avfilter", "avresample",
+                                "swscale", "swresample", "postproc")):
+            continue
+        kept.append(stripped)
+    if not kept:
+        tail = [line.strip() for line in (detail or "").strip().splitlines() if line.strip()]
+        kept = tail[-1:]
+    out = " | ".join(kept[-2:])
+    return out[:limit]
+
+
 def _process_error_detail(exc: "subprocess.CalledProcessError") -> str:
-    """stderr > stdout > str(exc) for a failed helper binary."""
+    """stderr > stdout > str(exc) for a failed helper binary, with any build banner removed."""
     for output in (exc.stderr, exc.stdout):
         if isinstance(output, bytes):
             detail = output.decode("utf-8", errors="replace").strip()
         else:
             detail = str(output or "").strip()
         if detail:
-            return detail
+            return _meaningful_binary_error(detail)
     return str(exc)
 
 

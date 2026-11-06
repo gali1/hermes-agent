@@ -155,3 +155,30 @@ class TestSignalDelegatesToCentralSniffer:
         from gateway.platforms import signal as signal_mod
 
         assert signal_mod._guess_extension(M4A) == ".m4a"
+
+
+def test_a_helper_binary_banner_is_not_passed_off_as_the_cause():
+    """A truncated .ogg once surfaced 1.5 kB of ffmpeg build flags with 'End of file' at the end.
+
+    The caller and the model reading the error got compiler switches where a cause belonged. The
+    banner is dropped and the meaningful line survives.
+    """
+    from tools.transcription_common import _meaningful_binary_error
+
+    banner = "\n".join([
+        "ffmpeg version 4.2.7-0ubuntu0.1 Copyright (c) 2000-2022 the FFmpeg developers",
+        "  built with gcc 9 (Ubuntu 9.4.0-1ubuntu1~20.04.1)",
+        "  configuration: --prefix=/usr --enable-libopus --enable-libx264 --enable-shared",
+        "  libavutil      56. 31.100 / 56. 31.100",
+        "  libavcodec     58. 54.100 / 58. 54.100",
+        "  WARNING: library configuration mismatch",
+        "avcodec     configuration: --prefix=/usr --enable-gpl",
+        "/tmp/clip.ogg: End of file",
+    ])
+    detail = _meaningful_binary_error(banner)
+    assert "End of file" in detail
+    assert "configuration:" not in detail
+    assert "libavutil" not in detail
+    assert len(detail) < 200
+    # A banner-only failure must still say something rather than becoming empty.
+    assert _meaningful_binary_error("ffmpeg version 4.2.7\n  configuration: --x")
