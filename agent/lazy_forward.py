@@ -22,6 +22,17 @@ def forward(module: str, name: str, *, static: bool = False):
             return lazy_attr(module, name)(self, *args, **kwargs)
     forwarder.__name__ = forwarder.__qualname__ = name
     forwarder.__doc__ = f"Forwarder — see ``{module}.{name}``."
+    # The bare ``*args, **kwargs`` signature lies to introspection. Callers that decide what to pass
+    # by reading the target's parameters (the router does exactly this before switching a live agent)
+    # see VAR_KEYWORD, conclude the target takes anything, and hand it a keyword it never accepted:
+    # "switch_model() got an unexpected keyword argument 'user_initiated'", after which routing
+    # disables itself for the turn and the model the operator asked for is never used. Exposing the
+    # real signature through ``__wrapped__`` (which ``inspect.signature`` follows, stripping ``self``
+    # from a bound method) makes every lazily forwarded method tell the truth.
+    try:
+        setattr(forwarder, "__wrapped__", lazy_attr(module, name))
+    except Exception:  # pragma: no cover - a module that cannot import yet still forwards at call time
+        pass
     return staticmethod(forwarder) if static else forwarder
 
 

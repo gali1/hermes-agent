@@ -1729,7 +1729,7 @@ def test_route_turn_tool_calls_only_leaves_the_session_model_alone(patched_candi
     assert agent.model == "weak"
 
 
-from agent.model_router import message_text_and_attachments  # noqa: E402  (test-local import)
+from agent.model_router import message_text_and_attachments, _call_switch_model  # noqa: E402
 
 
 class TestAdapterNoteAttachments:
@@ -1778,3 +1778,45 @@ class TestAdapterNoteAttachments:
     def test_the_suffix_is_still_read_when_the_file_is_gone(self):
         note = "[document saved at: /nowhere/doc_1_Check In_ Delta Air Lines.pdf. Its text is not inlined]"
         assert message_text_and_attachments(note)[1] == ("pdf",)
+
+
+class TestLazyForwarderSignatureHonesty:
+    """A lazily forwarded agent method must not claim ``**kwargs`` it cannot honour.
+
+    Regression: ``AIAgent.switch_model`` is ``forward(module, name)`` whose forwarder takes
+    ``*args, **kwargs``. ``_call_switch_model`` reads the signature to decide whether to pass
+    ``user_initiated``, saw VAR_KEYWORD, passed it, and the real helper raised TypeError — routing
+    then logged "disabled for this turn after error" and kept a model that cannot read the pdf.
+    """
+
+    def test_the_bound_forwarder_reports_the_real_parameters(self):
+        import inspect
+        from agent.lazy_forward import forward
+
+        class Holder:
+            switch_model = forward("agent.agent_runtime_helpers", "switch_model")
+
+        params = inspect.signature(Holder().switch_model).parameters
+        assert "user_initiated" not in params
+        assert "new_model" in params and "new_provider" in params
+
+    def test_the_router_switches_without_passing_an_unsupported_keyword(self, monkeypatch):
+        import agent.agent_runtime_helpers as arh
+        from agent.lazy_forward import forward
+
+        seen = {}
+
+        def fake_switch(agent, new_model, new_provider, api_key="", base_url="", api_mode="",
+                        capabilities=None):
+            seen["args"] = (new_model, new_provider)
+
+        monkeypatch.setattr(arh, "switch_model", fake_switch)
+
+        class Holder:
+            switch_model = forward("agent.agent_runtime_helpers", "switch_model")
+
+        class Decision:
+            model, provider = "gpt-6-luna", "opencode-zen"
+
+        assert _call_switch_model(Holder(), Decision(), runtime=None) is True
+        assert seen["args"] == ("gpt-6-luna", "opencode-zen")
