@@ -40,9 +40,12 @@ class CLITuiComposerEditMixin:
         """
         from hermes_cli.cli_session_dock import _prompt_text
         from hermes_cli.cli_subagent_monitor import modal_prompt_active
-        if modal_prompt_active(self) or getattr(self, "_connection_state", None):
-            return
         from cli import _cprint
+        if modal_prompt_active(self) or getattr(self, "_connection_state", None):
+            # Say why instead of returning in silence: the keystroke used to be filtered out at the
+            # keyboard level, so a modal prompt made Ctrl+E look broken with no feedback at all.
+            _cprint(f"  {t('cli.queue.edit_blocked_modal')}")
+            return
         items = self._pending_input_items()
         if not items:
             _cprint(f"  {t('cli.queue.edit_empty')}")
@@ -112,10 +115,15 @@ class CLITuiComposerEditMixin:
 
         Called last from ``_tui_build_key_bindings`` so the filtered bindings win over the
         generic Escape handlers (prompt_toolkit picks the last matching binding).
+
+        Ctrl+E is bound with **no** filter. It used to carry ``not modal_prompt_active(self)``,
+        and a filter that is False makes prompt_toolkit drop the keystroke without calling
+        anything — the handler never ran, nothing was printed, and the key looked dead. The
+        handler now runs and says why it cannot edit, so every press produces either the queued
+        text in the composer or a visible reason.
         """
         from hermes_cli.cli_subagent_monitor import modal_prompt_active
-        kb.add('c-e', filter=Condition(lambda: not modal_prompt_active(self)))(
-            self._tui_handle_ctrl_e)
+        kb.add('c-e')(self._tui_handle_ctrl_e)
         _queue_edit_filter = Condition(
             lambda: getattr(self, '_queue_edit_index', None) is not None)
         kb.add('escape', filter=_queue_edit_filter, eager=True)(
