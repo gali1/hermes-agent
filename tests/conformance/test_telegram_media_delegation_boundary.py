@@ -19,12 +19,29 @@ rows and the transcription/video suites.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import struct
+import sys
 import zlib
 from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+
+# The plugin under test is loaded by the running gateway from $HERMES_HOME/plugins, which is not on
+# sys.path inside pytest — and the conformance sandbox rebinds HERMES_HOME, so the plugin dir has to be
+# located rather than assumed. Without this the whole file silently skips ("No module named
+# 'capability_delegation'") and a green run means nothing.
+_PLUGIN_CANDIDATES = [
+    Path(os.environ["HERMES_DELEGATION_PLUGIN_DIR"]) if os.environ.get("HERMES_DELEGATION_PLUGIN_DIR") else None,
+    (Path(os.environ["HERMES_HOME"]) / "plugins") if os.environ.get("HERMES_HOME") else None,
+    Path.home() / ".hermes" / "plugins",
+]
+for _cand in _PLUGIN_CANDIDATES:
+    if _cand and (_cand / "capability_delegation").is_dir():
+        if str(_cand) not in sys.path:
+            sys.path.insert(0, str(_cand))
+        break
 from telegram import Chat, Document, Message, Update, User
 
 from gateway.config import PlatformConfig
