@@ -4,10 +4,11 @@ description: Resume unfinished work from a ledger until verified done.
 version: 1.1.0
 author: Hermes Agent (Gadafi Ali)
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [continuation, resume, ledger, checkpoint, mission, guard, handoff, anti-abandonment]
-    related_skills: [weekly-review-planning, development-workflow]
+    related_skills: [weekly-review-planning]
 ---
 
 # Continuation until completion
