@@ -1761,3 +1761,20 @@ class TestAdapterNoteAttachments:
 
     def test_a_note_without_a_path_claims_no_attachment(self):
         assert message_text_and_attachments("[saved at: unknown]")[1] == ()
+
+    def test_a_filename_with_spaces_still_yields_its_modality(self, tmp_path):
+        """Adapter filenames contain spaces; a whitespace-delimited capture carried no extension.
+
+        Measured on a real Telegram upload: 'doc_14aa5419ed55_Check In_ Delta Air Lines.pdf' was
+        captured as '…doc_14aa5419ed55_Check' — no suffix, no hint, so routing kept a model that
+        cannot read a pdf and reported itself as keeping the incumbent by choice.
+        """
+        f = tmp_path / "doc_1_Check In_ Delta Air Lines.pdf"
+        f.write_bytes(b"%PDF-1.4 image-only")
+        note = (f"[The user sent a document: '{f.name}'. It is saved at: {f}. Its text is not "
+                f"inlined here (it's a binary format such as PDF or DOCX).]")
+        assert message_text_and_attachments(note)[1] == ("pdf",)
+
+    def test_the_suffix_is_still_read_when_the_file_is_gone(self):
+        note = "[document saved at: /nowhere/doc_1_Check In_ Delta Air Lines.pdf. Its text is not inlined]"
+        assert message_text_and_attachments(note)[1] == ("pdf",)

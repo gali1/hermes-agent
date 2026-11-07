@@ -231,7 +231,30 @@ _FILE_SUFFIX_MODALITY = {
 #: file never becomes a content part, so a string-only turn looked text-only and routing kept an
 #: incumbent that cannot read the attachment, which is the opposite of what contract C9a intends.
 #: The note is the transport's own wording, so reading the modality off it is not guessing at prose.
-_ADAPTER_NOTE_PATH_RE = re.compile(r"saved at:\s*([^\s\]\n]+)", re.IGNORECASE)
+_ADAPTER_NOTE_PATH_RE = re.compile(r"saved at:\s*([^\]\n]+)", re.IGNORECASE)
+
+
+def _note_path_candidates(raw: str) -> tuple:
+    """The path a note tail most likely names, most likely first.
+
+    The tail runs to the end of the bracket, so it carries the rest of the sentence, and adapter
+    filenames contain spaces ('…/doc_1_Check In_ Delta Air Lines.pdf. Its text is not inlined'). A
+    whitespace-delimited capture stopped at '…doc_14aa5419ed55_Check', carried no suffix at all, and
+    produced no hint — so routing kept a model that cannot read a pdf and said it was by choice.
+    """
+    tail = (raw or "").replace("]", " ").strip().strip("'\"").rstrip(".,;: ")
+    if not tail:
+        return ()
+    words = [w for w in tail.split(" ") if w]
+    for cut in range(len(words), 0, -1):
+        candidate = " ".join(words[:cut]).rstrip(".,;:")
+        if candidate and os.path.exists(candidate):
+            return (candidate,)
+    for word in reversed(words):
+        candidate = word.rstrip(".,;:")
+        if _FILE_SUFFIX_MODALITY.get(Path(candidate).suffix.lower()):
+            return (candidate,)
+    return ()
 
 
 def adapter_note_attachments(text: str) -> Tuple[str, ...]:
@@ -240,10 +263,12 @@ def adapter_note_attachments(text: str) -> Tuple[str, ...]:
         return ()
     hints: List[str] = []
     for raw in _ADAPTER_NOTE_PATH_RE.findall(text):
-        candidate = raw.strip().strip("'\",;]").rstrip(".,;:")
-        modality = _FILE_SUFFIX_MODALITY.get(Path(candidate).suffix.lower())
-        if modality and modality not in hints:
-            hints.append(modality)
+        for candidate in _note_path_candidates(raw):
+            modality = _FILE_SUFFIX_MODALITY.get(Path(candidate).suffix.lower())
+            if modality:
+                if modality not in hints:
+                    hints.append(modality)
+                break
     return tuple(hints)
 
 
