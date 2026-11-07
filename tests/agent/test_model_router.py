@@ -1727,3 +1727,37 @@ def test_route_turn_tool_calls_only_leaves_the_session_model_alone(patched_candi
     mr.route_turn(agent, "what is 15 multiplied by 8?", config=cfg)
     assert agent.switch_calls == [], "tool_calls_only must not switch an eligible default model"
     assert agent.model == "weak"
+
+
+from agent.model_router import message_text_and_attachments  # noqa: E402  (test-local import)
+
+
+class TestAdapterNoteAttachments:
+    """A gateway upload reaches routing as plain text; the note is the only trace of the file.
+
+    Regression: Telegram's document note continues on the same line as the path
+    ("…x.pdf. Its text is not inlined here …"). Routing saw a string, contributed no attachment, and
+    kept an incumbent that cannot read the file while the plugin refused the path as untrusted — the
+    capability existed on paper and was dead in practice on that surface.
+    """
+
+    def test_a_document_note_asks_for_a_model_that_reads_pdfs(self):
+        text = ("[The user sent a document: 'foo.pdf'. It is saved at: /home/u/.hermes/cache/documents/"
+                "doc_1_foo.pdf. Its text is not inlined here (it's a binary format such as PDF or "
+                "DOCX). To read it, extract the document's text yourself.]\n\nread it")
+        _, attachments = message_text_and_attachments(text)
+        assert attachments == ("pdf",)
+
+    def test_a_voice_note_asks_for_a_model_that_takes_audio(self):
+        text = "[The user sent a voice note. It is saved at: /home/u/.hermes/cache/audio/v.ogg]"
+        assert message_text_and_attachments(text)[1] == ("audio",)
+
+    def test_the_hint_survives_a_parts_list(self):
+        parts = [{"type": "text", "text": "[The user sent a video. It is saved at: /t/c.mp4]"}]
+        assert message_text_and_attachments(parts)[1] == ("video",)
+
+    def test_plain_text_claims_no_attachment(self):
+        assert message_text_and_attachments("no files here, just words")[1] == ()
+
+    def test_a_note_without_a_path_claims_no_attachment(self):
+        assert message_text_and_attachments("[saved at: unknown]")[1] == ()

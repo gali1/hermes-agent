@@ -226,6 +226,27 @@ _FILE_SUFFIX_MODALITY = {
 }
 
 
+#: A gateway adapter turns an upload into a sentence — ``[The user sent a document: 'x.pdf'. It is
+#: saved at: /…/x.pdf. Its text is not inlined here …]`` — and hands the turn on as plain text. The
+#: file never becomes a content part, so a string-only turn looked text-only and routing kept an
+#: incumbent that cannot read the attachment, which is the opposite of what contract C9a intends.
+#: The note is the transport's own wording, so reading the modality off it is not guessing at prose.
+_ADAPTER_NOTE_PATH_RE = re.compile(r"saved at:\s*([^\s\]\n]+)", re.IGNORECASE)
+
+
+def adapter_note_attachments(text: str) -> Tuple[str, ...]:
+    """Modality hints carried by a gateway adapter note inside an otherwise plain-text turn."""
+    if not text or "saved at:" not in text.lower():
+        return ()
+    hints: List[str] = []
+    for raw in _ADAPTER_NOTE_PATH_RE.findall(text):
+        candidate = raw.strip().strip("'\",;]").rstrip(".,;:")
+        modality = _FILE_SUFFIX_MODALITY.get(Path(candidate).suffix.lower())
+        if modality and modality not in hints:
+            hints.append(modality)
+    return tuple(hints)
+
+
 def _modality_of_part(part: Dict[str, Any]) -> Optional[str]:
     kind = str(part.get("type") or "").strip().lower()
     if kind in _PART_MODALITY:
@@ -260,7 +281,7 @@ def message_text_and_attachments(user_message: Any) -> Tuple[str, Tuple[str, ...
     if user_message is None:
         return "", ()
     if isinstance(user_message, str):
-        return user_message, ()
+        return user_message, adapter_note_attachments(user_message)
     if isinstance(user_message, dict):
         parts: Sequence[Any] = [user_message]
     elif isinstance(user_message, (list, tuple)):
@@ -282,7 +303,11 @@ def message_text_and_attachments(user_message: Any) -> Tuple[str, Tuple[str, ...
         text = part.get("text")
         if isinstance(text, str) and text.strip():
             chunks.append(text)
-    return "\n".join(chunks).strip(), tuple(attachments)
+    text = "\n".join(chunks).strip()
+    for hint in adapter_note_attachments(text):
+        if hint not in attachments:
+            attachments.append(hint)
+    return text, tuple(attachments)
 
 
 def classify_request(
