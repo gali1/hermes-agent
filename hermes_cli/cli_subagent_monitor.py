@@ -4,6 +4,7 @@ goal/queue rows from ``cli_session_dock``."""
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 from prompt_toolkit.utils import get_cwidth
@@ -11,6 +12,8 @@ from prompt_toolkit.utils import get_cwidth
 from agent.i18n import t
 from hermes_cli import cli_process_dock as procs
 from hermes_cli import cli_session_dock as session_rows
+
+logger = logging.getLogger(__name__)
 
 
 def _clip(value, width):
@@ -400,6 +403,16 @@ def build_monitor_application(monitor, **kwargs):
     def close(event):
         app.exit()
 
+    @kb.add('c-e')
+    def edit_queued(event):
+        """Ctrl+E here: the queue bar in this view says "Ctrl+E edit", so it has to do it.
+
+        The monitor is a full-screen application with its own key bindings, so the composer's
+        Ctrl+E never fired while it was open — the hint was shown and the key went nowhere.
+        Closing with a result lets the caller hand the keystroke to the composer editor.
+        """
+        app.exit(result='queue-edit')
+
     layout = Layout(HSplit([
         Window(FormattedTextControl(header), height=1),
         ConditionalContainer(roster, filter=Condition(lambda: not state['detail'])),
@@ -424,6 +437,23 @@ def build_monitor_application(monitor, **kwargs):
     return app
 
 
+def _request_queue_edit(cli) -> None:
+    """Hand a Ctrl+E taken in the monitor back to the composer editor.
+
+    The monitor is a full-screen app: its bindings replace the composer's while it is open, so the
+    keystroke is replayed against ``cli._app`` — the REPL application that owns the composer.
+    """
+    from types import SimpleNamespace
+    app = getattr(cli, "_app", None)
+    handler = getattr(cli, "_tui_handle_ctrl_e", None)
+    if app is None or not callable(handler):
+        return
+    try:
+        handler(SimpleNamespace(app=app))
+    except Exception as exc:  # never let a key press take the monitor down
+        logger.debug("hermes: queue edit from monitor failed: %s", exc)
+
+
 def open_monitor(cli):
     import asyncio
     from prompt_toolkit.application import in_terminal
@@ -433,15 +463,18 @@ def open_monitor(cli):
     monitor.opening = True
 
     async def run():
+        result = None
         try:
             async with in_terminal():
                 monitor.refresh()
                 monitor.app = build_monitor_application(monitor)
-                await monitor.app.run_async()
+                result = await monitor.app.run_async()
         finally:
             monitor.app = None
             monitor.opening = False
             cli._invalidate()
+        if result == 'queue-edit':
+            _request_queue_edit(cli)
 
     asyncio.get_running_loop().create_task(run())
 

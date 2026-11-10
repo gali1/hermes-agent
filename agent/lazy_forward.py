@@ -22,6 +22,15 @@ def forward(module: str, name: str, *, static: bool = False):
             return lazy_attr(module, name)(self, *args, **kwargs)
     forwarder.__name__ = forwarder.__qualname__ = name
     forwarder.__doc__ = f"Forwarder — see ``{module}.{name}``."
+    # The bare ``*args, **kwargs`` signature lies to introspection: callers that decide what to pass
+    # by reading the target's parameters see VAR_KEYWORD, conclude the target takes anything, and hand
+    # it a keyword it never accepted ("switch_model() got an unexpected keyword argument
+    # 'user_initiated'"), after which routing disables itself for the turn. ``__wrapped__`` is what
+    # ``inspect.signature`` follows (and it strips ``self`` from a bound method).
+    try:
+        setattr(forwarder, "__wrapped__", lazy_attr(module, name))
+    except Exception:
+        pass
     return staticmethod(forwarder) if static else forwarder
 
 

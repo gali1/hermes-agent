@@ -1,0 +1,861 @@
+"""Specialist task delegation: the primary model keeps the conversation, a specialist does one job.
+
+These tests exercise the call path itself — who is chosen, what is sent, what comes back — not the
+turn-level routing decision (that is tests/agent/test_model_router.py).
+"""
+from __future__ import annotations
+
+import json
+import types
+from pathlib import Path
+
+import pytest
+
+from agent import capability_delegation as cd
+
+# --------------------------------------------------------------------------- fixtures
+
+
+def _info(modalities):
+    return types.SimpleNamespace(
+        input_modalities=tuple(modalities), output_modalities=("text",))
+
+
+def _cand(model, modalities, *, cost_in=1.0, cost_out=1.0, provider="test"):
+    from agent.model_router import ModelCandidate, ModelSpec
+    return ModelCandidate(
+        provider=provider, model=model, info=_info(modalities),
+        spec=ModelSpec(name=model, provider=provider, cost_in=cost_in, cost_out=cost_out))
+
+
+def _config(models, *, preferred_only=False, primary="primary-model"):
+    return {
+        "model": {"provider": "test", "default": primary},
+        "smart_model_routing": {
+            "enabled": True,
+            "preferred_models_only": preferred_only,
+            "models": list(models),
+        },
+        "providers": {"test": {"models": list(models)}},
+    }
+
+
+@pytest.fixture
+def pool(monkeypatch):
+    """Patch the pool the resolver sees, so no catalog or live config is involved."""
+    def _install(candidates):
+        monkeypatch.setattr(cd, "_pool", lambda config: (config, cd._routing_config(config),
+                                                        candidates, "test"))
+        return candidates
+    return _install
+
+
+@pytest.fixture
+def aux(monkeypatch):
+    """Capture the out-of-band call and return a canned response."""
+    calls = []
+
+    async def fake_async_call_llm(**kwargs):
+        calls.append(kwargs)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="SPECIALIST TEXT", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", fake_async_call_llm, raising=False)
+    monkeypatch.setattr(
+        aux_mod, "extract_content_or_reasoning",
+        lambda resp: resp.choices[0].message.content, raising=False)
+    return calls
+
+
+# --------------------------------------------------------------------------- resolution
+
+
+def test_resolver_picks_the_model_that_declares_the_modality(pool):
+    pool([_cand("primary-model", ["text"]),
+          _cand("reader", ["text", "pdf"]),
+          _cand("talker", ["text", "audio"])])
+    choice = cd.resolve_specialist("pdf", config=_config(["primary-model", "reader", "talker"]))
+    assert choice is not None
+    assert choice.model == "reader"
+    assert "capability-first" in choice.reason
+
+
+def test_resolver_never_delegates_to_the_conversations_own_model(pool):
+    """With only the primary able to do it, there is no specialist — not a self-delegation."""
+    pool([_cand("primary-model", ["text", "pdf"])])
+    assert cd.resolve_specialist("pdf", config=_config(["primary-model"])) is None
+
+
+def test_resolver_reports_when_no_declared_model_accepts_the_modality(pool):
+    pool([_cand("primary-model", ["text"]), _cand("talker", ["text", "audio"])])
+    assert cd.resolve_specialist("pdf", config=_config(["primary-model", "talker"])) is None
+
+
+def test_resolver_honours_selected_models_only(pool):
+    """preferred_models_only must not silently widen to a catalog model."""
+    pool([_cand("primary-model", ["text"])])
+    assert cd.resolve_specialist(
+        "pdf", config=_config(["primary-model"], preferred_only=True)) is None
+
+
+def test_resolver_prefers_the_cheaper_of_two_capable_specialists(pool):
+    pool([_cand("primary-model", ["text"]),
+          _cand("pricey", ["text", "pdf"], cost_in=50.0, cost_out=50.0),
+          _cand("cheap", ["text", "pdf"], cost_in=0.1, cost_out=0.1)])
+    choice = cd.resolve_specialist(
+        "pdf", config=_config(["primary-model", "pricey", "cheap"]))
+    assert choice.model == "cheap", "price breaks ties between equally capable specialists"
+
+
+# --------------------------------------------------------------------------- message building
+
+
+def test_image_is_sent_as_a_data_url_part(tmp_path):
+    img = tmp_path / "shot.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    messages, sent, note = cd.build_delegation_messages(str(img), "what is this?", "image")
+    parts = messages[0]["content"]
+    assert parts[0]["type"] == "text"
+    assert parts[1]["type"] == "image_url"
+    assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert sent == img.stat().st_size
+    assert "image_url" in note
+
+
+def test_audio_is_sent_as_an_input_audio_part_with_the_container_format(tmp_path):
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+    messages, _sent, note = cd.build_delegation_messages(str(voice), "transcribe", "audio")
+    part = messages[0]["content"][1]
+    assert part["type"] == "input_audio"
+    assert part["input_audio"]["format"] == "ogg"
+    assert part["input_audio"]["data"]
+
+
+def test_pdf_is_sent_as_a_file_part(tmp_path):
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    messages, _sent, _note = cd.build_delegation_messages(str(doc), "extract the totals", "pdf")
+    part = messages[0]["content"][1]
+    assert part["type"] == "file"
+    assert part["file"]["filename"] == "scan.pdf"
+    assert part["file"]["file_data"].startswith("data:application/pdf;base64,")
+
+
+def test_text_is_inlined_and_truncated(tmp_path, monkeypatch):
+    monkeypatch.setattr(cd, "MAX_INLINE_TEXT_CHARS", 20)
+    log = tmp_path / "app.log"
+    log.write_text("x" * 200)
+    messages, sent, note = cd.build_delegation_messages(str(log), "summarise", "text")
+    body = messages[0]["content"]
+    assert "truncated: showed 1 of 1 rows, 20 of 200 chars" in body
+    assert sent <= 4096
+    assert "truncated" in note
+
+
+def test_unreadable_video_yields_notes_not_a_description(tmp_path):
+    """Video is decomposed now, so the honest failure mode is a note - never invented content."""
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00" * 64)
+    messages, _sent, note = cd.build_delegation_messages(str(clip), "what happens?", "video")
+    body = messages[0]["content"]
+    assert "decomposed" in note
+    assert "ffprobe could not read the file" in body
+    assert "0 of 0 sampled frame(s)" in note or "had readable text" in note
+
+
+def test_oversized_file_is_refused_before_any_call(tmp_path):
+    big = tmp_path / "huge.pdf"
+    big.write_bytes(b"%PDF" + b"0" * (2 * 1024 * 1024))
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(big), "read", "pdf", max_bytes=1024 * 1024)
+    assert "delegation limit" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- the call
+
+
+def test_delegation_returns_the_specialists_text(pool, aux, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+
+    result = cd.delegate_capability_sync(
+        str(doc), "extract the totals", modality="pdf",
+        config=_config(["primary-model", "reader"]))
+
+    assert result.success is True
+    assert result.text == "SPECIALIST TEXT"
+    assert (result.provider, result.model) == ("test", "reader")
+    assert len(aux) == 1, "exactly one out-of-band call"
+    call = aux[0]
+    assert call["provider"] == "test" and call["model"] == "reader"
+    assert call["task"] == "capability_delegation"
+    assert call["messages"][0]["content"][1]["type"] == "file"
+
+
+def test_no_specialist_means_no_call_and_an_honest_error(pool, aux, tmp_path):
+    pool([_cand("primary-model", ["text"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model"]))
+
+    assert result.success is False
+    assert "no declared specialist" in result.error
+    assert aux == [], "a missing specialist must not spend a request"
+
+
+def test_provider_rejection_is_reported_not_swallowed(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "audio"])])
+
+    async def boom(**kwargs):
+        raise RuntimeError("400 input_audio is not supported by this model")
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", boom, raising=False)
+
+    clip = tmp_path / "memo.mp3"
+    clip.write_bytes(b"ID3" + b"0" * 32)
+    # transport="native" is the path that actually spends a provider request for audio
+    result = cd.delegate_capability_sync(
+        str(clip), "transcribe", modality="audio", config=_config(["primary-model", "reader"]),
+        transport="native")
+
+    assert result.success is False
+    assert "input_audio is not supported" in result.error
+    assert result.text == ""
+
+
+def test_empty_specialist_reply_is_a_failure(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+
+    async def empty(**kwargs):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="   ", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", empty, raising=False)
+
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "reader"]))
+
+    assert result.success is False
+    assert "no content" in result.error
+
+
+def test_the_primary_model_is_never_the_delegate(pool, aux, tmp_path):
+    """Delegating to the model that is already answering is a no-op with a price tag."""
+    pool([_cand("primary-model", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model"]))
+    assert result.success is False
+    assert aux == []
+
+
+def test_result_json_is_serialisable(pool, aux, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "reader"]))
+    payload = json.loads(result.to_json())
+    assert payload["success"] is True and payload["model"] == "reader"
+
+
+# --------------------------------------------------------------------------- retired models
+
+
+def test_a_remembered_dead_specialist_is_skipped(pool, tmp_path, monkeypatch):
+    """The provider retired the model but the catalog cache still lists it: skip, don't retry."""
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    pool([_cand("primary-model", ["text"]),
+          _cand("retired", ["text", "pdf"]),
+          _cand("live", ["text", "pdf"], cost_in=5.0, cost_out=5.0)])
+    cd.remember_unusable("test", "retired", "410 ModelDeprecated")
+    choice = cd.resolve_specialist(
+        "pdf", config=_config(["primary-model", "retired", "live"]))
+    assert choice is not None and choice.model == "live"
+
+
+def test_a_provider_refusal_is_remembered(pool, monkeypatch, tmp_path):
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    pool([_cand("primary-model", ["text"]), _cand("retired", ["text", "pdf"])])
+
+    async def gone(**kwargs):
+        raise RuntimeError("Error code: 410 - ModelDeprecated: Model retired has been deprecated.")
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", gone, raising=False)
+
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "retired"]))
+
+    assert result.success is False
+    assert ("test", "retired") in cd.remembered_unusable()
+    assert cd.resolve_specialist(
+        "pdf", config=_config(["primary-model", "retired"])) is None
+
+
+def test_an_ordinary_bad_request_is_not_memorised(pool, monkeypatch, tmp_path):
+    """A malformed part is our bug, not a dead model — remembering it would hide a real specialist."""
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+
+    async def bad(**_kwargs):
+        raise RuntimeError("Error code: 400 - invalid request: unsupported content part")
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", bad, raising=False)
+
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(
+        str(doc), "extract", modality="pdf", config=_config(["primary-model", "reader"]))
+    assert result.success is False
+    assert cd.remembered_unusable() == set()
+
+
+def test_forget_unusable_clears_the_memo(tmp_path, monkeypatch):
+    monkeypatch.setattr(cd, "unusable_path", lambda: tmp_path / "unusable.json")
+    cd.remember_unusable("test", "retired", "410")
+    assert ("test", "retired") in cd.remembered_unusable()
+    cd.forget_unusable("test", "retired")
+    assert cd.remembered_unusable() == set()
+
+
+# --------------------------------------------------------------------------- tool surface
+
+
+def test_the_tool_is_registered_in_the_delegation_toolset():
+    import tools.capability_delegation_tools  # noqa: F401  (registers on import)
+    from tools.registry import registry
+
+    assert "delegate_capability" in registry.get_tool_names_for_toolset("delegation")
+    assert registry.get_tool_to_toolset_map().get("delegate_capability") == "delegation"
+
+
+def test_tool_refuses_without_a_path_or_instruction():
+    import asyncio
+    from tools.capability_delegation_tools import _handle_delegate_capability
+
+    out = asyncio.run(_handle_delegate_capability({"path": "", "instruction": "read it"}))
+    assert "needs both" in out
+
+
+def test_tool_returns_the_delegation_json(pool, aux, tmp_path):
+    import asyncio
+    from tools.capability_delegation_tools import _handle_delegate_capability
+
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+
+    cfg = _config(["primary-model", "reader"])
+    import agent.capability_delegation as mod
+    original = mod._live_config
+    mod._live_config = lambda: cfg  # delegate_capability reads live config when none is passed
+    try:
+        out = asyncio.run(_handle_delegate_capability(
+            {"path": str(doc), "instruction": "extract the totals"}))
+    finally:
+        mod._live_config = original
+
+    payload = json.loads(out)
+    assert payload["success"] is True
+    assert payload["text"] == "SPECIALIST TEXT"
+    assert payload["model"] == "reader"
+
+
+# --------------------------------------------------------------------------- transports
+
+
+def test_pdf_with_a_text_layer_is_extracted_and_sent_as_text(tmp_path, monkeypatch):
+    """Portable by default: extraction works on every provider, a `file` part does not."""
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "VAULT TOTAL: 412 GB")
+    messages, sent, note = cd.build_delegation_messages(str(doc), "extract the total", "pdf")
+    body = messages[0]["content"]
+    assert isinstance(body, str)
+    assert "VAULT TOTAL: 412 GB" in body
+    assert "text layer" in note and "portable path" in note
+    assert sent == len("VAULT TOTAL: 412 GB")
+
+
+def test_a_scan_falls_back_to_the_native_part_and_says_so(tmp_path, monkeypatch):
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    messages, sent, note = cd.build_delegation_messages(str(doc), "read", "pdf")
+    part = messages[0]["content"][1]
+    assert part["type"] == "file"
+    assert "after local extraction produced nothing" in note
+    assert sent == doc.stat().st_size
+
+
+def test_pdf_transport_text_refuses_a_scan(tmp_path, monkeypatch):
+    doc = tmp_path / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(doc), "read", "pdf", transport="text")
+    assert "no text layer" in str(exc.value)
+
+
+def test_audio_is_transcribed_locally_by_default(tmp_path, monkeypatch):
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (True, "the disk is failing", ""))
+    messages, sent, note = cd.build_delegation_messages(str(voice), "summarise", "audio")
+    body = messages[0]["content"]
+    assert isinstance(body, str) and "the disk is failing" in body
+    assert "transcribed" in note and "STT" in note
+
+
+def test_audio_transport_stt_reports_why_transcription_failed(tmp_path, monkeypatch):
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (False, "", "no STT provider configured"))
+    with pytest.raises(ValueError) as exc:
+        cd.build_delegation_messages(str(voice), "transcribe", "audio", transport="stt")
+    assert "no STT provider configured" in str(exc.value)
+
+
+def test_audio_native_skips_transcription(tmp_path, monkeypatch):
+    voice = tmp_path / "memo.mp3"
+    voice.write_bytes(b"ID3" + b"0" * 32)
+    calls = []
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: calls.append(p) or (True, "x", ""))
+    messages, _sent, note = cd.build_delegation_messages(
+        str(voice), "transcribe", "audio", transport="native")
+    assert calls == [], "transport='native' must not spend a transcription"
+    assert messages[0]["content"][1]["type"] == "input_audio"
+    assert "not guaranteed" in note.replace("no audio part shape is guaranteed", "not guaranteed")
+
+
+def test_transport_is_threaded_through_the_call(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"])])
+    seen = {}
+
+    async def fake(**kwargs):
+        seen["messages"] = kwargs["messages"]
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="OK", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", fake, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "EXTRACTED BODY")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(
+        str(doc), "read it", modality="pdf", config=_config(["primary-model", "reader"]),
+        transport="text"))
+    assert result.success is True
+    assert "EXTRACTED BODY" in seen["messages"][0]["content"]
+
+
+# --------------------------------------------------------------------------- audio = STT
+
+
+def test_audio_returns_the_transcript_without_touching_a_model(pool, aux, tmp_path, monkeypatch):
+    """The missing capability is speech-to-text, not a model: no request should be spent."""
+    pool([_cand("primary-model", ["text"])])
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (True, "the disk is failing", ""))
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(
+        str(voice), "transcribe this", modality="audio",
+        config=_config(["primary-model"])))
+
+    assert result.success is True
+    assert result.text == "the disk is failing"
+    assert result.provider == "stt" and result.model == "local"
+    assert aux == [], "no specialist request for an audio transcript"
+
+
+def test_audio_without_stt_reports_the_stt_failure_not_a_fake_result(pool, aux, tmp_path, monkeypatch):
+    pool([_cand("primary-model", ["text"])])
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (False, "", "no STT provider configured"))
+    voice = tmp_path / "memo.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 32)
+
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(
+        str(voice), "transcribe this", modality="audio",
+        config=_config(["primary-model"])))
+
+    assert result.success is False
+    assert "no STT provider configured" in result.error
+    assert aux == []
+
+
+# --------------------------------------------------------------------------- OCR for scans
+
+
+def test_a_scan_is_ocrd_before_falling_back_to_bytes(tmp_path, monkeypatch):
+    """A scanned page has no text layer; OCR is the honest path, a file part is the last resort."""
+    scan = tmp_path / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    monkeypatch.setattr(cd, "ocr_available", lambda: True)
+    monkeypatch.setattr(cd, "_ocr_pdf", lambda p, **k: "SCANNED INVOICE TOTAL 412")
+
+    messages, sent, note = cd.build_delegation_messages(str(scan), "extract the total", "pdf")
+    body = messages[0]["content"]
+    assert isinstance(body, str), "OCR text is sent as text, not as bytes"
+    assert "SCANNED INVOICE TOTAL 412" in body
+    assert "OCR" in note and "tesseract" in note
+
+
+def test_without_ocr_a_scan_still_falls_back_but_says_why(tmp_path, monkeypatch):
+    scan = tmp_path / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.7\n" + b"2" * 32)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "")
+    monkeypatch.setattr(cd, "ocr_available", lambda: False)
+
+    messages, _sent, note = cd.build_delegation_messages(str(scan), "extract", "pdf")
+    assert messages[0]["content"][1]["type"] == "file"
+    assert "after local extraction produced nothing" in note
+
+
+def test_ocr_is_not_used_when_the_text_layer_has_content(tmp_path, monkeypatch):
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer with plenty of words "
+                                                           "to exceed the forty character floor")
+    called = []
+    monkeypatch.setattr(cd, "_ocr_pdf", lambda p, **k: called.append(p) or "OCR")
+    messages, _sent, note = cd.build_delegation_messages(str(doc), "read", "pdf")
+    assert called == [], "OCR costs seconds per page: never run it on a readable pdf"
+    assert "text layer" in note
+
+
+# --------------------------------------------------------------------------- extractor placeholder
+
+
+def test_the_needs_ocr_placeholder_is_not_treated_as_content(tmp_path, monkeypatch):
+    """`read_extract` hands back "[NEEDS OCR: pages 1 …]" for a scan — an instruction, not text."""
+    scan = tmp_path / "scan.pdf"
+    scan.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setattr(cd, "_extract_pdf_text",
+                        lambda p: "[NEEDS OCR: pages 1 of this PDF are scanned images …]")
+    assert cd.usable_text("[NEEDS OCR: pages 1 …]\nreal line") == "real line"
+    monkeypatch.setattr(cd, "ocr_available", lambda: True)
+    monkeypatch.setattr(cd, "_ocr_pdf", lambda p, **k: "MAGIC-OCR-8842")
+    messages, _sent, note = cd.build_delegation_messages(str(scan), "read", "pdf")
+    assert "MAGIC-OCR-8842" in messages[0]["content"]
+    assert "OCR" in note
+
+
+def test_usage_and_cost_are_reported_for_a_model_call(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"],
+                                                  cost_in=0.30, cost_out=1.20)])
+
+    async def with_usage(**_kwargs):
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(
+                message=types.SimpleNamespace(content="OK", reasoning_content=None))],
+            usage=types.SimpleNamespace(prompt_tokens=1000, completion_tokens=500,
+                                        total_tokens=1500))
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", with_usage, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer, long enough to be used")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(str(doc), "read", modality="pdf",
+                                         config=_config(["primary-model", "reader"]))
+    assert result.success is True
+    assert result.usage["total_tokens"] == 1500
+    # 1000 in * $0.30/M + 500 out * $1.20/M
+    assert abs(result.est_cost_usd - (0.0003 + 0.0006)) < 1e-9
+
+
+def test_local_stt_reports_zero_cost(pool, aux, tmp_path, monkeypatch):
+    pool([_cand("primary-model", ["text"])])
+    monkeypatch.setattr(cd, "_transcribe_file", lambda p: (True, "hello", ""))
+    voice = tmp_path / "m.ogg"
+    voice.write_bytes(b"OggS" + b"1" * 16)
+    import asyncio
+    result = asyncio.run(cd.delegate_capability(str(voice), "transcribe", modality="audio",
+                                                config=_config(["primary-model"])))
+    assert result.success and result.est_cost_usd == 0.0 and result.usage == {}
+    assert result.cost_basis == "free_local" and result.cost_known is True
+
+
+# --------------------------------------------------------------------------- documents + video
+
+
+def test_a_spreadsheet_is_extracted_not_rented(tmp_path, monkeypatch):
+    deck = tmp_path / "q3.xlsx"
+    deck.write_bytes(b"PK\x03\x04")
+    monkeypatch.setattr(cd, "_extract_document_text",
+                        lambda p: "SHEET: Summary\nrow 1: revenue 412000")
+    messages, sent, note = cd.build_delegation_messages(str(deck), "what is revenue", "document")
+    assert "revenue 412000" in messages[0]["content"]
+    assert "structure preserved" in note
+
+
+def test_an_unreadable_presentation_is_a_note_not_an_exception(tmp_path, monkeypatch):
+    deck = tmp_path / "talk.pptx"
+    deck.write_bytes(b"PK\x03\x04")
+    monkeypatch.setattr(cd, "_extract_document_text", lambda p: "")
+    messages, _sent, note = cd.build_delegation_messages(str(deck), "summarise", "document")
+    assert "no text could be extracted" in messages[0]["content"]
+    assert "no text could be extracted" in note
+
+
+def test_video_is_decomposed_locally_into_timestamped_text(tmp_path, monkeypatch):
+    clip = tmp_path / "standup.mp4"
+    clip.write_bytes(b"\x00" * 64)
+    from agent import video_context as vc
+
+    def fake_context(path, **kwargs):
+        ctx = vc.VideoContext(path=path, duration_s=93.0, width=1280, height=720)
+        ctx.frames = [vc.Frame(0, 0.0, "f0.jpg", "SPRINT 42 BURNDOWN"),
+                      vc.Frame(1, 46.5, "f1.jpg", "")]
+        ctx.transcript = "we shipped the OCR path yesterday"
+        return ctx
+
+    monkeypatch.setattr(vc, "build_video_context", fake_context)
+    messages, sent, note = cd.build_delegation_messages(str(clip), "summarise", "video")
+    body = messages[0]["content"]
+    assert "93.0s" in body and "1280x720" in body
+    assert "SPRINT 42 BURNDOWN" in body and "46.5s" not in body.split("ON SCREEN")[0]
+    assert "we shipped the OCR path yesterday" in body
+    assert "1 of 2 sampled frame(s) had readable text" in note
+
+
+def test_video_transport_native_is_refused_honestly(tmp_path):
+    clip = tmp_path / "x.mp4"
+    clip.write_bytes(b"\x00" * 16)
+    messages, sent, note = cd.build_delegation_messages(str(clip), "look", "video",
+                                                        transport="native")
+    assert sent == 0 and "no provider here accepts a native video part" in note
+
+
+def test_a_model_call_without_usage_is_marked_cost_unknown(pool, monkeypatch, tmp_path):
+    """gpt-6-luna is priced; reporting 0.0 without saying "no usage" is a lie by omission."""
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"],
+                                                  cost_in=0.10, cost_out=0.50)])
+
+    async def no_usage(**_kwargs):
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content="OK", reasoning_content=None))])
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", no_usage, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer, long enough to be used")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(str(doc), "read", modality="pdf",
+                                        config=_config(["primary-model", "reader"]))
+    assert result.success is True
+    assert result.cost_known is False, "no usage must not read as free"
+    assert result.cost_basis == "estimated_from_bytes_binary", (
+        "a binary payload's estimate is labelled as byte-derived, not token-derived")
+    # 41-byte pdf payload: ~10 input tokens + a 200-token reply allowance, at $0.10/$0.50 per 1M
+    assert result.est_cost_usd > 0.0, "a money budget must not be defeated by a silent provider"
+
+
+def test_a_dict_usage_shape_is_understood(pool, monkeypatch, tmp_path):
+    pool([_cand("primary-model", ["text"]), _cand("reader", ["text", "pdf"],
+                                                  cost_in=0.10, cost_out=0.50)])
+
+    async def dict_usage(**_kwargs):
+        return {"choices": [{"message": {"content": "OK"}}],
+                "usage": {"input_tokens": 2000, "output_tokens": 1000, "total_tokens": 3000}}
+
+    from agent import auxiliary_client as aux_mod
+    monkeypatch.setattr(aux_mod, "async_call_llm", dict_usage, raising=False)
+    monkeypatch.setattr(aux_mod, "extract_content_or_reasoning", lambda r: "OK", raising=False)
+    monkeypatch.setattr(cd, "_extract_pdf_text", lambda p: "a real text layer, long enough to be used")
+
+    doc = tmp_path / "r.pdf"
+    doc.write_bytes(b"%PDF-1.7\n")
+    result = cd.delegate_capability_sync(str(doc), "read", modality="pdf",
+                                        config=_config(["primary-model", "reader"]))
+    assert result.usage["total_tokens"] == 3000
+    assert abs(result.est_cost_usd - (2000 * 0.10 + 1000 * 0.50) / 1_000_000) < 1e-12
+    assert result.cost_known is True
+
+
+def test_a_large_binary_payload_trips_a_small_budget_on_estimate_alone():
+    """2 MB of audio with a silent provider must still cost enough to blow a $0.01 budget."""
+    choice = cd.SpecialistChoice(provider="opencode-zen", model="gpt-6-luna", modality="audio",
+                                 reason="test", cost_in=0.10, cost_out=0.50)
+    usd, basis = cd._price(choice, {}, bytes_sent=2 * 1024 * 1024, modality="audio")
+    assert basis == "estimated_from_bytes_binary"
+    assert usd > 0.01, f"estimate {usd} would fit inside a 1-cent budget"
+
+
+# --------------------------------------------------------------------------- document limits
+
+
+def test_a_zip_bomb_is_refused_before_inflation(tmp_path):
+    """A 12 KB package can declare gigabytes; refusing it is cheaper than an OOM kill."""
+    import zipfile
+
+    from tools.read_extract import ExtractionError, extract_document_text
+
+    bomb = tmp_path / "bomb.docx"
+    with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", "<Types/>")
+        zf.writestr("word/document.xml", b"\x00" * (300 * 1024 * 1024))
+
+    with pytest.raises(ExtractionError) as exc:
+        extract_document_text(str(bomb))
+    assert "refusing to inflate" in str(exc.value)
+
+
+def test_a_normal_docx_still_passes_the_zip_guard(tmp_path):
+    import zipfile
+
+    from tools.read_extract import extract_document_text
+
+    doc = tmp_path / "ok.docx"
+    body = "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'>" \
+           "<w:body><w:p><w:r><w:t>MAGIC-DOCX-2290</w:t></w:r></w:p></w:body></w:document>"
+    with zipfile.ZipFile(doc, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", body)
+    assert "MAGIC-DOCX-2290" in extract_document_text(str(doc))
+
+
+def test_an_xlsx_sheet_says_how_many_rows_it_left_out(tmp_path):
+    """Silent truncation is the failure: '5000 of 6000 rows' is honest, 5000 rows alone is not."""
+    import zipfile
+
+    from tools.read_extract import _MAX_XLSX_ROWS_PER_SHEET, extract_document_text
+
+    rows = _MAX_XLSX_ROWS_PER_SHEET + 500
+    sheet = ('<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/'
+             'spreadsheetml/2006/main"><sheetData>'
+             + "".join(f'<row r="{i}"><c r="A{i}" t="inlineStr"><is><t>row {i}</t></is></c></row>'
+                       for i in range(1, rows + 1))
+             + "</sheetData></worksheet>")
+    book = ('<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/'
+            'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/'
+            '2006/relationships"><sheets><sheet name="Q3" sheetId="1" r:id="rId1"/></sheets></workbook>')
+    rels = ('<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/'
+            '2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/'
+            'officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '</Relationships>')
+    path = tmp_path / "big.xlsx"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/workbook.xml", book)
+        zf.writestr("xl/_rels/workbook.xml.rels", rels)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet)
+    text = extract_document_text(str(path))
+    assert f"showed {_MAX_XLSX_ROWS_PER_SHEET} of {rows} rows" in text
+
+
+def test_a_utf16_csv_is_decoded_not_shredded_into_nuls(tmp_path, monkeypatch):
+    csv = tmp_path / "utf16.csv"
+    csv.write_bytes("id,name\n1,René Müller\n2,Zoe\n".encode("utf-16"))
+    monkeypatch.setattr(cd, "delegate_capability_sync", lambda *a, **k: None)
+    messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
+    body = messages[0]["content"]
+    assert "René Müller" in body and "\x00" not in body
+    assert "utf-16" in note
+
+
+def test_a_cp1252_csv_no_longer_produces_replacement_characters(tmp_path):
+    csv = tmp_path / "cp.csv"
+    csv.write_bytes("id,name\n1,René Müller\n".encode("cp1252"))
+    messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
+    assert "René Müller" in messages[0]["content"]
+    assert "cp1252" in note
+
+
+def test_a_truncated_csv_says_how_many_rows_were_shown(tmp_path, monkeypatch):
+    csv = tmp_path / "big.csv"
+    csv.write_text("id,name\n" + "\n".join(f"{i},name{i}" for i in range(20000)))
+    body_limit = 500
+    monkeypatch.setattr(cd, "MAX_INLINE_TEXT_CHARS", body_limit)
+    messages, _sent, note = cd.build_delegation_messages(str(csv), "read", "text")
+    assert "truncated: showed" in note and "rows" in note
+    assert "of 20001 rows" in note or "of 20000 rows" in note
+
+
+def test_the_configured_output_cap_raises_the_estimate(monkeypatch):
+    """A 4000-token answer costs 20x a 200-token allowance; the estimate must use the real cap."""
+    choice = cd.SpecialistChoice(provider="p", model="m", modality="text", reason="t",
+                                cost_in=0.10, cost_out=0.50)
+    monkeypatch.setattr(cd, "_output_token_allowance", lambda: 1024)
+    low, _ = cd._price(choice, {}, bytes_sent=1200, modality="text")
+    monkeypatch.setattr(cd, "_output_token_allowance", lambda: 64000)
+    high, basis = cd._price(choice, {}, bytes_sent=1200, modality="text")
+    assert high > low * 10, f"{high} should dwarf {low}"
+    assert basis == "estimated_from_bytes"
+
+
+def test_the_estimate_is_biased_high_not_low(monkeypatch):
+    """bytes/3 over-counts input tokens on purpose: undercounting lets a budget slip."""
+    choice = cd.SpecialistChoice(provider="p", model="m", modality="text", reason="t",
+                                cost_in=1.0, cost_out=0.0)
+    monkeypatch.setattr(cd, "_output_token_allowance", lambda: 1024)
+    usd, _ = cd._price(choice, {}, bytes_sent=3000, modality="text")
+    # 3000 bytes at 4 bytes/token would be 750 tokens = $0.00075; 3 bytes/token gives 1000 = $0.001
+    assert usd >= 0.0009, f"estimate {usd} under-counts input"
+
+
+def test_a_video_result_carries_the_verbatim_timeline(tmp_path):
+    """The specialist drops timestamps; the primary must not need vision to recover them."""
+    from agent.capability_delegation import _cache_video_context, cached_video_timeline
+    from agent.video_context import Frame, VideoContext
+
+    ctx = VideoContext(path="v.mp4", duration_s=6.1, audio_duration_s=6.1,
+                       frames=[Frame(index=0, timestamp_s=0.0, path="f0.jpg",
+                                     ocr_text="MAGIC-VIDEO-5510"),
+                               Frame(index=1, timestamp_s=3.0, path="f1.jpg",
+                                     ocr_text="ACTION ITEM ship OCR path")],
+                       transcript="hello", notes=[])
+    _cache_video_context("v.mp4", ctx)
+    line = cached_video_timeline("v.mp4")
+    assert "[  0.00s] MAGIC-VIDEO-5510" in line
+    assert "[  3.00s] ACTION ITEM ship OCR path" in line
+
+
+def test_both_readers_decode_the_same_corpus_the_same_way(tmp_path):
+    """The delegation path and read_file are two implementations; they must agree on encoding.
+
+    Measured divergence: a cp1252 CSV decoded to 'René Müller' on the delegation path and was
+    reported as a binary file through read_file. That is a second reader, so it is checked here
+    rather than trusted.
+    """
+    import codecs
+
+    from agent.capability_delegation import decode_text_payload
+    from tools.file_tools import read_file_tool
+
+    corpus = {
+        "utf8.csv": "1,René Müller\n".encode("utf-8"),
+        "utf8bom.csv": codecs.BOM_UTF8 + "1,René Müller\n".encode("utf-8"),
+        "cp1252.csv": "1,René Müller\n".encode("cp1252"),
+        "utf16.csv": codecs.BOM_UTF16_LE + "1,René Müller\n".encode("utf-16-le"),
+    }
+    for name, payload in corpus.items():
+        path = tmp_path / name
+        path.write_bytes(payload)
+        expected, encoding = decode_text_payload(payload)
+        text = read_file_tool(str(path), 1, 50)
+        assert "René Müller" in text, f"{name} lost the accented name via read_file ({encoding})"
+        assert "René Müller" in expected, f"{name} lost the accented name via decode_text_payload"

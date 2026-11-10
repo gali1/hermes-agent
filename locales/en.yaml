@@ -2468,6 +2468,7 @@ cli:
     edit_hint: "Editing queued prompt {index} of {count} — Enter saves · Ctrl+E next · Ctrl+X deletes · Esc cancels."
     edit_blank: "Edited prompt is empty — nothing saved (Esc cancels the edit)."
     edit_cancelled: "Queue edit cancelled — the queued prompt is unchanged."
+    edit_blocked_modal: "Ctrl+E is waiting on the open prompt above — finish or dismiss it, then press Ctrl+E again."
   reload:
     env_reloaded: "Reloaded .env ({count} var(s) updated)"
   continuation:
