@@ -608,6 +608,33 @@ def select_model(
             score=0.0, profile=profile, candidates=0, skip_reason=SKIP_NO_ELIGIBLE)
 
     best_score, best = ranked[0]
+    # tool_calls_only: the configured default model is the assistant for the turn, and the
+    # pool exists to serve capabilities it lacks — not to compete with it. An eligible
+    # incumbent is never displaced: not for price, not for a better score. (Same semantics
+    # as model_router.route_turn; that engine also handles the delegation case, where a
+    # specialist executes one sub-task and the default model still answers.)
+    if st.strategy == "tool_calls_only" and current:
+        for rank_score, option in ranked:
+            if option.name != current:
+                continue
+            if current_provider and option.provider and option.provider != current_provider:
+                continue
+            return RoutingDecision(
+                model=current, provider=option.provider,
+                reason=(f"tool_calls_only: default model {current_provider or 'current'}/{current} "
+                        f"stays primary (best alternative {best.provider}/{best.name} not used — "
+                        "the default model is replaced only when it cannot serve the turn)"),
+                score=rank_score, profile=profile, candidates=len(ranked),
+                skip_reason=SKIP_ALREADY_CURRENT)
+        # The default model is not in the routing pool. It still stays primary: under this
+        # strategy the pool is the delegate list, never a rival for the whole turn.
+        return RoutingDecision(
+            model=current, provider=current_provider or "",
+            reason=(f"tool_calls_only: default model {current_provider or ''}/{current} stays primary "
+                    f"(not in the routing pool; best pool alternative {best.provider}/{best.name} "
+                    "is reserved for capability delegation)"),
+            score=0.0, profile=profile, candidates=len(ranked),
+            skip_reason=SKIP_ALREADY_CURRENT)
     if current:
         for rank_score, option in ranked:
             if option.name != current:
@@ -712,7 +739,7 @@ def parse_settings(raw: Any) -> RoutingSettings:
     if not isinstance(raw, dict):
         return RoutingSettings()
     strategy = str(raw.get("strategy") or "automatic").strip().lower()
-    if strategy not in ("automatic", "cost", "quality"):
+    if strategy not in ROUTING_STRATEGIES:
         strategy = "automatic"
     # ``stability_threshold`` (lab) and ``min_improvement`` (earlier) are the same knob.
     threshold = raw.get("stability_threshold", raw.get("min_improvement", 0.15))
@@ -734,7 +761,7 @@ def parse_settings(raw: Any) -> RoutingSettings:
     )
 
 
-ROUTING_STRATEGIES = ("automatic", "cost", "quality")
+ROUTING_STRATEGIES = ("automatic", "cost", "quality", "tool_calls_only")
 _ROUTING_BOOL_KEYS = ("enabled", "preferred_models_only", "allow_unknown_metadata",
                       "cost_optimization", "allow_tool_fallback")
 

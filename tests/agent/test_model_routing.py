@@ -13,7 +13,9 @@ import pytest
 
 import agent.model_routing as model_routing
 from agent.model_routing import (
-    TIERS, ModelOption, RequestProfile, classify_request, estimate_cost, estimate_tokens,
+    ROUTING_STRATEGIES, SKIP_ALREADY_CURRENT, TIERS, ModelOption, RequestProfile,
+    RoutingSettings, classify_request, estimate_cost, estimate_tokens,
+    validate_routing_config,
     _exclusion_reason, explain_routing, is_eligible, maybe_apply_model_routing,
     options_from_config, parse_settings, rank_candidates, score_model, select_model,
 )
@@ -653,6 +655,71 @@ class TestStringModelListRegression:
         assert decision is not None
         assert decision.model in picked
         assert all(name in picked for name in switched)
+
+
+class TestToolCallsOnlyStrategy:
+    """tool_calls_only: the default model is the assistant; the pool is its delegates.
+
+    The 95a4d9aa86 lineage implements this in model_router.route_turn; this engine (the one
+    the turn prologue actually calls) silently coerced the strategy to 'automatic' because
+    ROUTING_STRATEGIES did not list it — so a user who picked it in the other tree's UI got
+    price-driven switching instead of a protected default.
+    """
+
+    @staticmethod
+    def _opts():
+        return [ModelOption(name="big-pickle", provider="p", cost_in=0.01, cost_out=0.01,
+                            tier_rank=2, supports_tools=True, supports_vision=True,
+                            context_window=200_000),
+                ModelOption(name="deepseek-v4.1-flash", provider="p", cost_in=0.50, cost_out=0.90,
+                            tier_rank=2, supports_tools=True, supports_vision=False,
+                            context_window=200_000)]
+
+    def test_strategy_is_valid_and_parsed(self):
+        assert "tool_calls_only" in ROUTING_STRATEGIES
+        st = parse_settings({"strategy": "tool_calls_only"})
+        assert st.strategy == "tool_calls_only"  # was silently coerced to 'automatic'
+
+    def test_validate_accepts_it(self):
+        assert validate_routing_config({"strategy": "tool_calls_only"}) == []
+
+    def test_eligible_incumbent_stays_primary_even_when_cheaper_exists(self):
+        st = RoutingSettings(enabled=True, strategy="tool_calls_only", stability_threshold=0.15)
+        prof = RequestProfile(tier="simple", est_input_tokens=400, est_output_tokens=200)
+        decision = select_model(self._opts(), prof, current="deepseek-v4.1-flash",
+                                current_provider="p", settings=st)
+        assert decision.model == "deepseek-v4.1-flash"
+        assert decision.skip_reason == SKIP_ALREADY_CURRENT
+        assert "stays primary" in decision.reason
+
+    def test_automatic_under_the_same_conditions_switches(self):
+        st = RoutingSettings(enabled=True, strategy="automatic", stability_threshold=0.15)
+        prof = RequestProfile(tier="simple", est_input_tokens=400, est_output_tokens=200)
+        decision = select_model(self._opts(), prof, current="deepseek-v4.1-flash",
+                                current_provider="p", settings=st)
+        assert decision.model == "big-pickle"  # the contrast that proves the strategy bites
+
+    def test_default_outside_the_pool_stays_primary(self):
+        # The operator's default (deepseek) is NOT in this pool. Under tool_calls_only it
+        # still holds the turn; the pool is for delegation, not replacement.
+        st = RoutingSettings(enabled=True, strategy="tool_calls_only", stability_threshold=0.15)
+        prof = RequestProfile(tier="simple", est_input_tokens=400, est_output_tokens=200)
+        pool = [ModelOption(name="big-pickle", provider="p", cost_in=0.01, cost_out=0.01,
+                            tier_rank=2, supports_tools=True, supports_vision=True,
+                            context_window=200_000),
+                ModelOption(name="glm-5.3-flash", provider="p", cost_in=0.20, cost_out=0.40,
+                            tier_rank=2, supports_tools=True, context_window=200_000)]
+        decision = select_model(pool, prof, current="deepseek-v4.1-flash",
+                                current_provider="p", settings=st)
+        assert decision.model == "deepseek-v4.1-flash"
+        assert decision.skip_reason == SKIP_ALREADY_CURRENT
+        assert "not in the routing pool" in decision.reason
+
+    def test_cli_flag_and_interactive_list_offer_it(self):
+        import inspect
+        import hermes_cli.subcommands.model as model_cli
+        source = inspect.getsource(model_cli)
+        assert "tool_calls_only" in source
 
 
 class TestValidatorFindings:

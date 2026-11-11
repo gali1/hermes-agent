@@ -63,7 +63,7 @@ def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
         sub.add_argument("--yes", "-y", action="store_true",
                          help="Skip the confirmation prompt (for scripts).")
         if name == "configure":
-            sub.add_argument("--strategy", choices=("automatic", "cost", "quality"), default=None)
+            sub.add_argument("--strategy", choices=("automatic", "cost", "quality", "tool_calls_only"), default=None)
             sub.add_argument("--threshold", type=float, default=None,
                              help="stability_threshold: improvement needed to switch (0-1).")
             sub.add_argument("--models", default=None,
@@ -373,7 +373,7 @@ def _routing_interactive() -> int:
             changes["models"] = [names[i] for i in picked]
             changes["preferred_models_only"] = True
     elif choice == 3:
-        strategies = ["automatic", "cost", "quality"]
+        strategies = ["automatic", "cost", "quality", "tool_calls_only"]
         current = str(block.get("strategy") or "automatic")
         idx = prompt_choice("Strategy?", strategies,
                             default=strategies.index(current) if current in strategies else 0)
