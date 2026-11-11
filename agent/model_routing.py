@@ -828,8 +828,15 @@ def _optional_price(info: Any, attr: str) -> Optional[float]:
     return price if price > 0 else None
 
 
-def options_from_config(cfg: Dict[str, Any]) -> List[ModelOption]:
-    """Build candidates from ``models: [{name, provider, ...}]``; malformed entries skipped.
+def options_from_config(cfg: Dict[str, Any], default_provider: str = "") -> List[ModelOption]:
+    """Build candidates from ``models: [{name, provider, ...}]`` or ``models: [name, ...]``.
+
+    Both shapes are valid: ``validate_routing_config`` describes the field as "a list of
+    model names", the CLI and ``--models`` write plain strings, and ``models[]`` entries as
+    dicts exist for per-model overrides. Reading only dicts made every saved selection
+    invisible to the engine -- the pool came back empty, selection fell through to the whole
+    provider catalog, and the interactive summary reported "87 eligible" seconds after the
+    user had picked three models. A name with no provider inherits *default_provider*.
 
     ``models[]`` is canonical, and a field stated on the entry always wins. A field the entry
     omits is filled from the models.dev entry for the same provider/model, so overriding just
@@ -842,12 +849,19 @@ def options_from_config(cfg: Dict[str, Any]) -> List[ModelOption]:
     if not isinstance(raw, (list, tuple)):
         return out
     for entry in raw:
+        if isinstance(entry, str):
+            text = entry.strip()
+            if not text:
+                continue
+            provider_part, sep, model_part = text.partition("/")
+            entry = {"name": model_part if sep else text,
+                     "provider": provider_part if sep else ""}
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or "").strip()
         if not name:
             continue
-        provider = str(entry.get("provider") or "").strip()
+        provider = str(entry.get("provider") or "").strip() or default_provider.strip()
         info = _catalog_info(provider, name)
         inputs = tuple(_catalog_attr(info, "input_modalities", ()) or ())
         outputs = tuple(_catalog_attr(info, "output_modalities", ()) or ())
@@ -1018,7 +1032,8 @@ def maybe_apply_model_routing(agent: Any, text: Any, *,
     if not st.enabled:
         return None
     try:
-        options = options_from_config(cfg)
+        options = options_from_config(
+            cfg, default_provider=str(getattr(agent, "provider", "") or ""))
         # A provider that lists exactly one model offers no choice: no catalog scan, no
         # routing decision — unless the operator wrote the key, which makes the intent explicit.
         if len(options) == 1 and not st.preferred_models_only_explicit:
@@ -1046,6 +1061,15 @@ def maybe_apply_model_routing(agent: Any, text: Any, *,
         if st.preferred_models_only and st.allow_tool_fallback and profile.needs_tools:
             fallback_options = options_from_catalog(str(getattr(agent, "provider", "") or ""))
         current_provider = getattr(agent, "provider", None)
+        # Never select a free model that already refused this window: the provider said no
+        # until the reset, so choosing it again would spend a turn to learn that again.
+        try:
+            from agent import free_model_guard
+            options, _dropped = free_model_guard.filter_exhausted(options, cfg)
+            if fallback_options:
+                fallback_options, _ = free_model_guard.filter_exhausted(fallback_options, cfg)
+        except Exception:
+            logger.debug("model routing: free-model guard unavailable", exc_info=True)
         decision = select_model(
             options, profile,
             current=getattr(agent, "model", None),
@@ -1071,6 +1095,28 @@ def maybe_apply_model_routing(agent: Any, text: Any, *,
         logger.warning("model routing failed; keeping the current model", exc_info=True)
         return None
 
+def _configured_model_names(config: Any) -> List[str]:
+    """Names from ``models`` in priority order, whichever shape the entries use."""
+    raw = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return []
+    names: List[str] = []
+    for entry in raw:
+        name = entry.get("name") if isinstance(entry, dict) else entry
+        name = str(name or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _free_guard_report(config: Any) -> Dict[str, Any]:
+    try:
+        from agent import free_model_guard
+        return free_model_guard.status(free_model_guard.guard_config(config))
+    except Exception:
+        return {}
+
+
 def explain_routing(
     config: Dict[str, Any],
     text: Any,
@@ -1092,11 +1138,21 @@ def explain_routing(
     st = parse_settings(config)
     prof = classify_request(text or "", has_images=has_images, has_audio=has_audio,
                             has_files=has_files, needs_tools=needs_tools)
-    cands = list(options) if options is not None else options_from_config(config)
+    cands = (list(options) if options is not None
+             else options_from_config(config, default_provider=provider))
     source = "config"
     if not cands:
         cands = options_from_catalog(provider)
         source = "catalog"
+    # A free model that already hit its limit this window must never be offered again: the
+    # provider has said no until the reset, so re-selecting it burns a turn. Applied after the
+    # catalog fallback too, otherwise an exhausted pool "falls back" straight onto the free
+    # model it just excluded.
+    try:
+        from agent import free_model_guard
+        cands, exhausted_skipped = free_model_guard.filter_exhausted(cands, config)
+    except Exception:
+        exhausted_skipped = []
     # §7.7: widen exactly as selection does, so the report cannot describe a pool the engine
     # would not have used. An explicit ``options`` list is widened against the same provider
     # catalog, because selection would do so too when the opt-in is on.
@@ -1180,6 +1236,12 @@ def explain_routing(
             and (not provider or not decision.provider or decision.provider == provider)),
         "eligible_count": len(ranked),
         "candidates": rows,
+        # What the operator actually configured, in priority order. The CLI needs this to
+        # show the pool it is routing within: "candidates: 4" alone never told anyone whether
+        # their selection had been applied.
+        "configured_models": _configured_model_names(config),
+        "exhausted_skipped": list(exhausted_skipped),
+        "free_guard": _free_guard_report(config),
     }
 
 

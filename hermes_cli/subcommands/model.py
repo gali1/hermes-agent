@@ -114,16 +114,9 @@ def cmd_model_routing_status(args) -> int:
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0
-    print(f"enabled: {str(report['enabled']).lower()}")
-    print(f"strategy: {report['settings']['strategy']} "
-          f"(stability_threshold={report['settings']['stability_threshold']})")
-    print(f"request tier: {report['request']['tier']}")
-    print(f"candidates: {report['eligible_count']} eligible "
-          f"from {report['candidate_source']}")
-    print(f"current: {report['current'] or '(unset)'}")
-    label = "would select" if report["enabled"] else "would select if enabled"
-    print(f"{label}: {report['selected'] or '(none)'}")
-    print(f"skip_reason: {report['skip_reason'] or '(switches)'}")
+    # One renderer for status and configure: two copies drifted, and the pool line landed in
+    # only one of them, so `status` kept reporting a count without the models behind it.
+    print(_render_routing(report))
     print(f"reason: {report['reason']}")
     return 0
 
@@ -150,10 +143,39 @@ def _render_routing(report) -> str:
         f"strategy: {report['settings']['strategy']} "
         f"(stability_threshold={report['settings']['stability_threshold']})",
         f"request tier: {report['request']['tier']}",
-        f"candidates: {report['eligible_count']} eligible from {report['candidate_source']}",
-        f"{label}: {report['selected'] or '(none)'}",
-        f"skip_reason: {report['skip_reason'] or '(switches)'}",
     ]
+    # Show the pool itself, not just its size. "candidates: 4" told nobody whether their
+    # selection had been applied; naming the models makes that answerable at a glance.
+    pool = report.get("configured_models") or []
+    if pool:
+        scope = "only these" if report["settings"].get("preferred_models_only") else "priority order"
+        lines.append(f"selected models ({len(pool)}, {scope}):")
+        for index, name in enumerate(pool, 1):
+            current = report.get("current") == name
+            lines.append(f"  {index}. {name}{'  ← current' if current else ''}")
+    else:
+        lines.append("selected models: all eligible from the provider catalog")
+    lines.append(f"candidates: {report['eligible_count']} eligible from {report['candidate_source']}")
+    lines.append(f"current: {report.get('current') or '(unset)'}")
+    lines.append(f"{label}: {report['selected'] or '(none)'}")
+    lines.append(f"skip_reason: {report['skip_reason'] or '(switches)'}")
+    if report.get("exhausted_skipped"):
+        lines.append(f"blocked this window (free-tier limit): {', '.join(report['exhausted_skipped'])}")
+    guard = report.get("free_guard") or {}
+    if guard.get("enabled"):
+        detail = f"free-model guard: on (window {guard.get('window')}, resets {guard.get('resets_at')}"
+        if guard.get("fallback"):
+            detail += f", fallback {guard['fallback']}"
+        detail += ")"
+        lines.append(detail)
+        for name in guard.get("exhausted") or []:
+            usage = (guard.get("usage") or {}).get(name) or {}
+            lines.append(f"  exhausted: {name} — {usage.get('requests', 0)} requests, "
+                         f"{usage.get('tokens', 0)} tokens before the limit")
+        counted = [(n, u) for n, u in (guard.get("usage") or {}).items() if u.get("requests")]
+        if counted:
+            lines.append("  usage today: " + ", ".join(
+                f"{n} ({u['requests']} req/{u['tokens']} tok)" for n, u in counted[:6]))
     if report.get("moa_active"):
         # Say it in words, not just as a skip_reason code: the selection shown above will not
         # happen while the fan-out is running, and a reader must not take it as a prediction.

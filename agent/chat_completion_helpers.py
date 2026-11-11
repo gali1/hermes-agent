@@ -2075,6 +2075,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    # A free model that just ran out of allowance is not a transient rate limit: waiting out a
+    # backoff cannot help, because the quota only returns at the reset. Switch to the operator's
+    # paid model now and block the free one for the rest of the window.
+    try:
+        from agent import free_model_guard
+        if free_model_guard.switch_off_exhausted(agent, reason):
+            return True
+    except Exception:
+        logger.debug("free-model guard: failover hook failed", exc_info=True)
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)

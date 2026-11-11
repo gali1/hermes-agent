@@ -100,6 +100,14 @@ def record_response_usage(
 
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
+    # Free-tier accounting: count the request and its tokens against the model's window, so the
+    # guard can tell "used a lot" from "provider said no" without guessing.
+    try:
+        from agent import free_model_guard
+        _guard_tokens = int(getattr(canonical_usage, "total_tokens", 0) or 0)
+        free_model_guard.record_usage(agent.model, agent.provider, _guard_tokens)
+    except Exception:
+        logger.debug("free-model guard: usage hook failed", exc_info=True)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage

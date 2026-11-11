@@ -260,8 +260,31 @@ class TestIncumbentIdentity:
 
 class TestConfigParsing:
     def test_malformed_entries_skipped(self):
+        # A bare string is a model NAME, not a malformed entry (see
+        # test_string_models_are_names). Only the non-dict, non-string junk and the
+        # empty name are dropped.
         opts = options_from_config({"models": [{"name": "ok"}, {"nope": 1}, "junk", {"name": ""}]})
-        assert [o.name for o in opts] == ["ok"]
+        assert [o.name for o in opts] == ["ok", "junk"]
+
+    def test_string_models_are_names(self):
+        """The CLI and --models write plain names; the engine must read them as candidates.
+
+        Regression: reading only dicts made a saved selection invisible -- the pool came
+        back empty, selection fell through to the whole provider catalog, and status
+        reported "87 eligible" immediately after three models had been chosen.
+        """
+        opts = options_from_config({"models": ["a", "b"]}, default_provider="p")
+        assert [o.name for o in opts] == ["a", "b"]
+        assert {o.provider for o in opts} == {"p"}
+
+    def test_string_model_with_provider_prefix(self):
+        opts = options_from_config({"models": ["prov/name"]}, default_provider="other")
+        assert [(o.provider, o.name) for o in opts] == [("prov", "name")]
+
+    def test_dict_entry_provider_wins_over_default(self):
+        opts = options_from_config({"models": [{"name": "m", "provider": "stated"}]},
+                                   default_provider="fallback")
+        assert opts[0].provider == "stated"
 
     def test_non_list_models(self):
         assert options_from_config({"models": "nope"}) == []
@@ -574,6 +597,62 @@ class TestConfigCatalogMerge:
         option = options_from_config({"models": [{"name": "ok"}]})[0]
         assert called == []
         assert option.cost_in == 0.0 and option.supports_tools is None
+
+
+class TestStringModelListRegression:
+    """A saved list of plain names must BE the candidate pool, not fall through to the catalog.
+
+    The CLI writes ``models: [name, name, ...]`` and ``preferred_models_only: true``. Reading
+    only dicts discarded all of them, so ``explain_routing`` reported the whole provider
+    catalog ("87 eligible ... would select gpt-5-nano") seconds after the user had saved three
+    models -- the UI was accurate about a decision the engine would never make.
+    """
+
+    @staticmethod
+    def _info():
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            context_window=200_000, max_output=8_000, cost_input=1.0, cost_output=2.0,
+            input_modalities=("text",), output_modalities=("text",),
+            tool_call=True, structured_output=True, reasoning=False, status="active")
+
+    def test_saved_names_are_the_pool(self, monkeypatch):
+        import agent.models_dev as models_dev
+        monkeypatch.setattr(models_dev, "get_model_info", lambda *a, **k: self._info())
+        # The catalog must never be consulted for the pool while a list is configured.
+        monkeypatch.setattr(models_dev, "list_provider_models",
+                            lambda *a, **k: ["catalog-a", "catalog-b", "catalog-c"])
+        picked = ["glm-5.3-flash-free", "gpt-6-luna", "muse-spark-1.3"]
+        cfg = {"enabled": True, "models": picked, "preferred_models_only": True}
+
+        report = explain_routing(cfg, "refactor this module and explain the reasoning",
+                                 provider="opencode-zen", current="deepseek-v4.1-flash")
+
+        assert report["candidate_source"] == "config"
+        assert report["eligible_count"] == 3
+        assert {row["model"] for row in report["candidates"]} == set(picked)
+        assert report["selected"] in picked
+        assert "catalog-a" not in {row["model"] for row in report["candidates"]}
+
+    def test_selection_survives_a_real_turn(self, monkeypatch):
+        """maybe_apply_model_routing must switch only within the configured pool."""
+        import agent.models_dev as models_dev
+        monkeypatch.setattr(models_dev, "get_model_info", lambda *a, **k: self._info())
+        monkeypatch.setattr(models_dev, "list_provider_models",
+                            lambda *a, **k: ["catalog-a"])
+        switched = []
+        monkeypatch.setattr("agent.agent_runtime_helpers.switch_model",
+                            lambda a, m, p: switched.append(m))
+        picked = ["glm-5.3-flash-free", "gpt-6-luna", "muse-spark-1.3"]
+        agent = _Agent(config={"smart_model_routing": {
+            "enabled": True, "models": picked, "preferred_models_only": True}},
+            model="deepseek-v4.1-flash", provider="opencode-zen")
+
+        decision = maybe_apply_model_routing(agent, "analyse this and explain the reasoning")
+
+        assert decision is not None
+        assert decision.model in picked
+        assert all(name in picked for name in switched)
 
 
 class TestValidatorFindings:
