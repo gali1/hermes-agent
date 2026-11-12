@@ -31,6 +31,11 @@ _CLASSIC_PAT_PREFIX = "ghp_"  # rejected by the Copilot API
 # to pass validation and then fail downstream with an opaque auth error (#12650).
 _SUPPORTED_PREFIXES = ("gho_", "github_pat_", "ghu_")
 COPILOT_ENV_VARS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
+# Hermes also reads these as *git* credentials (HTTPS push). A classic PAT there is a git token,
+# not a Copilot credential, so a value Copilot cannot use says nothing about a misconfiguration:
+# with GH_TOKEN and GITHUB_TOKEN both holding PATs, every cold start logged four "not supported"
+# warnings for a setup that pushes fine. Only COPILOT_GITHUB_TOKEN is an explicit Copilot intent.
+_SHARED_GIT_ENV_VARS = frozenset({"GH_TOKEN", "GITHUB_TOKEN"})
 _DEVICE_CODE_POLL_INTERVAL = 5  # seconds
 _DEVICE_CODE_POLL_SAFETY_MARGIN = 3  # seconds
 
@@ -68,6 +73,11 @@ def resolve_copilot_token() -> tuple[str, str]:
         valid, msg = validate_copilot_token(val)
         if valid:
             return val, env_var
+        if env_var in _SHARED_GIT_ENV_VARS:
+            # Not a Copilot credential (git uses this var): skip quietly and keep looking.
+            logger.debug("Ignoring token in %s (shared with git, unusable for Copilot): %s",
+                         env_var, msg)
+            continue
         logger.warning("Token from %s is not supported: %s", env_var, msg)
     # `gh auth token` fallback ONLY when no Copilot env var was set: an exported GITHUB_TOKEN
     # (even a classic PAT) means the user intends *that* token; skipping also avoids a slow
