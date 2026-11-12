@@ -1156,7 +1156,12 @@ class RekalEngine:
             seen_content_keys.add(ck)
             vec_dist = vec_scores.get(ck, 1.0)
             vec_norm = _normalize_vec(vec_dist)
-            days = _days_since(mem["created_at"])
+            # B11: freshness follows the last observation, not the original insert.
+            # last_reinforced_at was written on every corroboration and never read,
+            # so a fact confirmed yesterday still decayed from the day it was first
+            # captured. Falls back to created_at when the memory was never reinforced.
+            observed_at = mem.get("last_reinforced_at") or mem["created_at"]
+            days = _days_since(observed_at)
             rec_norm = _recency_score(days, weights["half_life"])
             acc_norm = _access_score(mem["access_count"])
             imp_boost = _importance_boost(mem["importance"])
@@ -1188,6 +1193,7 @@ class RekalEngine:
                 # which proof_norm() maps to exactly neutral (0.5), so repeated
                 # corroboration never changed the ranking.
                 "proof_count": mem["proof_count"],
+                "last_reinforced_at": mem.get("last_reinforced_at"),
                 "score": round(score, 4),
                 "fts_score": round(fts_norm, 3),
                 "vec_score": round(vec_norm, 3),

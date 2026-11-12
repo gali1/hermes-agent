@@ -427,3 +427,26 @@ def test_b12_batch_store_reinforces_duplicates(tmp_path):
     assert mixed["skipped"] == 1 and mixed["stored"] == 1
     contents = {r["content"] for r in eng.search("nightly", limit=5, project="p")["results"]}
     assert "Snapshots are taken nightly" in contents
+
+
+def test_b11_recency_follows_last_observation(tmp_path):
+    """A fact confirmed recently must not decay from its original capture date.
+
+    Regression pin for B11: last_reinforced_at was written on every corroboration
+    and never read, so recency was always measured from created_at.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    eng = make_engine(tmp_path)
+    stale = eng.store("Legacy endpoint is deprecated", project="p")["memory_id"]
+    untouched = eng.store("Legacy endpoint is still served", project="p")["memory_id"]
+
+    old = (datetime.now(timezone.utc) - timedelta(days=400)).strftime("%Y-%m-%d %H:%M:%S")
+    eng.db.execute("UPDATE memories SET created_at = ?", (old,))
+    eng.db.commit()
+
+    eng.store("Legacy endpoint is deprecated", project="p")     # corroborated today
+
+    rows = {r["id"]: r for r in eng.search("legacy", limit=10, project="p")["results"]}
+    assert rows[stale]["last_reinforced_at"] is not None
+    assert rows[stale]["recency_score"] > rows[untouched]["recency_score"]
