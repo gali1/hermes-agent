@@ -398,3 +398,32 @@ def test_b1_unreinforced_memory_stays_neutral(tmp_path):
     row = eng.search("widget", limit=5, project="p")["results"][0]
     assert row["proof_count"] == 1
     assert row["proof_score"] == 0.5
+
+
+def test_b12_batch_store_reinforces_duplicates(tmp_path):
+    """Re-observing a fact inside a batch must count as evidence, as store() does.
+
+    Regression pin for B12: batch_store's duplicate branch reported duplicate=True
+    but never touched proof_count, so bulk ingestion silently discarded every
+    corroboration while single store() calls recorded them.
+    """
+    eng = make_engine(tmp_path)
+    first = eng.batch_store([{"content": "Rollback is one command", "project": "p"}])
+    assert "duplicate" not in first["results"][0]
+    target = first["results"][0]["memory_id"]
+
+    for expected in (2, 3):
+        again = eng.batch_store([{"content": "Rollback is one command", "project": "p"}])
+        hit = again["results"][0]
+        assert hit["duplicate"] is True and hit["reinforced"] is True
+        assert hit["proof_count"] == expected
+        assert hit["memory_id"] == target
+
+    # the batch stays atomic and still stores genuinely new content alongside dupes
+    mixed = eng.batch_store([
+        {"content": "Rollback is one command", "project": "p"},
+        {"content": "Snapshots are taken nightly", "project": "p"},
+    ])
+    assert mixed["skipped"] == 1 and mixed["stored"] == 1
+    contents = {r["content"] for r in eng.search("nightly", limit=5, project="p")["results"]}
+    assert "Snapshots are taken nightly" in contents

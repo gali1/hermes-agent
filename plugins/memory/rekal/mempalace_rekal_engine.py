@@ -794,11 +794,29 @@ class RekalEngine:
                         "SELECT id FROM memories WHERE content_hash = ?", (chash,)
                     ).fetchone()
                     if existing:
-                        results.append({
+                        # B12: re-observing a fact inside a batch is evidence, exactly
+                        # as it is in store(). Mirrors _reinforce() but without its
+                        # commit(), because batch_store owns the surrounding transaction
+                        # and must stay atomic.
+                        self.db.execute(
+                            "UPDATE memories SET proof_count = COALESCE(proof_count, 1) + 1, "
+                            "last_reinforced_at = ? WHERE id = ?",
+                            (ts, existing["id"]),
+                        )
+                        strengthened = self.db.execute(
+                            "SELECT proof_count FROM memories WHERE id = ?",
+                            (existing["id"],),
+                        ).fetchone()
+                        self._cache.invalidate(existing["id"])
+                        batch_hit = {
                             "success": True,
                             "memory_id": existing["id"],
                             "duplicate": True,
-                        })
+                            "reinforced": True,
+                        }
+                        if strengthened is not None:
+                            batch_hit["proof_count"] = int(strengthened["proof_count"])
+                        results.append(batch_hit)
                         skipped += 1
                         continue
 
