@@ -1165,11 +1165,17 @@ class RekalEngine:
                 "created_at": mem["created_at"],
                 "updated_at": mem["updated_at"],
                 "access_count": mem["access_count"],
+                # B1: proof_count must travel with the candidate. The scorer reads
+                # entry["proof_count"] below; without this key it defaulted to 1,
+                # which proof_norm() maps to exactly neutral (0.5), so repeated
+                # corroboration never changed the ranking.
+                "proof_count": mem["proof_count"],
                 "score": round(score, 4),
                 "fts_score": round(fts_norm, 3),
                 "vec_score": round(vec_norm, 3),
                 "recency_score": round(rec_norm, 3),
                 "access_score": round(acc_norm, 3),
+                "proof_score": round(_hs.proof_norm(mem["proof_count"]), 3) if _hs else 0.5,
                 "source": "rekal",
             })
 

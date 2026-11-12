@@ -363,3 +363,38 @@ def test_advanced_retrieval_is_contained(tmp_path):
     eng.store("Scoped memory in another project", project="other")
     scoped = eng.search("memory", limit=10, project="other", fusion="rrf", graph_expand=True)
     assert all(r.get("project") in ("other", None) for r in scoped["results"])
+
+
+# ── B1: evidence accumulation must actually reach the scorer ──────────────
+
+def test_b1_proof_count_reaches_the_scorer(tmp_path):
+    """A reinforced memory must score above neutral.
+
+    Regression pin for B1: the scored candidate dict omitted proof_count, so the
+    scorer's entry.get("proof_count", 1) always saw 1 -> proof_norm(1) == 0.5.
+    Re-observing a fact therefore changed nothing about its ranking, even though
+    store() was recording the corroboration.
+    """
+    eng = make_engine(tmp_path)
+    first = eng.store("Retry uses exponential backoff", project="p")
+    target = first["memory_id"]
+    eng.store("Session storage uses SQLite WAL", project="p")
+
+    for _ in range(3):
+        again = eng.store("Retry uses exponential backoff", project="p")
+        assert again["duplicate"] is True and again["reinforced"] is True
+
+    row = next(r for r in eng.search("backoff", limit=5, project="p")["results"]
+               if r["id"] == target)
+    assert row["proof_count"] == 4
+    assert row["proof_score"] > 0.5, "reinforcement did not reach the scorer"
+
+
+def test_b1_unreinforced_memory_stays_neutral(tmp_path):
+    """One observation is neither rewarded nor penalised (proof_norm(1) == 0.5)."""
+    eng = make_engine(tmp_path)
+    eng.store("Widget cache warms on first request", project="p")
+
+    row = eng.search("widget", limit=5, project="p")["results"][0]
+    assert row["proof_count"] == 1
+    assert row["proof_score"] == 0.5
