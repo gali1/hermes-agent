@@ -217,6 +217,68 @@ def test_migrations_on_fresh_database(tmp_path):
     assert reopened.search("event date", limit=5)["results"]
 
 
+def test_migrations_on_existing_head_shape_database(tmp_path):
+    """The exact pre-change shape: B1/B12 evidence columns, no new columns."""
+    path = str(tmp_path / "head.db")
+    old = sqlite3.connect(path)
+    old.executescript(
+        """
+        CREATE TABLE memories (
+            id TEXT PRIMARY KEY, content TEXT NOT NULL, content_hash TEXT NOT NULL,
+            memory_type TEXT NOT NULL DEFAULT 'fact', project TEXT,
+            scope TEXT NOT NULL DEFAULT 'global', session_id TEXT NOT NULL DEFAULT '',
+            user_id TEXT NOT NULL DEFAULT '', wing TEXT, room TEXT,
+            tags TEXT NOT NULL DEFAULT '[]', importance REAL NOT NULL DEFAULT 0.5,
+            status TEXT NOT NULL DEFAULT 'active', valid_from TEXT, valid_until TEXT,
+            source TEXT, metadata TEXT NOT NULL DEFAULT '{}',
+            proof_count INTEGER NOT NULL DEFAULT 1, last_reinforced_at TEXT,
+            superseded_by TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            access_count INTEGER NOT NULL DEFAULT 0, last_accessed_at TEXT);
+        CREATE TABLE memory_links (
+            from_id TEXT NOT NULL, to_id TEXT NOT NULL, relation TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+            PRIMARY KEY (from_id, to_id, relation));
+        CREATE TABLE memory_config (
+            project TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+            PRIMARY KEY (project, key));
+        CREATE VIRTUAL TABLE memories_fts USING fts5(
+            content, tags, project, content='memories', content_rowid='rowid');
+        CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+            INSERT INTO memories_fts(rowid, content, tags, project)
+            VALUES (new.rowid, new.content, new.tags, new.project);
+        END;
+        INSERT INTO memories
+            (id, content, content_hash, memory_type, project, proof_count,
+             last_reinforced_at, created_at, updated_at)
+        VALUES ('head1', 'A memory written two commits before this change',
+                'hash-head1', 'fact', 'p', 3, '2026-10-01 00:00:00',
+                '2026-10-01 00:00:00', '2026-10-01 00:00:00');
+        """
+    )
+    old.commit()
+    old.close()
+
+    store = MemoryStore(path)
+    columns = _columns(store)
+    assert _NEW_COLUMNS <= columns
+    row = store.get("head1")
+    assert row["proof_count"] == 3          # existing evidence preserved
+    assert row["confidence"] == 0.5         # new column takes its default
+    assert row["occurred_start"] is None
+    assert row["occurred_end"] is None
+    # FTS still answers for the migrated row, and the hard filter falls back to
+    # store time because no event time exists.
+    assert store.search("two commits", limit=5)["results"]
+    assert {r["id"] for r in store.search(
+        "commits in 2026", limit=5, fusion="rrf", temporal=True, temporal_filter=True
+    )["results"]} == {"head1"}
+    # New writes work on the migrated file.
+    assert store.store("A brand new memory after the migration",
+                       occurred_start="2026-11-01 00:00:00")["success"]
+    store.close()
+    assert MemoryStore(path).get("head1")["proof_count"] == 3
+
+
 def test_migrations_on_pre_change_database(tmp_path):
     path = str(tmp_path / "legacy.db")
     old = sqlite3.connect(path)
