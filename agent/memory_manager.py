@@ -532,7 +532,7 @@ class MemoryManager:
         )
         if self.enhanced_enabled:
             try:
-                enhanced_ctx = self._enhanced.prefetch(clean_query, session_id=session_id)
+                enhanced_ctx = self._prefetch_enhanced(clean_query, session_id=session_id)
                 if enhanced_ctx and enhanced_ctx.strip():
                     parts.append(enhanced_ctx)
             except Exception as e:
@@ -584,6 +584,51 @@ class MemoryManager:
                 config=self._external_prefetch_spill_config,
             )
         return result
+
+    def _prefetch_enhanced(self, query: str, *, session_id: str = "") -> str:
+        """Run the enhanced store's prefetch under the same bound as external providers.
+
+        The enhanced backend used to be called inline, so a slow FTS5 query or a cold
+        embedding model blocked the whole turn with no ceiling, unlike every plugin
+        provider (which has been bounded since the 8s prefetch guard landed). It keeps
+        its own key in the in-flight table so one stuck query cannot stack up per turn.
+        Deliberately NOT routed through spill_if_oversized: its output has always been
+        injected verbatim, and changing that would alter what the model sees.
+        """
+        key = "enhanced"
+        if self._enhanced is None:
+            return ""
+        result_box: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                result_box["value"] = self._enhanced.prefetch(query, session_id=session_id) or ""
+            except Exception as exc:  # pragma: no cover - re-raised by caller
+                result_box["error"] = exc
+
+        thread = spawn_context_thread(_run, name="memory-prefetch-enhanced")
+        with self._external_prefetch_lock:
+            existing = self._external_prefetch_threads.get(key)
+            if existing is not None and existing.is_alive():
+                logger.debug("Enhanced memory prefetch is still running; skipping this turn")
+                return ""
+            self._external_prefetch_threads[key] = thread
+            thread.start()
+
+        thread.join(self._external_prefetch_timeout)
+        if thread.is_alive():
+            logger.warning(
+                "Enhanced memory prefetch timed out after %.1fs; skipping it until the stuck call returns",
+                self._external_prefetch_timeout,
+            )
+            return ""
+
+        with self._external_prefetch_lock:
+            if self._external_prefetch_threads.get(key) is thread:
+                self._external_prefetch_threads.pop(key, None)
+        if "error" in result_box:
+            raise result_box["error"]
+        return result_box.get("value", "")
 
     def describe_recall(self) -> str:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.
