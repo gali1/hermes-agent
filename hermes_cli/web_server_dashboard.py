@@ -538,6 +538,16 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
             "not be mounted",
             name, raw_api,
         )
+    # A plugin may ship a dashboard *API* (plugin_api.py) without shipping a UI
+    # bundle at all — lib-docs, done-bell and needs-you do exactly that: they are
+    # desktop-app UIs with a dashboard manifest. Defaulting ``entry`` to
+    # dist/index.js regardless made the SPA advertise a tab and then fail with
+    # "Could not load this plugin's script" on a path that never existed.
+    # Resolve the bundle here and report whether there is a UI to mount.
+    entry = data.get("entry", "dist/index.js")
+    has_ui = bool(entry) and (dashboard_dir / str(entry)).is_file()
+    if not has_ui:
+        tab_info["hidden"] = True
     return {
         "name": name,
         "label": data.get("label", name),
@@ -546,7 +556,8 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
         "version": data.get("version", "0.0.0"),
         "tab": tab_info,
         "slots": slots,
-        "entry": data.get("entry", "dist/index.js"),
+        "entry": entry,
+        "has_ui": has_ui,
         "css": data.get("css"),
         "has_api": bool(safe_api),
         "source": source,

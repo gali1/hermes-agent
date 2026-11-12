@@ -20,6 +20,8 @@ export interface PluginManifest {
   /** Declared for discovery; actual slots use registerSlot in the plugin bundle. */
   slots?: string[];
   entry: string;
+  /** False for API-only plugins: a dashboard manifest with no UI bundle on disk. */
+  has_ui?: boolean;
   css?: string | null;
   has_api: boolean;
   /**
