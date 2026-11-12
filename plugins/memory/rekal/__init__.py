@@ -6,29 +6,37 @@ OpenCode, kept verbatim apart from import/packaging shims.  This module is the
 Hermes integration layer that replaces OpenCode's bridge subprocess, TypeScript
 tool and session hooks:
 
-* one ``mempalace`` tool carrying the upstream operation set and result
-  formatting (``mempalace.ts`` / ``mempalace_bridge.py``),
+* a small set of narrowly scoped tools (``rekal_search``, ``rekal_remember``,
+  ``rekal_link``, ``rekal_overview``, ``rekal_ingest``, ``rekal_diary``) instead
+  of one 32-operation mega-tool.  Every LLM-facing action is additive or
+  read-only; maintenance (delete, deduplicate, FTS rebuild, migrations,
+  scoring config) lives behind :meth:`RekalMemoryProvider.internal_op` and is
+  never routable from ``handle_tool_call()``.
 * automatic recall through ``prefetch()`` using the upstream advanced retrieval
   path (rank fusion + graph expansion + temporal analysis),
 * automatic capture and conversation offloading through ``sync_turn()``,
   ``on_session_end()`` and ``on_pre_compress()``,
-* the upstream memory protocol as the tool description, plus the
-  ``<memory_system>`` trust block in the system prompt.
+* the upstream memory protocol as tool guidance, plus the ``<memory_system>``
+  trust block in the system prompt.
 
-MemPalace's own drawer/KG/diary operations are optional: when the ``mempalace``
-pip package is not installed those operations return a clean install hint and
-the zero-dependency Rekal engine keeps working.
+The diary is backed by the Rekal SQLite store (``rekal_diary`` table), so it
+works with zero optional dependencies.  MemPalace's own drawer / KG operations
+remain available but are internal: when the ``mempalace`` pip package is not
+installed they return a clean install hint and the zero-dependency Rekal engine
+keeps working.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 from plugins.memory.rekal.mempalace_rekal_engine import RekalEngine
@@ -49,7 +57,7 @@ _CONTEXT_STRIP_RE = re.compile(
 )
 
 # ---------------------------------------------------------------------------
-# MemPalace optional dependency (drawer / knowledge-graph / diary operations)
+# MemPalace optional dependency (drawer / knowledge-graph operations)
 # ---------------------------------------------------------------------------
 
 _MEMPALACE_IMPORT_ERROR: Optional[str] = None
@@ -167,6 +175,10 @@ def _is_trivial_message(text: str) -> bool:
     return bool(_TRIVIAL_RE.match((text or "").strip()))
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def _format_relative_time(iso_timestamp: str) -> str:
     try:
         dt = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
@@ -220,342 +232,342 @@ def _format_prefetch_context(results: List[Dict[str, Any]], max_results: int) ->
     return f"<mempalace_context>\n{intro}\n\n{body}\n</mempalace_context>"
 
 
+def _json_output(raw: Any) -> str:
+    return json.dumps(raw, indent=2, default=str)
+
+
+def _hit_payload(item: Dict[str, Any], max_content: int = 2000) -> Dict[str, Any]:
+    """Result row for the LLM surface: keep every scoring signal, drop empties."""
+    payload: Dict[str, Any] = {}
+    for key, value in item.items():
+        if value in (None, "", [], {}):
+            continue
+        if key == "content" and isinstance(value, str):
+            value = value[:max_content]
+        payload[key] = value
+    return payload
+
+
 # ---------------------------------------------------------------------------
-# Tool description — upstream mempalace.txt, verbatim
+# Store-backed diary (zero optional dependencies)
 # ---------------------------------------------------------------------------
+#
+# Upstream kept the journal inside the optional mempalace package, so diary
+# write/read were dead without it.  A diary entry is a journal line, not a
+# recall candidate: storing it in ``memories`` would pollute search results and
+# feed narrative text into contradiction detection.  It therefore gets its own
+# table in the same SQLite store, created idempotently on first use.
 
-_TOOL_DESCRIPTION = """SINGLE TOOL called "mempalace". Do NOT call operations below as separate tools — always call mempalace with the "operation" parameter set to the desired operation name.
+_DIARY_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS rekal_diary (
+        id TEXT PRIMARY KEY,
+        agent_name TEXT NOT NULL,
+        wing TEXT,
+        topic TEXT,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_rekal_diary_agent
+        ON rekal_diary(agent_name, created_at DESC)""",
+)
 
-Persistent AI memory system. You have two memory layers: the conversation prompt (short-term) and mempalace (long-term). Use them together to minimize token usage while maintaining full recall.
+_DIARY_COLUMNS = "id, agent_name, wing, topic, content, created_at"
 
-## HYBRID MEMORY PROTOCOL — Follow This Every Session
 
-### Phase 1: Session Bootstrap (MANDATORY — do first)
-Call session_init with your current task. This returns prior memories, recent diary entries, conflicts, and timeline in one call. Read the result before doing anything else.
+class _StoreDiary:
+    """Diary journal backed by the Rekal SQLite store."""
 
-If session_init is unavailable, call build_context instead.
+    def __init__(self, engine: RekalEngine):
+        self._engine = engine
+        self._ready = False
 
-### Phase 2: Active Work (during the session)
-While working, follow these rules:
+    # The engine owns the connection, its busy-retry helper and the commit
+    # protocol; the diary reuses them rather than opening a second writer.
+    def _execute(self, sql: str, params: Tuple[Any, ...] = ()) -> Any:
+        execute = getattr(self._engine, "_execute", None)
+        if callable(execute):
+            return execute(sql, params)
+        return self._engine.db.execute(sql, params)
 
-SHORT-TERM (stays in prompt):
-- Current user message and your response
-- Active file contents being edited
-- Tool outputs from the current task
-- Errors being debugged right now
+    def _commit(self) -> None:
+        self._engine.db.commit()
 
-LONG-TERM (goes to mempalace immediately):
-- User states a preference → memory_store(memory_type="preference")
-- Architecture or convention discovered → memory_store(memory_type="fact")
-- Decision made with reasoning → memory_store(memory_type="fact")
-- Bug with non-obvious cause → memory_store(memory_type="episode")
-- Procedure or workflow described → memory_store(memory_type="procedure")
-- Task completed or milestone reached → diary_write
+    def _ensure_schema(self) -> None:
+        if self._ready:
+            return
+        for statement in _DIARY_SCHEMA:
+            self._execute(statement)
+        self._commit()
+        self._ready = True
 
-### Phase 3: Missing Context Detection
-When you realize you're missing context:
-1. Check: is it in the current prompt? → Use it directly
-2. Not in prompt? → Call memory_recall (or build_context) to retrieve from mempalace
-3. Still not found? → Ask the user or use file tools
+    def write(self, agent_name: str, entry: str, topic: str = "general", wing: str = "") -> Dict[str, Any]:
+        self._ensure_schema()
+        entry_id = uuid.uuid4().hex[:16]
+        timestamp = _utc_now_iso()
+        self._execute(
+            f"INSERT INTO rekal_diary ({_DIARY_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?)",
+            (entry_id, agent_name, wing, topic, entry, timestamp),
+        )
+        self._commit()
+        return {
+            "success": True,
+            "entry_id": entry_id,
+            "agent": agent_name,
+            "topic": topic,
+            "timestamp": timestamp,
+        }
 
-NEVER guess when mempalace might have the answer. Query it.
+    def read(self, agent_name: str = "hermes", last_n: int = 10, wing: str = "") -> List[Dict[str, Any]]:
+        self._ensure_schema()
+        rows = self._execute(
+            f"""SELECT {_DIARY_COLUMNS} FROM rekal_diary
+                WHERE (? = '' OR agent_name = ?)
+                  AND (? = '' OR wing = ?)
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?""",
+            (agent_name, agent_name, wing, wing, last_n),
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "agent": row["agent_name"],
+                "wing": row["wing"],
+                "topic": row["topic"],
+                "content": row["content"],
+                "timestamp": row["created_at"],
+            }
+            for row in rows
+        ]
 
-### Phase 4: Conversation Offloading
-When conversation grows long (many turns), call ingest_turns to compress and store older conversation content. This preserves the knowledge without keeping it in the prompt.
 
-Call ingest_turns when:
-- Conversation exceeds ~15 turns
-- Switching to a different task within the same session
-- Before a complex multi-step operation that needs prompt space
-- User says "let's move on" or changes topic
+# ---------------------------------------------------------------------------
+# LLM-facing tool surface
+# ---------------------------------------------------------------------------
+#
+# Shape: several narrowly scoped tools, the same convention the other external
+# memory providers use (``retaindb_*``, ``brv_*``), with an ``action`` enum only
+# where a tool genuinely covers more than one verb.  Schemas are built from the
+# dispatch tables below, so ``get_tool_schemas()`` cannot advertise an action
+# that ``handle_tool_call()`` would refuse.
+#
+# INVARIANT: nothing in _TOOL_SPECS may be destructive or administrative.
+# delete / deduplicate / FTS rebuild / migrations / scoring config are in
+# _INTERNAL_OPERATIONS and are only reachable from internal_op() (CLI/tests).
 
-### Phase 5: Session End
-Before the session ends:
-1. Call ingest_turns for any un-stored conversation content
-2. Call diary_write summarizing what was accomplished
-3. Store any final decisions or discoveries via memory_store
+_MEMORY_TYPES = ["fact", "preference", "procedure", "context", "episode"]
+_LINK_RELATIONS = ["supersedes", "contradicts", "related_to"]
 
-## Operations
+_PARAM_SPECS: Dict[str, Dict[str, Any]] = {
+    "query": {"type": "string", "description": "What to look for."},
+    "memory_id": {"type": "string", "description": "Memory ID (from search/store output)."},
+    "limit": {"type": "number", "description": "Max results (default: 10, max: 50)."},
+    "project": {"type": "string", "description": "Optional project scope."},
+    "memory_type": {"type": "string", "enum": list(_MEMORY_TYPES), "description": "Filter or classify by type."},
+    "fusion": {"type": "string", "enum": ["rrf"], "description": "'rrf' combines retrieval arms by rank."},
+    "graph_expand": {"type": "boolean", "description": "Also return memories linked to the top hits."},
+    "temporal": {"type": "boolean", "description": "Read a time window out of the query and prefer that period."},
+    "strategy_boosts": {"type": "object", "description": "Per-strategy weight overrides."},
+    "content": {"type": "string", "description": "The fact/procedure/episode text to store (one self-contained statement)."},
+    "tags": {"type": "array", "items": {"type": "string"}, "description": "2-4 specific tags."},
+    "importance": {"type": "number", "description": "Importance 0-1 (default: 0.5)."},
+    "wing": {"type": "string", "description": "Storage wing (default: project)."},
+    "room": {"type": "string", "description": "Storage room (default: general)."},
+    "from_id": {"type": "string", "description": "Source memory ID."},
+    "to_id": {"type": "string", "description": "Target memory ID."},
+    "link_relation": {"type": "string", "enum": list(_LINK_RELATIONS), "description": "Relation to record (default: related_to)."},
+    "start": {"type": "string", "description": "ISO timestamp lower bound."},
+    "end": {"type": "string", "description": "ISO timestamp upper bound."},
+    "statement": {"type": "string", "description": "Optional claim to check against memory + knowledge graph."},
+    "turns": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Conversation turns to offload (strings, or objects with role/content).",
+    },
+    "entry": {"type": "string", "description": "Diary entry text."},
+    "topic": {"type": "string", "description": "Diary topic (default: general)."},
+    "agent_name": {"type": "string", "description": "Diary owner (default: hermes)."},
+}
 
-### Session lifecycle
-- session_init: Bootstrap a session. Returns relevant memories + diary + conflicts + timeline. CALL THIS FIRST.
-- build_context: Load relevant memories for a query. Use mid-session when switching tasks.
-- ingest_turns: Compress and store conversation turns into structured memories. Call periodically to offload prompt.
-- diary_write / diary_read: Session journal for continuity.
+_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
+    "rekal_search": {
+        "description": (
+            "Search Rekal long-term memory. ACTIONS:\n"
+            "• search — weighted keyword/vector/recency scoring; use when you want the plain ranking.\n"
+            "• recall — PREFERRED. Rank fusion across keyword/vector/graph/time, associative expansion through "
+            "links, and natural-language time windows ('yesterday', 'last week', 'March 2026'). Time words are "
+            "removed from the keyword match, so they never suppress results.\n"
+            "• get — fetch one memory by ID together with the memories it is linked to.\n\n"
+            "Search before storing, and recall stored context before answering questions about past work."
+        ),
+        "properties": (
+            "query", "memory_id", "limit", "project", "memory_type",
+            "fusion", "graph_expand", "temporal", "strategy_boosts",
+        ),
+        "actions": {"search": "_act_search", "recall": "_act_recall", "get": "_act_get"},
+        "required": ("action",),
+    },
+    "rekal_remember": {
+        "description": (
+            "Store a durable memory, or reinforce one you observed again. ACTIONS:\n"
+            "• store — one self-contained fact/preference/procedure/context/episode. Distil: no raw dialogue, "
+            "1-2 sentences, 2-4 specific tags. Re-storing identical content does not duplicate it; it raises that "
+            "memory's proof_count (repetition is evidence). Storing content that negates an existing memory records "
+            "a 'contradicts' link and returns it under `contradicts` — nothing is deleted.\n"
+            "• reinforce — record another independent observation of an existing memory by ID (raises proof_count).\n\n"
+            "Never store secrets, API keys or passwords."
+        ),
+        "properties": (
+            "content", "memory_id", "memory_type", "tags", "importance", "project", "wing", "room",
+        ),
+        "actions": {"store": "_act_store", "reinforce": "_act_reinforce"},
+        "required": ("action",),
+    },
+    "rekal_link": {
+        "description": (
+            "Connect two memories. Relations: related_to (association), contradicts (disagreement to review), "
+            "supersedes (from_id replaces to_id while to_id is kept). Pick supersedes rather than deleting an "
+            "outdated memory."
+        ),
+        "properties": ("from_id", "to_id", "link_relation"),
+        "handler": "_act_link",
+        "required": ("from_id", "to_id"),
+    },
+    "rekal_overview": {
+        "description": (
+            "Introspect the memory store. ACTIONS:\n"
+            "• timeline — recent memories in time order (optionally bounded by start/end).\n"
+            "• topics — memory-type distribution with counts.\n"
+            "• contradictions — contradicting memory pairs, or (when `statement` is given) a verdict on whether a "
+            "claim conflicts with what is stored. Check before storing a fact that might disagree with memory.\n"
+            "• stats — store statistics: totals, links, conflicts, duplicate groups, per-type/per-project counts."
+        ),
+        "properties": ("project", "start", "end", "limit", "statement"),
+        "actions": {
+            "timeline": "_act_timeline",
+            "topics": "_act_topics",
+            "contradictions": "_act_contradictions",
+            "stats": "_act_stats",
+        },
+        "required": ("action",),
+    },
+    "rekal_ingest": {
+        "description": (
+            "Offload conversation turns into long-term memory. Each turn is distilled into structured memories; "
+            "purely mechanical turns are skipped. Call when the conversation grows long (~15+ turns), when switching "
+            "tasks, or before a long multi-step operation that needs prompt space."
+        ),
+        "properties": ("turns", "content", "project", "wing", "room"),
+        "handler": "_act_ingest",
+        "required": (),
+    },
+    "rekal_diary": {
+        "description": (
+            "Session journal for continuity across sessions. ACTIONS:\n"
+            "• write — log what was accomplished, decisions taken, and what comes next.\n"
+            "• read — recent entries, newest first."
+        ),
+        "properties": ("entry", "topic", "limit", "wing", "agent_name"),
+        "actions": {"write": "_act_diary_write", "read": "_act_diary_read"},
+        "required": ("action",),
+    },
+}
 
-### MemPalace native (verbatim drawers)
-- search: Semantic search over stored drawers
-- store: File verbatim content into a wing/room
-- status, list_wings, list_rooms: Palace overview
-- kg_add, kg_query, kg_invalidate: Knowledge graph entity relationships
 
-### Rekal engine (structured memories with lifecycle)
-- memory_store: Store a typed, tagged memory. Pass memory_id-free content plus
-  memory_type, project, tags, importance (0-1).
-- memory_search: Hybrid search (BM25 + vector + recency) with configurable weights
-- memory_recall: PREFERRED for retrieval. Same store, stronger ranking — rank
-  fusion across keyword/vector/graph/time, associative expansion through links,
-  and natural-language time windows. Use this when you want the best answer and
-  memory_search when you need the exact legacy scoring.
-- memory_update: Edit an existing memory (requires memory_id)
-- memory_supersede: Replace a memory while preserving history (requires old_id).
-  ALWAYS prefer over delete+store.
-- memory_delete: Remove a memory (requires memory_id)
-- memory_link: Connect memories (from_id, to_id, link_relation)
-- memory_conflicts: Find contradicting pairs
-- memory_health: Database statistics
-- memory_similar, memory_topics, memory_timeline, memory_related: Introspection
-- set_config: Per-project scoring weights (project, key, value)
+def _build_tool_schema(tool_name: str, spec: Dict[str, Any], param_specs: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    properties: Dict[str, Any] = {}
+    actions = spec.get("actions") or {}
+    if actions:
+        properties["action"] = {
+            "type": "string",
+            "enum": list(actions),
+            "description": "Which action to perform.",
+        }
+    for name in spec["properties"]:
+        properties[name] = copy.deepcopy(param_specs[name])
+    required: List[str] = list(spec.get("required") or ())
+    if actions and "action" not in required:
+        required.insert(0, "action")
+    return {
+        "name": tool_name,
+        "description": spec["description"],
+        "parameters": {"type": "object", "properties": properties, "required": required},
+    }
 
-### Retrieval tuning (memory_recall / memory_search)
-- fusion="rrf": combine retrieval strategies by rank instead of raw score.
-- graph_expand=true: also return memories linked to the top hits, even when they
-  match neither the text nor the vector query. This is how you recover context
-  that uses different vocabulary than your question.
-- temporal=true: read a time window out of the query ("yesterday", "last week",
-  "March 2026", "3 days ago") and prefer memories from that period. The time
-  words are removed from the keyword match, so they never suppress results.
 
-### Evidence and contradictions (automatic)
-- Storing content that already exists does not create a duplicate; it increments
-  that memory's proof_count. Repeatedly observed facts rank higher. Do not try
-  to avoid re-storing something you have seen again — the repetition is signal.
-- Storing content that negates an existing memory automatically records a
-  `contradicts` link and returns it under `contradicts`. Nothing is deleted:
-  review the pair and call memory_supersede if the new statement wins.
+TOOL_SCHEMAS: Tuple[Dict[str, Any], ...] = tuple(
+    _build_tool_schema(name, spec, _PARAM_SPECS) for name, spec in _TOOL_SPECS.items()
+)
 
-### Verification
-- contradiction_check: Check before storing new facts
-- fact_check: Validate a claim against KG + memory
-- multi_hop: Find indirect entity relationships
+# The complete LLM-facing action set, for tests and for the CLI to diff against.
+# Actionless tools appear as (tool, None).
+LLM_ACTIONS: Tuple[Tuple[str, Optional[str]], ...] = tuple(
+    (tool, action)
+    for tool, spec in _TOOL_SPECS.items()
+    for action in ((tuple(spec["actions"]) if spec.get("actions") else (None,)))
+)
 
-## Storing Rules
 
-### ALWAYS search before storing
-1. mempalace operation=memory_recall query="<topic>" limit=5
-2. Duplicate exists → skip
-3. Same topic, outdated → memory_supersede(old_id, content)
-4. No match → memory_store(content, memory_type, tags)
+# ---------------------------------------------------------------------------
+# Internal / CLI-only operations (never reachable from handle_tool_call)
+# ---------------------------------------------------------------------------
+#
+# Everything the old mega-tool exposed, including maintenance. These are
+# destructive or administrative and must not be model-callable: deleting
+# memories, hard-deleting duplicate rows, rebuilding FTS, running migrations and
+# rewriting per-project scoring weights all belong to an operator.
 
-### Distill before storing
-NEVER store raw dialogue. Extract the durable fact, compress.
-Drop: articles, filler, hedging. Keep: technical terms, proper nouns, reasons.
-One memory = one fact, 1-2 sentences.
-
-### memory_type: fact | preference | procedure | context | episode
-### tags: 2-4 specific tags, never generic
-
-## Token Optimization Strategy
-
-As conversation grows:
-1. Early turns (1-10): Everything fits in prompt. Store decisions/preferences to mempalace as they occur.
-2. Mid conversation (10-20): Call ingest_turns on turns 1-10. Prompt keeps only recent turns + session_init context.
-3. Long conversation (20+): Call ingest_turns again. Rely heavily on memory_search for historical context. Prompt holds only current task + last few turns.
-
-The goal: a 100-turn conversation should use roughly the same prompt tokens as a 10-turn conversation, because the first 90 turns are in mempalace and retrievable on demand.
-
-## What NOT to Store
-- Transient state ("currently editing X")
-- Trivially re-discoverable facts (line numbers)
-- Vague platitudes ("user likes clean code")
-- Secrets, API keys, passwords — never
-- Content already in the current prompt (wasteful duplication)
-
-## Validation
-NEVER blindly trust retrieved memory. Cross-reference against current file state when uncertain. If memory contradicts current code, trust the code.
-"""
+_INTERNAL_OPERATIONS: Dict[str, str] = {
+    # Retrieval / introspection (same capability as the LLM surface, kept for CLI parity)
+    "build_context": "_op_build_context",
+    "contradiction_check": "_op_contradiction_check",
+    "fact_check": "_op_fact_check",
+    "ingest_turns": "_op_ingest_turns",
+    "memory_conflicts": "_op_memory_conflicts",
+    "memory_health": "_op_memory_health",
+    "memory_link": "_op_memory_link",
+    "memory_recall": "_op_memory_recall",
+    "memory_related": "_op_memory_related",
+    "memory_search": "_op_memory_search",
+    "memory_similar": "_op_memory_similar",
+    "memory_store": "_op_memory_store",
+    "memory_timeline": "_op_memory_timeline",
+    "memory_topics": "_op_memory_topics",
+    "multi_hop": "_op_multi_hop",
+    "session_init": "_op_session_init",
+    # Journal (store-backed since C1)
+    "diary_write": "_op_diary_write",
+    "diary_read": "_op_diary_read",
+    # MemPalace-native drawers / knowledge graph (optional dependency)
+    "search": "_op_search",
+    "smart_search": "_op_smart_search",
+    "store": "_op_store",
+    "status": "_op_status",
+    "list_wings": "_op_list_wings",
+    "list_rooms": "_op_list_rooms",
+    "kg_add": "_op_kg_add",
+    "kg_query": "_op_kg_query",
+    "kg_invalidate": "_op_kg_invalidate",
+    # Mutation / maintenance — operator only
+    "memory_update": "_op_memory_update",
+    "memory_supersede": "_op_memory_supersede",
+    "memory_delete": "_op_memory_delete",
+    "deduplicate": "_op_deduplicate",
+    "consolidate": "_op_deduplicate",   # no non-destructive consolidate exists yet; dry-run unless apply=true
+    "rebuild_fts": "_op_rebuild_fts",
+    "migrate": "_op_migrate",
+    "set_config": "_op_set_config",
+}
 
 _SYSTEM_PROMPT_BLOCK = """<memory_system>
-You have access to MemPalace — a persistent, local memory system that survives across sessions.
+You have access to Rekal — a persistent, local memory system that survives across sessions.
 Relevant memories from previous sessions may be automatically injected into your context inside <mempalace_context> tags.
 
 Rules for using retrieved memories:
 - NEVER blindly trust retrieved memory. Always validate against current file state and session context.
 - If a memory contradicts current code or files, trust the code — the memory may be stale.
-- Use the mempalace tool explicitly when you need to store important decisions, search for specific history, or manage the knowledge graph.
+- Use rekal_search / rekal_remember / rekal_link / rekal_overview / rekal_ingest / rekal_diary when you need to store important decisions, search for specific history, or connect related knowledge.
 - Significant discoveries, architecture decisions, and resolved bugs are automatically stored after each response.
-- You can proactively store or search memory using the mempalace tool when automatic retrieval is insufficient.
 </memory_system>"""
-
-# ---------------------------------------------------------------------------
-# Tool schema — upstream mempalace.ts parameter contract
-# ---------------------------------------------------------------------------
-
-_OPERATIONS = [
-    "search", "smart_search", "store", "status", "list_wings", "list_rooms",
-    "kg_add", "kg_query", "kg_invalidate", "contradiction_check", "fact_check",
-    "multi_hop", "diary_write", "diary_read", "build_context", "ingest_turns",
-    "memory_conflicts", "memory_delete", "memory_health", "memory_link",
-    "memory_recall", "memory_related", "memory_search", "memory_similar",
-    "memory_store", "memory_supersede", "memory_timeline", "memory_topics",
-    "memory_update", "session_init", "set_config",
-]
-
-_MEMORY_TYPES = ["fact", "preference", "procedure", "context", "episode"]
-_LINK_RELATIONS = ["supersedes", "contradicts", "related_to"]
-
-MEMPALACE_SCHEMA = {
-    "name": "mempalace",
-    "description": _TOOL_DESCRIPTION,
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "operation": {
-                "type": "string",
-                "enum": list(_OPERATIONS),
-                "description": "The operation to perform.",
-            },
-            "query": {"type": "string"},
-            "content": {"type": "string"},
-            "wing": {"type": "string"},
-            "room": {"type": "string"},
-            "drawer": {"type": "string"},
-            "tags": {"type": "array", "items": {"type": "string"}},
-            "limit": {"type": "number"},
-            "entity": {"type": "string"},
-            "relation": {"type": "string"},
-            "target": {"type": "string"},
-            "confidence": {"type": "number"},
-            "entry": {"type": "string"},
-            "depth": {"type": "number"},
-            "agent_name": {"type": "string"},
-            "statement": {"type": "string"},
-            "claim": {"type": "string"},
-            "expand_with_kg": {"type": "boolean"},
-            "memory_id": {"type": "string"},
-            "old_id": {"type": "string"},
-            "from_id": {"type": "string"},
-            "to_id": {"type": "string"},
-            "link_relation": {"type": "string", "enum": list(_LINK_RELATIONS)},
-            "memory_type": {"type": "string", "enum": list(_MEMORY_TYPES)},
-            "project": {"type": "string"},
-            "importance": {"type": "number"},
-            "fusion": {"type": "string", "enum": ["rrf"]},
-            "graph_expand": {"type": "boolean"},
-            "temporal": {"type": "boolean"},
-            "strategy_boosts": {"type": "object"},
-            "turns": {"type": "array", "items": {"type": "string"}},
-            "topic": {"type": "string"},
-            "task": {"type": "string"},
-            "start": {"type": "string"},
-            "end": {"type": "string"},
-            "as_of": {"type": "string"},
-            "direction": {"type": "string", "enum": ["in", "out", "both"]},
-            "valid_from": {"type": "string"},
-            "ended": {"type": "string"},
-            "key": {"type": "string"},
-            "value": {"type": "number"},
-            "w_fts": {"type": "number"},
-            "w_vec": {"type": "number"},
-            "w_recency": {"type": "number"},
-            "w_access": {"type": "number"},
-            "half_life": {"type": "number"},
-        },
-        "required": ["operation"],
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# Result formatting — upstream mempalace.ts switch
-# ---------------------------------------------------------------------------
-
-def _json_output(raw: Any) -> str:
-    return json.dumps(raw, indent=2, default=str)
-
-
-def _format_search_results(data: Any, adaptive: bool = False) -> str:
-    envelope = data if isinstance(data, dict) else {}
-    results = envelope.get("results") or []
-
-    if not results:
-        return "No memories found matching your query."
-
-    header_parts: List[str] = []
-    if adaptive:
-        if envelope.get("total_drawers"):
-            header_parts.append(f"Palace: {envelope['total_drawers']} drawers")
-        if envelope.get("adaptive_k"):
-            header_parts.append(f"Candidates scanned: {envelope['adaptive_k']}")
-        if envelope.get("kg_expanded"):
-            header_parts.append("Query expanded via KG")
-    header = (" | ".join(header_parts) + "\n\n") if header_parts else ""
-
-    formatted = []
-    for i, r in enumerate(results):
-        r = r if isinstance(r, dict) else {}
-        similarity = f"{r['similarity']:.3f}" if isinstance(r.get("similarity"), (int, float)) else "?"
-        bm25 = f"{r['bm25_score']:.2f}" if isinstance(r.get("bm25_score"), (int, float)) else ""
-        wing = r.get("wing") or "unknown"
-        room = r.get("room") or "unknown"
-        source = r.get("source_file") or ""
-        created = r.get("created_at") or ""
-        text = r.get("text") or ""
-        via = r.get("matched_via") or "drawer"
-
-        line = f"[{i + 1}] sim={similarity}"
-        if bm25:
-            line += f" bm25={bm25}"
-        if adaptive and isinstance(r.get("adaptive_score"), (int, float)):
-            line += f" adaptive={r['adaptive_score']:.3f}"
-        if adaptive and isinstance(r.get("recency_score"), (int, float)):
-            line += f" recency={r['recency_score']:.2f}"
-        line += f" | {wing}/{room}"
-        if source and source != "?":
-            line += f" | {source}"
-        if created and created != "unknown":
-            line += f" | {created}"
-        line += f" ({via})"
-
-        formatted.append(f"{line}\n    {str(text)[:2000]}")
-
-    return header + "\n\n".join(formatted)
-
-
-def _format_memory_recall(data: Any) -> str:
-    envelope = data if isinstance(data, dict) else {}
-    results = envelope.get("results") or []
-    retrieval = envelope.get("retrieval") or {}
-
-    arms = retrieval.get("arms")
-    window = retrieval.get("temporal_window")
-    header = " | ".join(
-        part
-        for part in (
-            f"mode: {retrieval.get('mode') or 'unknown'}",
-            f"arms: {', '.join(arms)}" if isinstance(arms, list) else "",
-            f"graph-expanded: {retrieval['graph_expanded']}" if retrieval.get("graph_expanded") else "",
-            f"window: {' .. '.join(window)}" if isinstance(window, list) else "",
-        )
-        if part
-    )
-
-    lines = [header, ""]
-    for i, r in enumerate(results):
-        r = r if isinstance(r, dict) else {}
-        try:
-            score = float(r.get("score") or 0)
-        except (TypeError, ValueError):
-            score = 0.0
-        try:
-            proof = float(r.get("proof_count") or 0)
-        except (TypeError, ValueError):
-            proof = 0.0
-        signals = " ".join(
-            signal
-            for signal in (
-                f"score={score:.4f}",
-                f"rrf#{r['rrf_rank']}" if r.get("rrf_rank") else "",
-                f"graph={r['graph_score']}" if r.get("graph_score") else "",
-                f"temporal={r['temporal_score']}" if r.get("temporal_score") else "",
-                f"proof={r['proof_count']}" if proof > 1 else "",
-                f"via={r['via']}" if r.get("via") else "",
-            )
-            if signal
-        )
-        lines.append(f"[{i + 1}] {signals}\n{str(r.get('content') or '')[:2000]}")
-
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +578,7 @@ class RekalMemoryProvider(MemoryProvider):
     def __init__(self):
         self._config = _default_config()
         self._engine: Optional[RekalEngine] = None
+        self._diary: Optional[_StoreDiary] = None
         self._hermes_home = ""
         self._session_id = ""
         self._turn_count = 0
@@ -644,6 +657,7 @@ class RekalMemoryProvider(MemoryProvider):
             kg=_kg,
             search_memories_fn=_search_memories,
         )
+        self._diary = _StoreDiary(self._engine)
 
         self._auto_recall = self._config["auto_recall"]
         self._auto_capture = self._config["auto_capture"]
@@ -792,32 +806,80 @@ class RekalMemoryProvider(MemoryProvider):
                 self._engine.close()
             except Exception:
                 logger.debug("Rekal close failed", exc_info=True)
+        self._diary = None
         self._active = False
 
     # -- Tool surface ------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [MEMPALACE_SCHEMA]
+        return [dict(schema) for schema in TOOL_SCHEMAS]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        if tool_name != "mempalace":
-            return tool_error(f"Unknown tool: {tool_name}")
+        spec = _TOOL_SPECS.get(tool_name)
+        if spec is None:
+            known = ", ".join(_TOOL_SPECS)
+            return tool_error(f"Unknown tool: {tool_name}. Rekal tools: {known}")
         if not self._active or not self._engine:
             return tool_error("Rekal is not initialized")
 
-        operation = str(args.get("operation") or "").strip()
-        handler = getattr(self, f"_op_{operation}", None) if operation else None
-        if handler is None:
-            valid = ", ".join(sorted(_OPERATIONS))
-            return tool_error(f"Unknown operation: {operation}. Valid: {valid}")
+        args = args or {}
+        actions = spec.get("actions") or {}
+        if actions:
+            action = str(args.get("action") or "").strip()
+            if action not in actions:
+                valid = ", ".join(actions)
+                return tool_error(
+                    f"Unknown action for {tool_name}: {action or '<missing>'}. Valid actions: {valid}"
+                )
+            handler_name = actions[action]
+        else:
+            action = tool_name
+            handler_name = spec["handler"]
+
+        # Dispatch ONLY through the spec table above: never getattr on a
+        # caller-supplied operation name, or internal maintenance would be
+        # reachable again.
+        handler = getattr(self, handler_name, None)
+        if handler is None:  # schema/handler drift must fail closed, not silently
+            logger.error("rekal: %s advertises action '%s' with no handler %s", tool_name, action, handler_name)
+            return tool_error(f"{tool_name} action '{action}' is unavailable in this build")
 
         try:
             return handler(args)
+        except ValueError as exc:
+            return tool_error(str(exc))
         except Exception as exc:
-            logger.debug("mempalace operation '%s' failed", operation, exc_info=True)
-            return tool_error(f"MemPalace operation '{operation}' failed: {exc}")
+            logger.debug("rekal %s/%s failed", tool_name, action, exc_info=True)
+            return tool_error(f"Rekal {tool_name} '{action}' failed: {exc}")
 
-    # -- Operation helpers -------------------------------------------------
+    def internal_op(self, operation: str, **args: Any) -> str:
+        """Run a maintenance/administrative operation (CLI + tests only).
+
+        Deliberately unreachable from ``handle_tool_call``: destructive and
+        administrative operations must never be model-callable.
+        """
+        handler_name = _INTERNAL_OPERATIONS.get(operation)
+        if handler_name is None:
+            valid = ", ".join(sorted(_INTERNAL_OPERATIONS))
+            return tool_error(f"Unknown internal operation: {operation}. Valid: {valid}")
+        if not self._active or not self._engine:
+            return tool_error("Rekal is not initialized")
+        handler = getattr(self, handler_name, None)
+        if handler is None:  # pragma: no cover - table is static
+            return tool_error(f"Internal operation '{operation}' has no handler")
+        try:
+            return handler(args)
+        except ValueError as exc:
+            return tool_error(str(exc))
+        except Exception as exc:
+            logger.debug("rekal internal op %s failed", operation, exc_info=True)
+            return tool_error(f"Internal operation '{operation}' failed: {exc}")
+
+    @staticmethod
+    def internal_operations() -> List[str]:
+        return sorted(_INTERNAL_OPERATIONS)
+
+    # -- Argument helpers --------------------------------------------------
 
     @staticmethod
     def _int_arg(args: Dict[str, Any], key: str, default: int) -> int:
@@ -826,7 +888,235 @@ class RekalMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             return default
 
-    # -- MemPalace native operations --------------------------------------
+    def _limit_arg(self, args: Dict[str, Any], default: int = 10) -> int:
+        return max(1, min(50, self._int_arg(args, "limit", default)))
+
+    @staticmethod
+    def _require_arg(args: Dict[str, Any], key: str) -> str:
+        value = str(args.get(key) or "").strip()
+        if not value:
+            raise ValueError(f"{key} is required")
+        return value
+
+    # -- LLM actions: search / remember / link / overview / ingest / diary --
+
+    def _search_envelope(self, args: Dict[str, Any], *, advanced: bool) -> Dict[str, Any]:
+        query = self._require_arg(args, "query")
+        kwargs: Dict[str, Any] = {
+            "limit": self._limit_arg(args, 10),
+            "project": args.get("project"),
+            "memory_type": args.get("memory_type"),
+            "strategy_boosts": args.get("strategy_boosts"),
+        }
+        if advanced:
+            kwargs["fusion"] = args.get("fusion") or "rrf"
+            kwargs["graph_expand"] = _as_bool(args.get("graph_expand"), True)
+            kwargs["temporal"] = _as_bool(args.get("temporal"), True)
+        else:
+            kwargs["fusion"] = args.get("fusion")
+            kwargs["graph_expand"] = args.get("graph_expand")
+            kwargs["temporal"] = args.get("temporal")
+
+        envelope = self._engine.search(query, **kwargs)
+        results = envelope.get("results", []) if isinstance(envelope, dict) else []
+        payload: Dict[str, Any] = {
+            "results": [_hit_payload(hit) for hit in results],
+            "count": len(results),
+        }
+        if isinstance(envelope, dict) and envelope.get("retrieval"):
+            payload["retrieval"] = envelope["retrieval"]
+        return payload
+
+    def _act_search(self, args: Dict[str, Any]) -> str:
+        return _json_output(self._search_envelope(args, advanced=False))
+
+    def _act_recall(self, args: Dict[str, Any]) -> str:
+        return _json_output(self._search_envelope(args, advanced=True))
+
+    def _act_get(self, args: Dict[str, Any]) -> str:
+        memory_id = self._require_arg(args, "memory_id")
+        memory = self._engine.get(memory_id)
+        if not memory:
+            return tool_error(f"Memory not found: {memory_id}")
+        payload = _hit_payload(memory)
+        try:
+            payload["links"] = self._engine.related(memory_id)
+        except Exception:
+            logger.debug("rekal get: related() failed for %s", memory_id, exc_info=True)
+        return _json_output(payload)
+
+    def _act_store(self, args: Dict[str, Any]) -> str:
+        content = self._require_arg(args, "content")
+        memory_type = str(args.get("memory_type") or "fact").strip()
+        if memory_type not in _MEMORY_TYPES:
+            raise ValueError(f"memory_type must be one of: {', '.join(_MEMORY_TYPES)}")
+        tags = args.get("tags")
+        if tags is not None and not isinstance(tags, list):
+            tags = [str(tags)]
+        try:
+            importance = float(args.get("importance", 0.5))
+        except (TypeError, ValueError):
+            importance = 0.5
+        raw = self._engine.store(
+            content=content,
+            memory_type=memory_type,
+            project=args.get("project"),
+            wing=args.get("wing"),
+            room=args.get("room"),
+            tags=tags,
+            importance=max(0.0, min(1.0, importance)),
+        )
+        return _json_output(raw)
+
+    def _act_reinforce(self, args: Dict[str, Any]) -> str:
+        memory_id = self._require_arg(args, "memory_id")
+        reinforce = getattr(self._engine, "reinforce", None) or getattr(self._engine, "_reinforce", None)
+        if not callable(reinforce):
+            return tool_error("This Rekal store does not support reinforcement")
+        proof_count = reinforce(memory_id)
+        if proof_count is None:
+            return tool_error(f"Memory not found (or store too old to reinforce): {memory_id}")
+        return _json_output({
+            "success": True,
+            "memory_id": memory_id,
+            "proof_count": proof_count,
+        })
+
+    def _act_link(self, args: Dict[str, Any]) -> str:
+        from_id = self._require_arg(args, "from_id")
+        to_id = self._require_arg(args, "to_id")
+        relation = str(args.get("link_relation") or "related_to").strip()
+        if relation not in _LINK_RELATIONS:
+            raise ValueError(f"link_relation must be one of: {', '.join(_LINK_RELATIONS)}")
+        raw = self._engine.link(from_id=from_id, to_id=to_id, relation=relation)
+        if isinstance(raw, dict) and raw.get("error"):
+            return tool_error(str(raw["error"]))
+        return _json_output(raw)
+
+    def _act_timeline(self, args: Dict[str, Any]) -> str:
+        rows = self._engine.timeline(
+            project=args.get("project"),
+            start=args.get("start"),
+            end=args.get("end"),
+            limit=self._limit_arg(args, 20),
+        )
+        return _json_output({
+            "results": [_hit_payload(row, max_content=400) for row in rows],
+            "count": len(rows),
+        })
+
+    def _act_topics(self, args: Dict[str, Any]) -> str:
+        topics = self._engine.topics(project=args.get("project"))
+        return _json_output({"topics": topics, "count": len(topics)})
+
+    def _act_contradictions(self, args: Dict[str, Any]) -> str:
+        statement = str(args.get("statement") or "").strip()
+        if statement:
+            return _json_output(self._engine.contradiction_check(statement))
+        conflicts = self._engine.get_conflicts(project=args.get("project"))
+        return _json_output({"conflicts": conflicts, "count": len(conflicts)})
+
+    def _act_stats(self, args: Dict[str, Any]) -> str:
+        return _json_output(self._engine.health())
+
+    def _act_ingest(self, args: Dict[str, Any]) -> str:
+        turns = args.get("turns")
+        if turns is None:
+            turns = args.get("content", "")
+        if isinstance(turns, list):
+            normalized: List[Any] = []
+            for item in turns:
+                if isinstance(item, dict):
+                    normalized.append(item)
+                else:
+                    normalized.append({"role": "mixed", "content": str(item)})
+            turns = normalized
+        if not turns:
+            raise ValueError("turns is required")
+        raw = self._engine.ingest_turns(
+            turns=turns,
+            project=args.get("project"),
+            wing=args.get("wing"),
+            room=args.get("room"),
+        )
+        return _json_output(raw)
+
+    def _diary_store(self) -> _StoreDiary:
+        if self._diary is None:
+            if self._engine is None:
+                raise RuntimeError("Rekal diary is not initialized")
+            self._diary = _StoreDiary(self._engine)
+        return self._diary
+
+    def _act_diary_write(self, args: Dict[str, Any]) -> str:
+        entry = self._require_arg(args, "entry")
+        raw = self._diary_store().write(
+            agent_name=str(args.get("agent_name") or "hermes"),
+            entry=entry,
+            topic=str(args.get("topic") or "general"),
+            wing=str(args.get("wing") or ""),
+        )
+        return _json_output(raw)
+
+    def _act_diary_read(self, args: Dict[str, Any]) -> str:
+        entries = self._diary_store().read(
+            agent_name=str(args.get("agent_name") or "hermes"),
+            last_n=self._limit_arg(args, 10),
+            wing=str(args.get("wing") or ""),
+        )
+        return _json_output({"entries": entries, "count": len(entries)})
+
+    # -- Result formatting for MemPalace-native operations ------------------
+
+    @staticmethod
+    def _format_search_results(data: Any, adaptive: bool = False) -> str:
+        envelope = data if isinstance(data, dict) else {}
+        results = envelope.get("results") or []
+
+        if not results:
+            return "No memories found matching your query."
+
+        header_parts: List[str] = []
+        if adaptive:
+            if envelope.get("total_drawers"):
+                header_parts.append(f"Palace: {envelope['total_drawers']} drawers")
+            if envelope.get("adaptive_k"):
+                header_parts.append(f"Candidates scanned: {envelope['adaptive_k']}")
+            if envelope.get("kg_expanded"):
+                header_parts.append("Query expanded via KG")
+        header = (" | ".join(header_parts) + "\n\n") if header_parts else ""
+
+        formatted = []
+        for i, r in enumerate(results):
+            r = r if isinstance(r, dict) else {}
+            similarity = f"{r['similarity']:.3f}" if isinstance(r.get("similarity"), (int, float)) else "?"
+            bm25 = f"{r['bm25_score']:.2f}" if isinstance(r.get("bm25_score"), (int, float)) else ""
+            wing = r.get("wing") or "unknown"
+            room = r.get("room") or "unknown"
+            source = r.get("source_file") or ""
+            created = r.get("created_at") or ""
+            text = r.get("text") or ""
+            via = r.get("matched_via") or "drawer"
+
+            line = f"[{i + 1}] sim={similarity}"
+            if bm25:
+                line += f" bm25={bm25}"
+            if adaptive and isinstance(r.get("adaptive_score"), (int, float)):
+                line += f" adaptive={r['adaptive_score']:.3f}"
+            if adaptive and isinstance(r.get("recency_score"), (int, float)):
+                line += f" recency={r['recency_score']:.2f}"
+            line += f" | {wing}/{room}"
+            if source and source != "?":
+                line += f" | {source}"
+            if created and created != "unknown":
+                line += f" | {created}"
+            line += f" ({via})"
+
+            formatted.append(f"{line}\n    {str(text)[:2000]}")
+
+        return header + "\n\n".join(formatted)
+
+    # -- Internal: MemPalace native operations ------------------------------
 
     def _op_search(self, args: Dict[str, Any]) -> str:
         _require_mempalace()
@@ -836,7 +1126,7 @@ class RekalMemoryProvider(MemoryProvider):
             wing=args.get("wing") or None,
             room=args.get("room") or None,
         )
-        return _format_search_results(raw)
+        return self._format_search_results(raw)
 
     def _op_smart_search(self, args: Dict[str, Any]) -> str:
         _require_mempalace()
@@ -853,7 +1143,7 @@ class RekalMemoryProvider(MemoryProvider):
             wing=args.get("wing") or None,
             room=args.get("room") or None,
         )
-        return _format_search_results(raw, adaptive=True)
+        return self._format_search_results(raw, adaptive=True)
 
     def _op_store(self, args: Dict[str, Any]) -> str:
         _require_mempalace()
@@ -902,7 +1192,6 @@ class RekalMemoryProvider(MemoryProvider):
         raw = _mcp_mod.tool_list_rooms(wing=args.get("wing") or None)
         raw = raw if isinstance(raw, dict) else {}
         rooms = raw.get("rooms")
-        wing_name = raw.get("wing") or args.get("wing") or "all"
         if isinstance(rooms, dict) and rooms:
             return "\n".join(f"{name}: {count} drawers" for name, count in rooms.items())
         return "No rooms found."
@@ -962,42 +1251,18 @@ class RekalMemoryProvider(MemoryProvider):
         return f"Invalidated: {fact}"
 
     def _op_diary_write(self, args: Dict[str, Any]) -> str:
-        _require_mempalace()
-        raw = _mcp_mod.tool_diary_write(
-            agent_name=args.get("agent_name", "hermes"),
-            entry=args.get("entry", ""),
-            topic=args.get("topic", "general"),
-            wing=args.get("wing", ""),
-        )
-        if isinstance(raw, dict) and raw.get("success") is False:
-            return f"Failed: {raw.get('error') or 'unknown error'}"
-        raw = raw if isinstance(raw, dict) else {}
-        return (
-            "Diary entry logged.\n"
-            f"  ID: {raw.get('entry_id', '?')}\n"
-            f"  Agent: {raw.get('agent', args.get('agent_name', 'hermes'))}\n"
-            f"  Time: {raw.get('timestamp', '?')}"
-        )
+        """Journal write — store-backed, so mempalace is not required.
+
+        Kept under the legacy operation name so CLI callers keep working; the
+        result carries the same fields the bridge used (entry_id/agent/timestamp).
+        """
+        return self._act_diary_write(args)
 
     def _op_diary_read(self, args: Dict[str, Any]) -> str:
-        _require_mempalace()
-        raw = _mcp_mod.tool_diary_read(
-            agent_name=args.get("agent_name", "hermes"),
-            last_n=self._int_arg(args, "limit", 10),
-            wing=args.get("wing", ""),
-        )
-        raw = raw if isinstance(raw, dict) else {}
-        entries = raw.get("entries") or []
-        if not entries:
-            return raw.get("message") or "No diary entries found."
-        blocks = []
-        for entry in entries:
-            entry = entry if isinstance(entry, dict) else {}
-            timestamp = entry.get("timestamp") or entry.get("date") or "?"
-            blocks.append(f"[{timestamp}] ({entry.get('topic', 'general')})\n{entry.get('content', '')}")
-        return "\n\n".join(blocks)
+        """Journal read — store-backed, so mempalace is not required."""
+        return self._act_diary_read(args)
 
-    # -- Rekal engine operations -------------------------------------------
+    # -- Internal: Rekal engine operations ----------------------------------
 
     def _op_memory_store(self, args: Dict[str, Any]) -> str:
         raw = self._engine.store(
@@ -1043,7 +1308,7 @@ class RekalMemoryProvider(MemoryProvider):
             temporal=args.get("temporal", True),
             strategy_boosts=args.get("strategy_boosts"),
         )
-        return _format_memory_recall(raw)
+        return _json_output(raw)
 
     def _op_memory_update(self, args: Dict[str, Any]) -> str:
         raw = self._engine.update(
@@ -1067,7 +1332,7 @@ class RekalMemoryProvider(MemoryProvider):
         return _json_output(raw)
 
     def _op_memory_delete(self, args: Dict[str, Any]) -> str:
-        raw = self._engine.delete(memory_id=args.get("memory_id", ""))
+        raw = self._engine.delete(memory_id=self._require_arg(args, "memory_id"))
         return _json_output(raw)
 
     def _op_memory_link(self, args: Dict[str, Any]) -> str:
@@ -1124,52 +1389,10 @@ class RekalMemoryProvider(MemoryProvider):
             statement=args.get("statement", args.get("content", "")),
             entity=args.get("entity"),
         )
-        contradictions = raw.get("contradictions") or [] if isinstance(raw, dict) else []
-        verdict = raw.get("verdict", "unknown") if isinstance(raw, dict) else "unknown"
-        lines = [
-            f"Statement: {raw.get('statement') or args.get('statement') or '?'}",
-            f"Verdict: {verdict}",
-            "Entities checked: "
-            + (", ".join(raw.get("entities_checked") or []) or "none"),
-        ]
-        if contradictions:
-            lines.append("")
-            lines.append("Contradictions:")
-            for c in contradictions:
-                c = c if isinstance(c, dict) else {}
-                lines.append(f"  [{c.get('type')}] confidence={c.get('confidence')} — {c.get('reason')}")
-                lines.append(f"    Fact: {c.get('fact')}")
-        return "\n".join(lines)
+        return _json_output(raw)
 
     def _op_fact_check(self, args: Dict[str, Any]) -> str:
-        raw = self._engine.fact_check(claim=args.get("claim", args.get("content", "")))
-        raw = raw if isinstance(raw, dict) else {}
-        verdict = raw.get("verdict", "unknown")
-        confidence = raw.get("confidence", 0)
-        supporting = raw.get("supporting_evidence") or []
-        contradicting = raw.get("contradicting_evidence") or []
-        lines = [
-            f"Claim: {raw.get('claim') or args.get('claim') or '?'}",
-            f"Verdict: {verdict}",
-            f"Confidence: {confidence}",
-            "Entities: " + (", ".join(raw.get("entities") or []) or "none"),
-        ]
-        if supporting:
-            lines.append("")
-            lines.append("Supporting evidence:")
-            for s in supporting:
-                s = s if isinstance(s, dict) else {}
-                if s.get("fact"):
-                    lines.append(f"  [{s.get('type')}] {s['fact']}")
-                elif s.get("text"):
-                    lines.append(f"  [{s.get('type')}] sim={s.get('similarity')} — {s['text']}")
-        if contradicting:
-            lines.append("")
-            lines.append("Contradicting evidence:")
-            for c in contradicting:
-                c = c if isinstance(c, dict) else {}
-                lines.append(f"  [{c.get('type')}] confidence={c.get('confidence')} — {c.get('reason')}")
-        return "\n".join(lines)
+        return _json_output(self._engine.fact_check(claim=args.get("claim", args.get("content", ""))))
 
     def _op_multi_hop(self, args: Dict[str, Any]) -> str:
         raw = self._engine.multi_hop(
@@ -1177,35 +1400,7 @@ class RekalMemoryProvider(MemoryProvider):
             target_entity=args.get("target"),
             max_hops=self._int_arg(args, "depth", 3),
         )
-        raw = raw if isinstance(raw, dict) else {}
-        if raw.get("error"):
-            return f"Failed: {raw['error']}"
-        paths = raw.get("paths") or []
-        lines = [
-            f"Start: {raw.get('start') or args.get('entity')}",
-        ]
-        if raw.get("target"):
-            lines.append(f"Target: {raw['target']}")
-        lines.append(f"Max hops: {raw.get('max_hops', args.get('depth', 3))}")
-        lines.append(f"Nodes explored: {raw.get('graph_explored', '?')}")
-        if paths:
-            lines.append("")
-            lines.append("Paths found:")
-            for p in paths:
-                p = p if isinstance(p, dict) else {}
-                path_arr = p.get("path") or []
-                lines.append(f"  [{p.get('hops')} hops] {' '.join(str(x) for x in path_arr)}")
-        elif raw.get("target"):
-            lines.append("")
-            lines.append(
-                f"No path found from {raw.get('start')} to {raw['target']} "
-                f"within {raw.get('max_hops')} hops."
-            )
-        reachable = raw.get("reachable") or []
-        if reachable:
-            lines.append("")
-            lines.append(f"Reachable entities ({len(reachable)}): {', '.join(str(x) for x in reachable)}")
-        return "\n".join(lines)
+        return _json_output(raw)
 
     def _op_set_config(self, args: Dict[str, Any]) -> str:
         project = args.get("project")
@@ -1243,6 +1438,30 @@ class RekalMemoryProvider(MemoryProvider):
             room=args.get("room"),
         )
         return _json_output(raw)
+
+    # -- Internal: maintenance (destructive/administrative) -----------------
+
+    def _op_deduplicate(self, args: Dict[str, Any]) -> str:
+        """Hard-deletes duplicate rows. Dry-run unless ``apply`` is explicitly true."""
+        apply = _as_bool(args.get("apply"), False)
+        raw = self._engine.deduplicate(project=args.get("project"), dry_run=not apply)
+        return _json_output(raw)
+
+    def _op_rebuild_fts(self, args: Dict[str, Any]) -> str:
+        try:
+            self._engine._execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            self._engine.db.commit()
+            cache = getattr(self._engine, "_cache", None)
+            if cache is not None and hasattr(cache, "clear"):
+                cache.clear()
+        except Exception as exc:
+            return _json_output({"success": False, "error": str(exc)})
+        return _json_output({"success": True, "rebuilt": True})
+
+    def _op_migrate(self, args: Dict[str, Any]) -> str:
+        self._engine._run_migrations()
+        self._engine._repair_fts_if_needed()
+        return _json_output({"success": True, "migrated": True})
 
 
 def register(ctx):
