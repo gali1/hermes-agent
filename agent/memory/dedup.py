@@ -74,3 +74,36 @@ def is_duplicate(a, b, threshold=0.97):
     if norm_a == norm_b:
         return True
     return trigram_similarity(norm_a, norm_b) >= threshold
+
+
+def find_near_duplicate(text, candidates, threshold=0.97):
+    """Best near-duplicate of ``text`` among ``(key, candidate_text)`` pairs.
+
+    Returns ``(key, similarity)`` for the most similar candidate at or above
+    ``threshold``, or None.  Callers own the candidate bound (the store passes
+    one project's most recent N rows); this function only decides which of that
+    bounded set matches, so there is exactly one definition of "near duplicate"
+    in the codebase.
+
+    Degenerate candidates are skipped rather than compared: a punctuation-only
+    row is not evidence of anything, and at short lengths its trigram set can
+    look deceptively similar to real content.
+    """
+    if not isinstance(text, str) or is_degenerate(text):
+        return None
+    norm_text = normalize_content(text)
+    if not norm_text:
+        return None
+    best = None
+    for key, candidate in candidates:
+        if not isinstance(candidate, str) or is_degenerate(candidate):
+            continue
+        norm_candidate = normalize_content(candidate)
+        if not norm_candidate:
+            continue
+        if norm_candidate == norm_text:
+            return key, 1.0
+        similarity = trigram_similarity(norm_text, norm_candidate)
+        if similarity >= threshold and (best is None or similarity > best[1]):
+            best = (key, similarity)
+    return best
