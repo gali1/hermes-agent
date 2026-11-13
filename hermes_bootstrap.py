@@ -224,6 +224,39 @@ def install_happy_eyeballs_socket_connect() -> None:
         sys.meta_path.insert(0, _Urllib3ConnectionPatcher())
 
 
+def _apply_windows_no_console_children() -> None:
+    """Default non-interactive Windows children to CREATE_NO_WINDOW.
+
+    Every console-attached child makes conhost churn on the console that hosts the
+    interactive CLI. Under that churn the console window hosting the session drops
+    WS_VISIBLE: the PowerShell window disappears mid-turn while still owning the
+    foreground (``IsIconic`` stays false, which is why it looks like a minimize and
+    why hovering the taskbar brings it back). Children whose stdout/stderr are pipes
+    or DEVNULL are never talking to the user, so they get no console at all.
+    Interactive spawns (a TTY on stdout or stderr) are left exactly as they were.
+    """
+    import subprocess
+
+    _CREATE_NO_WINDOW = 0x08000000
+    original = subprocess.Popen.__init__
+    if getattr(original, "_hermes_no_window_default", False):
+        return
+
+    def _popen_init(self, *args, **kwargs):
+        try:
+            if not kwargs.get("creationflags"):
+                pipe, devnull = subprocess.PIPE, subprocess.DEVNULL
+                stdio = (kwargs.get("stdout"), kwargs.get("stderr"))
+                if kwargs.get("capture_output") or any(s is pipe or s is devnull for s in stdio):
+                    kwargs["creationflags"] = _CREATE_NO_WINDOW
+        except Exception:
+            pass  # a caller's odd kwargs must never break process creation
+        original(self, *args, **kwargs)
+
+    _popen_init._hermes_no_window_default = True  # type: ignore[attr-defined]
+    subprocess.Popen.__init__ = _popen_init  # type: ignore[method-assign]
+
+
 def apply_windows_utf8_bootstrap() -> bool:
     """Apply the Windows UTF-8 bootstrap once; True only when it was applied this call."""
     global _bootstrap_applied
@@ -249,6 +282,7 @@ def apply_windows_utf8_bootstrap() -> bool:
         except (OSError, ValueError):
             pass  # closed, or replaced with something non-reconfigurable
 
+    _apply_windows_no_console_children()
     _bootstrap_applied = True
     return True
 
@@ -620,3 +654,7 @@ if not _pm_repair:
             raise SystemExit(1) from None
 install_happy_eyeballs_socket_connect()
 export_scratch_tmp_env()
+if _IS_WINDOWS:
+    # Entry points that import this module without calling apply_windows_utf8_bootstrap()
+    # still need console-safe children; the patch is idempotent.
+    _apply_windows_no_console_children()
