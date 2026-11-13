@@ -227,11 +227,27 @@ _DIRECT_SURFACE_TOOLSETS = CLIENT_SURFACE_TOOLSETS | TOOLSET_SESSION_PLATFORMS.k
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
+def _ambient_toolset(name: str) -> bool:
+    """True when a tool's toolset is registered ambient on the host registry (fail-closed)."""
+    try:
+        from tools.registry import registry as _registry
+        toolset = _registry_toolset(name)
+        return bool(toolset) and _registry.is_ambient_toolset(toolset)
+    except Exception:
+        return False
+
+
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
     plugin tool). Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    # An ambient toolset is the plugin's declaration that its tools must be reachable in
+    # EVERY session (toolaria's rescuer_fetch redeems handles its hook created everywhere).
+    # A tool_search stub is not reachability: the tool must stay on the direct surface, for
+    # the same reason ``clarify`` does.
+    if _ambient_toolset(name):
         return False
     if defer_tools is not None and name in defer_tools:
         return True
