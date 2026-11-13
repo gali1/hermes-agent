@@ -1228,6 +1228,22 @@ def _sess_nowait(params, rid):
         return (s, None)
     # Stale runtime id (reaped/evicted/TTL): the client should session.resume the STORED id. Logged so
     # "message vanished" reads as "arrived and was rejected".
+    method = _current_rpc_method.get() or "?"
+    # A runtime this gateway itself reaped moments ago is a teardown RACE, not a stuck client: a 5s
+    # background poll (process.list / approval.pending) was already in flight when the teardown the
+    # same client asked for landed, so it arrives just after. The client recovers through the 4001
+    # latch, and warning "client should resume the stored session" for it is a false alarm that trains
+    # the operator to ignore the log. Only an id we do NOT remember reaping — never held, or evicted
+    # long ago — still warns: that one really is a client parked on a dead runtime.
+    reaped_age = None
+    with contextlib.suppress(Exception):
+        from tui_gateway.session_lifecycle import recently_reaped_session
+        reaped_age = recently_reaped_session(sid)
+    if reaped_age is not None:
+        logger.info("session-scoped RPC raced its own teardown: method=%s session_id=%r reaped %.2fs ago "
+                    "(poll lost to session.new/close; 4001 lets the client latch), rid=%r",
+                    method, sid, reaped_age, rid)
+        return (None, _err(rid, 4001, "session not found"))
     logger.warning("session-scoped RPC rejected: method=%s session_id=%r not in memory "
                    # A session-scoped RPC hit a runtime id the gateway no longer holds (detached on WS
                    # disconnect and orphan-reaped, LRU-evicted, or torn down after an idle TTL). The client
@@ -1236,7 +1252,7 @@ def _sess_nowait(params, rid):
                    # class returned a silent 4001. Log it so a "message vanished" report is diagnosable as
                    # "request arrived and was rejected" instead of "request never arrived" (see #90428).
                    "(detached/reaped runtime; client should resume the stored session), rid=%r",
-                   _current_rpc_method.get() or "?", sid, rid)
+                   method, sid, rid)
     return (None, _err(rid, 4001, "session not found"))
 
 
