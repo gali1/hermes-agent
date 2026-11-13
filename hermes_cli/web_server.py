@@ -20,6 +20,7 @@ import sys
 import sysconfig
 import threading
 import time
+import traceback
 import urllib.parse
 
 from hermes_cli.install_identity import get_install_id as _shared_get_install_id
@@ -1518,15 +1519,53 @@ def _on_server_started(
     _hb_interval = 2.0
     _hb_stall_threshold = 5.0
     _hb_loop = asyncio.get_running_loop()
+    _hb_state: Dict[str, Any] = {"beat": _hb_loop.time(), "reported": False, "stack": ""}
 
     def _loop_heartbeat(expected: float) -> None:
         now = _hb_loop.time()
         drift = now - expected
         if drift > _hb_stall_threshold:
-            _log.warning("event loop stalled %.1fs (GIL pressure suspected)", drift)
+            stack = _hb_state.get("stack") or ""
+            _hb_state["reported"] = False
+            _log.warning(
+                "event loop stalled %.1fs%s", drift,
+                stack or " (no stack sampled — the loop thread was inside a C call for the whole window)",
+            )
+        _hb_state["beat"] = now
         _hb_loop.call_later(_hb_interval, _loop_heartbeat, now + _hb_interval)
 
     _hb_loop.call_later(_hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval)
+
+    # Stall stack capture: the heartbeat can only report the drift AFTER the loop resumes, by which
+    # time the blocking frame is gone — so the warning said "GIL pressure suspected" and nothing else.
+    # A daemon thread samples the loop thread's stack while it is still stuck, so the same warning
+    # names the call that held the loop (2026-11-12: memory-wiki's /overview building the wiki from a
+    # 348MB state.db, 12.1s).
+    def _stall_watch(loop_thread_ident: int, state: Dict[str, Any]) -> None:
+        while True:
+            time.sleep(0.25)
+            try:
+                if _hb_loop.time() - float(state.get("beat") or 0.0) <= _hb_stall_threshold:
+                    continue
+                if state.get("reported"):
+                    continue
+                frame = sys._current_frames().get(loop_thread_ident)
+                state["stack"] = (
+                    "\n  event loop thread was blocked in:\n"
+                    + "".join(traceback.format_stack(frame)).rstrip()
+                    if frame is not None else ""
+                )
+                state["reported"] = True
+            except Exception:  # a watchdog that raises would only lose the next report
+                return
+
+    try:
+        threading.Thread(
+            target=_stall_watch, args=(threading.get_ident(), _hb_state),
+            name="loop-stall-watch", daemon=True,
+        ).start()
+    except Exception:
+        _log.debug("loop stall watchdog failed to start", exc_info=True)
 
 
 def _windows_serve_loop_factory(config):

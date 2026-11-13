@@ -440,8 +440,9 @@ def build_monitor_application(monitor, **kwargs):
 def _request_queue_edit(cli) -> None:
     """Hand a Ctrl+E taken in the monitor back to the composer editor.
 
-    The monitor is a full-screen app: its bindings replace the composer's while it is open, so the
-    keystroke is replayed against ``cli._app`` — the REPL application that owns the composer.
+    ``build_monitor_application`` exits with ``result='queue-edit'`` because the monitor is a
+    full-screen app: its bindings replace the composer's for as long as it is open. Replaying the
+    keystroke against ``cli._app`` — the REPL application — does exactly what Ctrl+E does there.
     """
     from types import SimpleNamespace
     app = getattr(cli, "_app", None)

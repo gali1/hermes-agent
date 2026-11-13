@@ -4,12 +4,20 @@ from __future__ import annotations
 
 from typing import Callable
 
+from hermes_cli.subcommands._shared import add_yes_flag
 
-def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
+
+def build_model_parser(
+    subparsers, *, cmd_model: Callable, cmd_model_routing: Callable | None = None
+) -> None:
     """Attach the ``model`` subcommand to ``subparsers``."""
     model_parser = subparsers.add_parser(
-        "model", help="Select default model and provider",
-        description="Interactively select your inference provider and default model")
+        "model", help="Select default model and provider, or configure dynamic model routing",
+        description=(
+            "Interactively select your inference provider and default model.\n\n"
+            "`hermes model routing` inspects or changes dynamic model selection\n"
+            "(smart_model_routing); `hermes model routing configure` edits it."
+        ))
     model_parser.add_argument(
         "--refresh", action="store_true",
         help="Wipe the model picker disk cache and re-fetch every provider's live /v1/models list.")
@@ -34,54 +42,358 @@ def build_model_parser(subparsers, *, cmd_model: Callable) -> None:
         "--insecure", action="store_true",
         help="Disable TLS verification for Nous login (testing only)")
     model_parser.set_defaults(func=cmd_model)
-    # ``hermes model`` alone stays the interactive picker; the optional subcommands are
-    # diagnostics that must never fall through to it.
-    model_subs = model_parser.add_subparsers(dest="model_command", metavar="<command>")
-    routing_parser = model_subs.add_parser(
-        "routing", help="Inspect dynamic model routing (smart_model_routing)")
-    routing_parser.set_defaults(func=cmd_model_routing_status)
-    routing_subs = routing_parser.add_subparsers(dest="routing_command", metavar="<command>")
-    status_parser = routing_subs.add_parser(
-        "status",
-        help="Report the routing contract and the model the next turn would pick",
-        description="Read-only. Never switches the model, never writes config.")
-    status_parser.add_argument(
-        "--json", action="store_true", help="Emit the full routing report as JSON.")
-    status_parser.add_argument(
-        "--text", default=None,
-        help="Prompt to classify (default: a representative probe prompt).")
-    status_parser.set_defaults(func=cmd_model_routing_status)
 
-    # State-changing subcommands. Every one goes through _routing_apply so the CLI, the setup
-    # wizard and the gateway share a single read/validate/preview/write path.
-    for name, help_text in (
-        ("enable", "Turn routing on (shows the preview and asks for confirmation)."),
-        ("disable", "Turn routing off; the single-model setting takes over again."),
-        ("configure", "Set routing options non-interactively."),
-    ):
-        sub = routing_subs.add_parser(name, help=help_text)
-        sub.add_argument("--yes", "-y", action="store_true",
-                         help="Skip the confirmation prompt (for scripts).")
-        if name == "configure":
-            sub.add_argument("--strategy", choices=("automatic", "cost", "quality", "tool_calls_only"), default=None)
-            sub.add_argument("--threshold", type=float, default=None,
-                             help="stability_threshold: improvement needed to switch (0-1).")
-            sub.add_argument("--models", default=None,
-                             help="Comma-separated model names; empty string means all eligible.")
-            sub.add_argument("--all-eligible", action="store_true",
-                             help="Route across the whole catalog (same as --models '').")
-            sub.add_argument("--selected-only", action="store_true",
-                             help="Route only among the models in --models.")
-            sub.add_argument("--allow-unknown-metadata", dest="allow_unknown", default=None,
-                             action="store_true")
-            sub.add_argument("--strict-metadata", dest="allow_unknown", action="store_false",
-                             help="Treat unknown capability metadata as unsupported.")
-            sub.add_argument("--cost-optimization", dest="cost_opt", default=None,
-                             action="store_true")
-            sub.add_argument("--no-cost-optimization", dest="cost_opt", action="store_false")
-        sub.set_defaults(func=cmd_model_routing_enable if name == "enable"
-                         else cmd_model_routing_disable if name == "disable"
-                         else cmd_model_routing_configure)
+    # -------------------------------------------------------------------------
+    # model routing — dynamic model selection (smart_model_routing)
+    # -------------------------------------------------------------------------
+    # Additive: `hermes model` and its flags still reach the interactive picker,
+    # so an untouched install keeps its exact CLI surface.  The handler is
+    # injected (falling back to a lazy import) so this module never imports main.
+    if cmd_model_routing is None:
+
+        def _lazy_routing(args):  # noqa: ANN001 - injected handler shape
+            from hermes_cli.main import cmd_model_routing as _handler
+
+            return _handler(args)
+
+        routing_handler = _lazy_routing
+    else:
+        routing_handler = cmd_model_routing
+
+    model_sub = model_parser.add_subparsers(dest="model_command")
+    routing_parser = model_sub.add_parser(
+        "routing",
+        help="Inspect or change dynamic model selection",
+        description=(
+            "Dynamic model selection (smart_model_routing) picks the cheapest "
+            "model that can actually serve each request.\n\n"
+            "Off by default: while disabled no model is ever switched and the "
+            "agent behaves exactly as before."
+        ),
+    )
+    routing_sub = routing_parser.add_subparsers(dest="routing_command")
+
+    _status = routing_sub.add_parser(
+        "status",
+        help="Show whether dynamic selection is on and what it can choose from",
+        description=(
+            "Print the resolved routing settings and the candidate pool.\n\n"
+            "With --json, prints the shared machine-readable report: the exact\n"
+            "key set enabled/settings/candidate_source/request/pricing/selected/\n"
+            "selected_provider/reason/skip_reason/current/kept_current/\n"
+            "eligible_count/candidates (sorted keys, 2-space indent). Read-only."
+        ),
+    )
+    _status.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit the shared JSON report (sort_keys, indent=2) instead of text",
+    )
+    _status.add_argument(
+        "prompt",
+        nargs="*",
+        help="Optional user message to classify for the report (default: none)",
+    )
+    _status.add_argument(
+        "--current-model",
+        default=None,
+        help="Treat this model as the session's incumbent (default: config default)",
+    )
+    _status.add_argument(
+        "--provider",
+        default=None,
+        help="Provider to resolve candidates against (default: model.provider)",
+    )
+    _status.add_argument(
+        "--attachments",
+        default=None,
+        metavar="image,pdf,...",
+        help="Modality hints for the request (image, pdf, audio, video)",
+    )
+    _status.add_argument(
+        "--conversation-tokens",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Size of the running context, added to the input estimate",
+    )
+
+    _enable = routing_sub.add_parser(
+        "enable", help="Turn dynamic model selection on (persists to config.yaml)"
+    )
+    _enable.add_argument(
+        "--strategy",
+        choices=["automatic", "cost", "quality", "tool_calls_only"],
+        default=None,
+        help="Selection bias (default: automatic — capability first, then cost; tool_calls_only keeps the default model primary)",
+    )
+    _enable.add_argument(
+        "--stability-threshold",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Score a rival must beat the current model by before switching (default 0.15)",
+    )
+    _enable.add_argument(
+        "--switch-on-cost",
+        action="store_true",
+        default=None,
+        help="Allow a mid-session switch to a cheaper model (breaks the prompt cache)",
+    )
+    _enable.add_argument(
+        "--all-models",
+        action="store_true",
+        help=(
+            "If no preferred model can serve a request, fall back to the "
+            "provider's catalog instead of keeping an incapable model"
+        ),
+    )
+    _enable.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        default=False,
+        help="Skip the confirmation prompt (for scripts and cron)",
+    )
+
+    routing_sub.add_parser(
+        "disable", help="Turn dynamic model selection off (persists to config.yaml)"
+    )
+
+    _explain = routing_sub.add_parser(
+        "explain",
+        help="Show the decision dynamic selection would make for a prompt",
+    )
+    _explain.add_argument(
+        "prompt",
+        nargs="+",
+        help="The user message to classify (quote it if it contains spaces)",
+    )
+    _explain.add_argument(
+        "--candidates",
+        default=None,
+        metavar="M1,M2,...",
+        help="Preview against these model ids instead of the configured list",
+    )
+    _explain.add_argument(
+        "--current-model",
+        default=None,
+        help="Treat this model as the session's incumbent (default: config default)",
+    )
+    _explain.add_argument(
+        "--provider",
+        default=None,
+        help="Provider to resolve candidates against (default: model.provider)",
+    )
+    _explain.add_argument(
+        "--attachments",
+        default=None,
+        metavar="image,pdf,...",
+        help="Modality hints for the request (image, pdf, audio, video)",
+    )
+    _explain.add_argument(
+        "--conversation-tokens",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Size of the running context, added to the input estimate",
+    )
+
+    _refresh = routing_sub.add_parser(
+        "refresh",
+        help="Refresh the model catalog dynamic selection chooses from",
+        description=(
+            "Force-refresh the models.dev catalog that routing resolves candidates\n"
+            "from — the same cache agent.models_dev already serves (no second\n"
+            "cache, no per-message fetch).\n\n"
+            "Read-only with respect to config.yaml: this touches the catalog cache,\n"
+            "never smart_model_routing. Useful after a provider adds models, when\n"
+            "`status` still shows the old pool."
+        ),
+    )
+    _refresh.add_argument(
+        "--provider",
+        default=None,
+        help="Report this provider's pool (default: model.provider from config)",
+    )
+    _refresh.add_argument(
+        "--json",
+        action="store_true",
+        default=False,
+        help="Emit the result as JSON (refreshed/providers/models/candidates/elapsed_ms)",
+    )
+
+    _configure = routing_sub.add_parser(
+        "configure",
+        help="Review and change every routing setting (interactive, or with flags)",
+        description=(
+            "Review the resolved settings and change them.\n\n"
+            "In a terminal with no flags this runs the interactive flow: current\n"
+            "state, enable/disable, all eligible models vs only your selected\n"
+            "models, model selection through the normal picker, preferences,\n"
+            "before/after summary with a preview, then confirmation.\n\n"
+            "With flags it is fully scriptable and needs no TTY.  Nothing is\n"
+            "written until the end, so cancelling leaves config.yaml unchanged.\n"
+            "Every write goes through agent.model_router.update_routing and is\n"
+            "read back from disk.  Verify afterwards with:\n"
+            "  hermes model routing status"
+        ),
+    )
+    _configure.add_argument(
+        "--models",
+        action="append",
+        default=None,
+        metavar="M1,M2,...",
+        help=(
+            "Route only among these model ids, in priority order "
+            "(comma-separated; repeat the flag to add more)"
+        ),
+    )
+    _configure.add_argument(
+        "--all-models",
+        "--all-eligible",
+        dest="all_models",
+        action="store_true",
+        default=False,
+        help="Route across the whole eligible provider catalog (clears the selected list)",
+    )
+    _configure_mode = _configure.add_mutually_exclusive_group()
+    _configure_mode.add_argument(
+        "--enable", action="store_true", default=False,
+        help="Turn dynamic model selection on")
+    _configure_mode.add_argument(
+        "--disable", action="store_true", default=False,
+        help="Turn dynamic model selection off")
+    _configure.add_argument(
+        "--strategy",
+        choices=["automatic", "cost", "quality", "tool_calls_only"],
+        default=None,
+        help="Selection bias (default: automatic — capability first, then cost; tool_calls_only keeps the default model primary)",
+    )
+    _configure.add_argument(
+        "--stability-threshold",
+        "--threshold",
+        dest="stability_threshold",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Score a rival must beat the current model by before switching (0-1)",
+    )
+    _configure.add_argument(
+        "--cost-optimization",
+        dest="cost_optimization",
+        action="store_true",
+        default=None,
+        help="Prefer cheaper models that can still serve the request",
+    )
+    _configure.add_argument(
+        "--no-cost-optimization",
+        dest="cost_optimization",
+        action="store_false",
+        help="Prefer capability over price",
+    )
+    _configure.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="M1,M2,...",
+        help=(
+            "Never auto-select these model ids (comma-separated; repeat the flag to "
+            "add more). They stay usable through an explicit model choice"
+        ),
+    )
+    _configure.add_argument(
+        "--clear-exclude",
+        action="store_true",
+        default=False,
+        help="Empty the never-auto-select list",
+    )
+    _configure.add_argument(
+        "--allow-unknown-metadata",
+        dest="allow_unknown_metadata",
+        action="store_true",
+        default=None,
+        help=(
+            "Treat missing capability metadata as unknown (penalised), not unsupported "
+            "— the default"
+        ),
+    )
+    _configure.add_argument(
+        "--no-allow-unknown-metadata",
+        "--strict-metadata",
+        dest="allow_unknown_metadata",
+        action="store_false",
+        help="Strict: a model missing a required capability's metadata is ineligible",
+    )
+    _configure.add_argument(
+        "--switch-on-cost",
+        dest="switch_on_cost",
+        action="store_true",
+        default=None,
+        help=(
+            "Allow a mid-session switch to a cheaper model (invalidates the provider's "
+            "prompt cache)"
+        ),
+    )
+    _configure.add_argument(
+        "--no-switch-on-cost",
+        dest="switch_on_cost",
+        action="store_false",
+        help="Keep the session's model even when a cheaper one would do — the default",
+    )
+    _configure.add_argument(
+        "--weights",
+        action="append",
+        default=None,
+        metavar="DIM=N,...",
+        help=(
+            "Scoring weights for the automatic strategy, merged over the current "
+            "values (capability, cost, reliability, context, continuity)"
+        ),
+    )
+    _configure.add_argument(
+        "--weights-default",
+        action="store_true",
+        default=False,
+        help="Reset the scoring weights to the engine defaults",
+    )
+    _configure.add_argument(
+        "--reliability",
+        action="append",
+        default=None,
+        metavar="MODEL=RATE,...",
+        help=(
+            "Declared success rate per model (0-1), merged over the current values; "
+            "expected retries are priced from it"
+        ),
+    )
+    _configure.add_argument(
+        "--clear-reliability",
+        action="store_true",
+        default=False,
+        help="Forget every declared reliability rate",
+    )
+    _configure.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Validate and show what would change without writing config.yaml")
+    _configure.add_argument(
+        "--json", action="store_true", default=False,
+        help="Print the writer's result (settings read back from disk) as JSON")
+    add_yes_flag(
+        _configure, "Assume yes: skip the final confirmation prompt")
+
+    routing_parser.set_defaults(func=routing_handler)
+
+
+# ---------------------------------------------------------------------------
+# The shared writer layer
+# ---------------------------------------------------------------------------
+# Every interface — `hermes model routing` (the parser above), the setup wizard and the
+# gateway (`gateway/slash_commands_model.py`) — reaches config.yaml through the functions
+# below: one read -> merge -> validate -> atomic write -> read-back path, so no surface can
+# disagree with another about what was saved. They stay importable library entry points even
+# where the parser dispatches through the injected handler.
 
 
 def cmd_model_routing_status(args) -> int:

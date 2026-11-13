@@ -99,6 +99,7 @@ def register_all_web_providers():
     from plugins.web.ddgs.provider import DDGSWebSearchProvider
     from plugins.web.exa.provider import ExaWebSearchProvider
     from plugins.web.firecrawl.provider import FirecrawlWebSearchProvider
+    from plugins.web.google_cse.provider import GoogleCSEWebSearchProvider
     from plugins.web.parallel.provider import ParallelWebSearchProvider
     from plugins.web.keenable.provider import KeenableWebSearchProvider
     from plugins.web.tavily.provider import TavilyWebSearchProvider
@@ -118,6 +119,7 @@ def register_all_web_providers():
         PerplexityWebSearchProvider,
         SearXNGWebSearchProvider,
         XAIWebSearchProvider,
+        GoogleCSEWebSearchProvider,
     ):
         register_provider(cls())
 

@@ -8,6 +8,14 @@ The inline-button path reuses the /model picker's ``send_choice_picker`` mechani
 ``cp:<index>`` callbacks), so it is tested at both seams: the handler's choice list and the
 Telegram adapter's payload builder (which must stay inside the 64-byte callback cap), and the
 adapter's callback handler (a stale or unknown payload must not reach the handler at all).
+
+Every write goes to a scratch ``HERMES_HOME`` / scratch config path (``tmp_path``); the real
+``~/.hermes`` is never touched (``tests/home_io_guard.py`` enforces it).
+
+Registry wiring (both spellings, the Telegram menu entry, the Slack subcommand map, busy
+policy, and ``/model`` staying untouched) is asserted through the real surfaces —
+``resolve_command`` / ``GATEWAY_KNOWN_COMMANDS`` / ``telegram_menu_commands`` — so a handler
+that merely exists is not mistaken for a command a user can reach.
 """
 
 from __future__ import annotations
@@ -17,9 +25,20 @@ from types import SimpleNamespace
 
 import pytest
 
+import gateway.run as gateway_run
+from agent import model_router as mr
+from gateway.config import Platform
 from gateway.platforms.base import SendResult
+from gateway.platforms.event import MessageEvent
+from gateway.session import SessionSource
 from gateway.slash_commands_model import GatewayModelCommandsMixin
-
+from hermes_cli.commands import (
+    GATEWAY_KNOWN_COMMANDS,
+    is_gateway_known_command,
+    resolve_command,
+)
+from hermes_cli.commands_platforms import telegram_menu_commands
+from hermes_cli.config import load_config_readonly
 
 class _FakeEvent:
     def __init__(self, args: str):
@@ -391,6 +410,9 @@ def test_followup_picker_survives_the_first_tap(cfgfile):
     import plugins.platforms.telegram.adapter as tg
 
     class _Query:
+        # A real tap carries the message it came from; both ids below are that message's.
+        message = SimpleNamespace(message_id=1)
+
         async def answer(self, **_kwargs):
             return None
 
@@ -400,13 +422,158 @@ def test_followup_picker_survives_the_first_tap(cfgfile):
         return None
 
     async def _cb(_chat_id, _value):
-        # The handler opens the confirm picker mid-callback, registering fresh state.
-        fake._choice_picker_state["67890"] = {"choices": [], "on_choice_selected": None}
+        # The handler opens the confirm picker mid-callback: a NEW message, so a new state
+        # with its own message id — exactly what send_choice_picker registers.
+        fake._choice_picker_state["67890"] = {
+            "choices": [], "on_choice_selected": None, "msg_id": 2}
         return "preview"
 
     fake._edit_result_text = _edit
-    fake._choice_picker_state["67890"] = {"choices": [{"value": "enable"}], "on_choice_selected": _cb}
+    fake._choice_picker_state["67890"] = {
+        "choices": [{"value": "enable"}], "on_choice_selected": _cb, "msg_id": 1}
 
     asyncio.run(tg.TelegramAdapter._handle_choice_picker_callback(fake, _Query(), "cp:0", "67890"))
 
-    assert "67890" in fake._choice_picker_state  # consumed state did not take the follow-up down
+    # Consuming the tapped message's state must not take the follow-up picker down with it.
+    assert "67890" in fake._choice_picker_state
+    assert fake._choice_picker_state["67890"]["msg_id"] == 2
+
+# --------------------------------------------------------------------------------------------
+# Registry wiring, shared across the lineage: both spellings, the platform menus, busy policy,
+# and the config block the CLI writes being visible to the engine without a restart.
+# --------------------------------------------------------------------------------------------
+
+ROUTED_CONFIG = """\
+model:
+  default: openai/gpt-5-mini
+  provider: openrouter
+smart_model_routing:
+  models:
+    - openai/gpt-5-mini
+    - openai/gpt-5-nano
+    - anthropic/claude-haiku
+"""
+
+
+@pytest.fixture
+def routing_home(tmp_path, monkeypatch):
+    """A scratch HERMES_HOME whose config already declares three preferred models."""
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(ROUTED_CONFIG, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "1")
+    return home
+
+
+@pytest.fixture
+def runner():
+    """A bare GatewayRunner: the mixin methods under test, no startup side effects."""
+    instance = object.__new__(gateway_run.GatewayRunner)
+    instance.adapters = {}
+    return instance
+
+
+def _event(text: str, *, user_id: str = "1", chat_id: str = "2") -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM, user_id=user_id, chat_id=chat_id, user_name="tester",
+    )
+    return MessageEvent(text=text, source=source)
+
+
+class TestRegistrationAndDispatch:
+    """Reachability, not existence: resolve -> gateway-known -> the dispatch table's handler."""
+
+    def test_both_spellings_resolve_to_the_same_command(self):
+        for typed in ("model-routing", "model_routing", "MODEL-ROUTING"):
+            resolved = resolve_command(typed)
+            assert resolved is not None, typed
+            assert resolved.name == "model-routing"
+
+    def test_both_spellings_are_gateway_known(self):
+        assert "model-routing" in GATEWAY_KNOWN_COMMANDS
+        assert "model_routing" in GATEWAY_KNOWN_COMMANDS
+
+    @pytest.mark.asyncio
+    async def test_model_command_is_unaffected(self, routing_home, runner):
+        event = _event("/model")
+        assert event.get_command() == "model"
+        cmd_def = resolve_command(event.get_command())
+        assert cmd_def.name == "model"
+        handler = (
+            runner._gateway_plain_command_handlers().get("model")
+            or runner._gateway_idle_command_handlers().get("model")
+        )
+        assert handler == runner._handle_model_command
+        assert handler != runner._handle_model_routing_command
+        # And the argument form still parses as its own command + args.
+        arg_event = _event("/model openai/gpt-5-nano")
+        assert arg_event.get_command() == "model"
+        assert arg_event.get_command_args().strip() == "openai/gpt-5-nano"
+
+    def test_telegram_menu_registers_the_underscore_form(self):
+        menu, _hidden = telegram_menu_commands(max_commands=100)
+        names = dict(menu)
+        assert "model_routing" in names
+        assert "model-routing" not in names  # Telegram only accepts [a-z0-9_]
+        assert "model" in names
+
+    def test_slack_reaches_it_through_the_hermes_subcommand_map(self):
+        # Slack's native slash list is at its 50-command cap, so routing is reachable as
+        # /hermes model-routing rather than by evicting an existing command.
+        from hermes_cli.commands_platforms import slack_native_slashes, slack_subcommand_map
+
+        assert not {"model-routing", "model_routing"} & {
+            name for name, _d, _h in slack_native_slashes()
+        }
+        mapping = slack_subcommand_map()
+        assert "model-routing" in mapping
+        assert "model_routing" in mapping
+
+    def test_allowed_while_busy(self, runner):
+        # busy dispatch reads _PLAIN_COMMANDS; the idle path reads _IDLE_COMMANDS.
+        assert "model-routing" in runner._PLAIN_COMMANDS
+        assert "model-routing" in runner._IDLE_COMMANDS
+        assert resolve_command("model-routing").busy_policy == "dispatch"
+
+
+class TestCrossInterfaceSync:
+    """A write through one interface is the state every other interface reads back."""
+
+    def test_update_routing_is_visible_without_a_restart(self, routing_home):
+        """route_turn re-reads the block per turn via load_config_readonly (file-signature cached)."""
+        assert load_config_readonly().get("smart_model_routing", {}).get("enabled") in (None, False)
+        assert mr.routing_preview("hello")["enabled"] is False
+
+        mr.update_routing({"enabled": True, "strategy": "cost"})
+
+        # No restart, no cache bust: the very next read sees the new block.
+        live = load_config_readonly()
+        assert live["smart_model_routing"]["enabled"] is True
+        preview = mr.routing_preview("hello")
+        assert preview["enabled"] is True
+        assert preview["settings"]["strategy"] == "cost"
+        assert preview["skip_reason"] != "disabled"
+
+
+class TestModelPoolIsComplete:
+    """The picker pool must not inherit the runtime selection bound."""
+
+    def test_the_picker_pool_is_not_truncated_to_the_selection_bound(self, monkeypatch):
+        """`widen_pool` bounds runtime *selection* to 60 catalog entries. A picker that inherits
+        that bound silently hides every model past the sixtieth - which is how gpt-6-luna
+        (entry 101 of 132) was missing from the list."""
+        seen = {}
+
+        def fake_widen(provider, models, **kwargs):
+            seen.update(provider=provider, limit=kwargs.get("limit"))
+            return list(models) + ["catalog-model"]
+
+        monkeypatch.setattr(mr, "widen_pool", fake_widen)
+        instance = object.__new__(gateway_run.GatewayRunner)
+        instance._model_routing_load_config = lambda: {
+            "model": {"provider": "opencode-zen", "default": "deepseek-v4.1-flash"}}
+        pool = instance._model_routing_model_choices({"models": ["deepseek-v4.1-flash"]})
+        assert seen["provider"] == "opencode-zen"
+        assert seen["limit"] is not None and seen["limit"] > 60, seen["limit"]
+        assert pool[0] == "deepseek-v4.1-flash"

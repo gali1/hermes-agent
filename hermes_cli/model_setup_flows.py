@@ -990,6 +990,15 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         selected, provider_id, f"Default model set to: {selected} (via {pconfig.name})", base_url=effective_base,
         api_mode=opencode_model_api_mode(provider_id, selected) if selected and is_opencode else None,
         drop_api_mode=not is_opencode)
+    if is_opencode:
+        # Optional and last: everything above is the model selection as before.  Skipping
+        # writes nothing; a non-interactive stdin returns before any prompt.
+        from hermes_cli.model_setup_flows_common import offer_model_routing
+        try:
+            offer_model_routing(
+                provider_id=provider_id, model_list=model_list, current_model=selected or "")
+        except Exception as exc:  # pragma: no cover - setup must never die here
+            print(f"  Smart model routing step skipped: {exc}")
 
     # Routing is offered only for OpenCode and only after its model is chosen; the default
     # answer keeps whatever is already configured, so a re-run never resets it.

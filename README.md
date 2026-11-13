@@ -385,6 +385,111 @@ The agent maintains two bounded, human-readable files under `$HERMES_HOME/memori
 
 `memory.enhanced.enabled: true` adds a structured SQLite store on top of curated memory: typed memories with lifecycle (store/update/supersede/delete/link), FTS5 BM25 search, rank-fusion hybrid retrieval with graph expansion and temporal windows, evidence accumulation, and automatic contradiction detection. Data lives under `$HERMES_HOME/memory_engine/`. **On by default** — set `memory.enhanced.enabled: false` to opt out, in which case behavior is exactly the built-in layer plus any configured provider. Config keys: `enabled` (`true`), `data_dir` (`"memory_engine"`), `auto_recall`, `auto_capture`, `max_recall`, `recall_budget_chars`.
 
+### Vector retrieval (experimental — `-fastembed` branch)
+
+This branch adds an optional dense-retrieval arm beside FTS5. It is **off by default** and degrades to FTS5-only retrieval when the backend is unavailable. Hermes requires **Python 3.11–3.13** — do not install into system Python.
+
+**1. Get the branch**
+
+```bash
+git clone --branch 2026-10-05-fastembed --single-branch \
+  https://github.com/gali1/hermes-agent.git hermes-agent-fastembed
+cd hermes-agent-fastembed
+```
+
+Already have a clone?
+
+```bash
+cd ~/hermes-agent-fastembed
+git fetch origin 2026-10-05-fastembed
+git checkout 2026-10-05-fastembed
+```
+
+**2. Install the `fastembed` extra** — uv (recommended; manages the interpreter for you):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is not installed
+cd ~/hermes-agent-fastembed
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python '.[fastembed]'
+```
+
+Or pip into a virtualenv:
+
+```bash
+cd ~/hermes-agent-fastembed
+python3.12 -m venv .venv          # or python3.11 / python3.13
+.venv/bin/python -m pip install -U pip
+.venv/bin/python -m pip install '.[fastembed]'
+```
+
+> A `uv venv` is not seeded with pip — use `uv pip install --python .venv/bin/python ...`,
+> or run `.venv/bin/python -m ensurepip --upgrade` first if you prefer plain pip.
+
+**3. Enable the backend**
+
+The enhanced local memory layer is on by default in this branch
+(`memory.enhanced.enabled: true`); the fastembed vector arm is the opt-in
+part. Activate it with:
+
+```bash
+hermes config set memory.enhanced.vector_backend fastembed
+```
+
+Set `memory.enhanced.enabled false` to turn the whole layer off.
+
+To make this branch the default `hermes` without activating the venv:
+
+```bash
+ln -sfn ~/hermes-agent-fastembed/.venv/bin/hermes ~/.local/bin/hermes
+```
+
+**4. Measure recall on your own sessions**
+
+```bash
+python scripts/memory_eval.py --vector-backend fastembed --limit 600
+```
+
+Run it from the clone with the venv active. The first run downloads
+`BAAI/bge-small-en-v1.5` (~130 MB, cached afterwards). The harness mines
+durable candidates from `$HERMES_HOME/state.db`, derives queries per memory,
+and reports recall@1 / recall@k / MRR for `fts`, `hybrid`, `vector` and
+`hybrid+vector`. No memory contents are printed. A lexical/hybrid baseline on
+400 real messages (200 memories, 732 queries) shows the calibrated hybrid at
+overall R@1 0.54 / R@5 0.79 versus FTS 0.41 / 0.43, with exact-lookup R@1 at
+0.75–0.82 — run the vector column to see whether embeddings add to that on
+your data.
+
+| Config key                        | Default         | Meaning                                                                                        |
+| --------------------------------- | --------------- | ---------------------------------------------------------------------------------------------- |
+| `memory.enhanced.vector_backend`  | `none`          | `none`, `fastembed` (local ONNX), `remote` (OpenAI-compatible `/embeddings`), `mempalace`     |
+| `memory.enhanced.vector_model`    | provider default | e.g. `BAAI/bge-small-en-v1.5`                                                                 |
+| `memory.enhanced.vector_weight`   | `0.3`           | vector-arm weight, hard-capped at `0.4` so vector never dominates                              |
+| `memory.enhanced.vector_max_share`| `0.5`           | max share of fused results that may be vector-only                                             |
+| `memory.enhanced.vector_index_batch` | `16`         | background indexing batch size                                                                 |
+
+Embeddings are indexed asynchronously on a daemon worker, so turns never block
+on embedding. The `remote` backend sends memory text to the configured
+endpoint — opt in deliberately. The first `fastembed` run downloads
+`BAAI/bge-small-en-v1.5` (~130 MB, cached afterwards) and needs no PyTorch.
+
+Measure recall on your own sessions before enabling:
+
+```bash
+python scripts/memory_eval.py --vector-backend fastembed --limit 600
+```
+
+The harness mines durable candidates from `$HERMES_HOME/state.db`, derives
+queries per memory, and reports recall@1 / recall@k / MRR for `fts`, `hybrid`,
+`vector` and `hybrid+vector`. No memory contents are printed. A lexical/hybrid
+baseline on 400 real messages (200 memories, 732 queries) shows hybrid RRF
+lifting overall R@5 from 0.430 to 0.757 and concept-query R@5 from 0.025 to
+0.555 — run the vector column to see whether embeddings add to that on your
+data.
+
+> Experimental: this branch exists to try the vector path. It is not intended
+> to merge into `main` as-is — review the eval numbers for your own data first.
+
 ### Memory provider plugins (opt-in)
 
 Set `memory.provider` in `config.yaml` to add an external memory engine — only one at a time; empty means built-in only:

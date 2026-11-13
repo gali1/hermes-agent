@@ -1377,6 +1377,21 @@ DEFAULT_CONFIG = {
             # graph expansion.  Without it, recency/access boosts let an
             # unrelated row outrank every real match and pad the block.
             "topical_only": True,
+            # Optional dense-retrieval arm beside FTS5 (`-fastembed` branch).
+            # `none` keeps retrieval purely lexical; `fastembed` uses a local
+            # ONNX model (no PyTorch, no network at query time); `remote` posts
+            # memory text to an OpenAI-compatible /embeddings endpoint.
+            "vector_backend": "none",   # none | fastembed | remote | mempalace
+            "vector_model": "",         # provider default when empty
+            "vector_weight": 0.3,       # bounded to <= 0.4 by the store
+            "vector_max_share": 0.5,    # max share of fused results that may be vector-only
+            "vector_index_batch": 16,
+            "vector_remote": {
+                "base_url": "https://api.openai.com/v1",
+                "api_key_env": "OPENAI_API_KEY",
+                "model": "text-embedding-3-small",
+                "timeout": 30,
+            },
             # Junk purge: re-run the capture filters over what is already
             # stored and archive the rows they would now refuse (requests,
             # assistant status lines, degenerate text). Capture-side filtering
@@ -2096,15 +2111,26 @@ DEFAULT_CONFIG = {
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,
-            # Opt-in: re-order the hits a query already admitted by each tool's recorded success
-            # rate (newest calls only; neutral below 3 calls and at >=40% success). Applied after
-            # admission, so it can never hide a hit — lexical ranking until this is set.
-            # ``reliability_rerank`` is the canonical key; ``reliability`` is a deprecated
-            # alias still honoured (canonical wins when both are set).
+            # --- AnyTool enhancements (TASK-2). Both are OPT-IN and OFF by default:
+            # a false/absent key is a strict no-op (no store read, no model call).
+            # Re-rank the hits the lexical gate already admitted using each tool's
+            # RECENT call outcomes (newest 8000 message rows, 30-day window). The
+            # multiplier is 0.2..1.0, neutral with <3 calls or a >=40% success rate,
+            # and is applied AFTER admission, so it only reorders: the candidate set
+            # and the returned match count never shrink.
+            # CANONICAL NAME across every deployment. The pre-unification spelling
+            # `reliability` is still honoured as a deprecated alias (reported with a
+            # warning, never silently ignored); if both are set, this key wins and the
+            # conflict is logged. Unknown keys under tools.tool_search are reported too.
             "reliability_rerank": False,
-            # Opt-in: when lexical search matches nothing, make ONE bounded model call over the
-            # catalog listing to recover tools by name. Steady-state cost is unchanged.
+            # When lexical search returns NOTHING, make ONE bounded model pass over a
+            # capped catalog listing (names + one-line descriptions) to propose
+            # candidates, then keep only proposals that exist in the real catalog.
+            # Silent on failure (error/timeout/unparsable): the empty result stands.
             "zero_match_llm": False,
+            # Wall-clock cap in seconds for that single pass (0.05..15). The call runs
+            # on a worker thread that is abandoned, not extended, when it expires.
+            "zero_match_llm_timeout": 4.0,
             # Tools replaced by the bridge by default. This list intentionally includes cold,
             # event-triggered built-ins; an explicit list replaces it wholesale and [] keeps every
             # tool eager. The runtime fallback in tools/tool_search.py derives from this value.

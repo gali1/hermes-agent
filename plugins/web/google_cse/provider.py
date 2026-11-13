@@ -1,16 +1,20 @@
-"""Google Custom Search JSON API (``https://www.googleapis.com/customsearch/v1``).
+"""Google Programmable Search (Custom Search JSON API) — search only, keyed fallback tier.
 
-Search-only — CSE returns results but does not fetch page bodies.
-Env: ``GOOGLE_CSE_API_KEY`` and ``GOOGLE_CSE_CX`` (both required). ``GOOGLE_API_KEY`` and
-``GOOGLE_CSE_ID`` are accepted as aliases so an existing Google setup keeps working; the
-canonical pair is the one both implementations document and the one the setup prompt names.
+Env: ``GOOGLE_CSE_API_KEY`` (API key) **and** ``GOOGLE_CSE_ID`` (the engine's ``cx`` id).
+``GOOGLE_API_KEY`` and ``GOOGLE_CSE_CX`` are accepted as aliases, so an install configured
+before the rename keeps working; the canonical pair wins when both spellings are set.
+Config: ``web.search_backend`` / ``web.backend: "google-cse"`` to pin it directly.
+
+Tier: registered in :data:`agent.web_search_registry._FALLBACK_PREFERENCE`, i.e. tried
+only AFTER the legacy vendor walk and BEFORE the keyless free tier — it never pre-empts a
+legacy vendor and never overrides an explicit ``web.backend`` / ``web.search_backend``.
+
+No credential value is ever logged or returned: the key travels in the query string (the
+API's documented form), so every log line and error string is passed through :func:`_redact`.
 
 Design notes:
-* **Fails closed.** Missing credentials return ``not configured``, never an empty success —
-  a caller must be able to tell "the backend is absent" from "the query found nothing".
-* **Never leaks the key.** The API key travels as a query parameter to Google and is never
-  included in an error message, a log line or the returned payload. Presence is checked by
-  variable *name* only; no value is ever logged.
+* **Fails closed.** Missing credentials return ``not configured``, never an empty success — a
+  caller must be able to tell "the backend is absent" from "the query found nothing".
 * **Bounded.** CSE accepts ``num`` up to 10; larger limits are clamped rather than paginated,
   because a fallback backend should not multiply billable calls. One request per query — a
   transport or parse failure surfaces as provider-unavailable so the next provider can run.
@@ -21,94 +25,123 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Tuple
 
+import httpx
+
 from plugins.web._common import (
-    BaseWebSearchProvider,
-    http_get_json,
-    provider_env,
-    search_fail,
-    search_ok,
-    setup_schema,
-    titled_rows,
+    BaseWebSearchProvider, provider_env, run_search, search_fail, search_ok, setup_schema, title_hit,
 )
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
-_MAX_NUM = 10  # hard API ceiling per request
+_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+# The JSON API serves at most 10 results per request (``num``); more needs pagination via ``start``.
+_MAX_RESULTS_PER_REQUEST = 10
+
+
+def _redact(text: str, *secrets: str) -> str:
+    """Strip credential values out of *text* before it is logged or returned."""
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
 
 
 class GoogleCSEWebSearchProvider(BaseWebSearchProvider):
-    """Search via Google's Custom Search JSON API."""
+    """Search-only Google Programmable Search provider (keyed fallback tier)."""
 
-    NAME = "google_cse"
+    NAME = "google-cse"
     DISPLAY_NAME = "Google Custom Search"
     KEY_ENV = "GOOGLE_CSE_API_KEY"
-    SEARCH_ID_ENV = "GOOGLE_CSE_CX"
+    CX_ENV = "GOOGLE_CSE_ID"
     # Legacy spellings, accepted after the canonical names. Order matters: the canonical
     # variable wins when both are set, so one box can migrate without editing the other.
     KEY_ENV_ALIASES: Tuple[str, ...] = ("GOOGLE_API_KEY",)
-    SEARCH_ID_ENV_ALIASES: Tuple[str, ...] = ("GOOGLE_CSE_ID",)
+    CX_ENV_ALIASES: Tuple[str, ...] = ("GOOGLE_CSE_CX",)
+    EXTRACT = False
+    KEYLESS = False
 
     @staticmethod
-    def _resolve_env(canonical: str, aliases: Tuple[str, ...]) -> Tuple[str, str]:
-        """First set variable's value and the name it came from; ``("", canonical)`` if none."""
+    def _env(canonical: str, aliases: Tuple[str, ...]) -> str:
+        """First set variable's value among *canonical* then *aliases*; ``""`` if none."""
         for name in (canonical, *aliases):
             value = provider_env(name)
             if value:
-                return value, name
-        return "", canonical
-
-    def _credentials(self) -> Tuple[str, str, list]:
-        api_key, _key_name = self._resolve_env(self.KEY_ENV, self.KEY_ENV_ALIASES)
-        cse_id, _id_name = self._resolve_env(self.SEARCH_ID_ENV, self.SEARCH_ID_ENV_ALIASES)
-        missing = [name for name, value in ((self.KEY_ENV, api_key), (self.SEARCH_ID_ENV, cse_id))
-                   if not value]
-        return api_key, cse_id, missing
+                return value
+        return ""
 
     def is_available(self) -> bool:
-        """Both halves of the credential pair are required; one alone cannot search."""
-        api_key, cse_id, _missing = self._credentials()
-        return bool(api_key and cse_id)
+        """Both credentials must be present — a lone API key cannot address an engine."""
+        for env_var, aliases in ((self.KEY_ENV, self.KEY_ENV_ALIASES), (self.CX_ENV, self.CX_ENV_ALIASES)):
+            if not self._env(env_var, aliases):
+                logger.debug("%s unavailable: %s is not set", self.NAME, env_var)
+                return False
+        return True
+
+    def _search_body(self, query: str, limit: int) -> Dict[str, Any]:
+        api_key = self._env(self.KEY_ENV, self.KEY_ENV_ALIASES)
+        cx = self._env(self.CX_ENV, self.CX_ENV_ALIASES)
+        if not api_key or not cx:
+            return search_fail(f"{self.KEY_ENV} and {self.CX_ENV} must both be set for Google Custom Search")
+
+        num = max(1, min(int(limit), _MAX_RESULTS_PER_REQUEST))
+        params = {"key": api_key, "cx": cx, "q": query, "num": num}
+        try:
+            resp = httpx.get(_ENDPOINT, params=params, headers={"Accept": "application/json"}, timeout=15)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Google CSE HTTP error: %s", _redact(str(exc), api_key, cx))
+            return search_fail(f"Google CSE returned HTTP {exc.response.status_code}")
+        except httpx.RequestError as exc:
+            detail = _redact(str(exc), api_key, cx)
+            logger.warning("Google CSE request error: %s", detail)
+            return search_fail(f"Could not reach Google CSE: {detail}")
+
+        try:
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 — malformed body is a failure, never an exception
+            logger.warning("Google CSE response parse error: %s", _redact(str(exc), api_key, cx))
+            return search_fail("Could not parse Google CSE response as JSON")
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "Google CSE returned a non-object response (%s)", type(data).__name__,
+            )
+            return search_fail("Google CSE returned an unexpected response shape")
+
+        # Quota / credential / bad-engine problems arrive as a JSON ``error`` object; the status
+        # code is not always >=400, so the body is checked as well.
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = _redact(str(error.get("message") or "unknown error"), api_key, cx)
+            logger.warning("Google CSE error response: %s", message)
+            return search_fail(f"Google CSE error: {message}")
+
+        items = data.get("items") or []
+        if not isinstance(items, list):
+            return search_fail("Google CSE returned an unexpected response shape")
+
+        raw = [item for item in items[:num] if isinstance(item, dict)]
+        rows = [
+            title_hit(str(item.get("title", "")), str(item.get("link", "")), str(item.get("snippet", "")), i + 1)
+            for i, item in enumerate(raw)
+        ]
+        logger.info("Google CSE '%s': %d results (from %d raw, limit %d)", query, len(rows), len(items), limit)
+        return search_ok(rows)
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
-        api_key, cse_id, missing = self._credentials()
-        if missing:
-            return search_fail(
-                f"Google Custom Search not configured: {', '.join(missing)} unset")
-        num = max(1, min(int(limit or 5), _MAX_NUM))
-        data, failure = http_get_json(
-            "Google Custom Search",
-            GOOGLE_CSE_ENDPOINT,
-            params={"key": api_key, "cx": cse_id, "q": query, "num": num},
-            headers={"Accept": "application/json"},
-            timeout=15,
-            logger=logger,
-            reach_target="Google Custom Search API",
-        )
-        if failure is not None:
-            return failure
-        items = (data or {}).get("items") or []
-        rows = [
-            {
-                "title": str(item.get("title", "")),
-                "url": str(item.get("link", "")),
-                "content": str(item.get("snippet", "")),
-            }
-            for item in items[:num]
-            if isinstance(item, dict)
-        ]
-        web_results = titled_rows(rows, "content")
-        logger.info(
-            "Google CSE search '%s': %d results (limit %d)", query, len(web_results), num)
-        return search_ok(web_results)
+        return run_search("Google CSE", logger, lambda: self._search_body(query, limit))
 
     def get_setup_schema(self) -> Dict[str, Any]:
-        return setup_schema(
-            "Google Custom Search",
-            "paid · 100 queries/day free",
-            "Google Programmable Search. Needs both GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX "
-            "(GOOGLE_API_KEY / GOOGLE_CSE_ID are accepted aliases).",
-            "GOOGLE_CSE_API_KEY",
-            "Google API key (and GOOGLE_CSE_CX for the search engine)",
+        schema = setup_schema(
+            self.DISPLAY_NAME, "free",
+            "Keyed fallback — needs GOOGLE_CSE_API_KEY and GOOGLE_CSE_ID (100 queries/day free); "
+            "GOOGLE_API_KEY / GOOGLE_CSE_CX are accepted aliases. Search only.",
+            self.KEY_ENV, "Google API key (Custom Search JSON API)",
             "https://developers.google.com/custom-search/v1/overview",
         )
+        schema["env_vars"].append({
+            "key": self.CX_ENV,
+            "prompt": "Search engine ID (cx)",
+            "url": "https://programmablesearchengine.google.com/controlpanel/all",
+        })
+        return schema

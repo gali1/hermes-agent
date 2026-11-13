@@ -280,7 +280,13 @@ MAX_PROGRESS_CHARS = 160
 # First-person work narration: "Now adding the algorithmic purge pass to the
 # store:" is a move being narrated, not a finding, and it survived every other
 # filter (it passed the 20-char floor and matched no category).
-_MAX_NARRATION_CHARS = 200
+# Length-capped for the same reason as announcements - a long passage that
+# happens to open this way usually carries real content.
+MAX_NARRATION_CHARS = 200
+# "let me" and "now <verb>ing" are unambiguous: the words pin the sentence to an
+# action in progress.  Kept alongside the explicit "Now <verb>" form below so a
+# narrated move is caught whichever tense it is written in.
+_NARRATION_EXPLICIT_RE = re.compile(r"(?i)^\s*(?:now\s+)?let me\b|^\s*now\s+[a-z]+ing\b")
 _NARRATION_RE = re.compile(
     r"(?i)^\s*now\s+(?:adding|updating|writing|patching|editing|wiring|hooking|"
     r"extending|fixing|refactoring|rewriting|moving|tweaking|implementing|"
@@ -292,6 +298,9 @@ _NARRATION_RE = re.compile(
     r"|extend|fix|refactor|rewrite|tweak|implement|check|run|read|search|verify"
     r"|test|build|deploy|commit|push)\b"
 )
+
+# Narration is kept separate from _LEADING_IMPERATIVE on purpose: it is not the
+# user asking for work, and a distinct drop reason makes the telemetry readable.
 
 
 def is_request(text) -> bool:
@@ -340,9 +349,9 @@ def looks_like_narration(text) -> bool:
     if not isinstance(text, str) or not text.strip():
         return False
     stripped = text.strip()
-    if len(stripped) > _MAX_NARRATION_CHARS:
+    if len(stripped) > MAX_NARRATION_CHARS:
         return False
-    if _NARRATION_RE.match(stripped):
+    if _NARRATION_EXPLICIT_RE.match(stripped) or _NARRATION_RE.match(stripped):
         return True
     if not _NARRATION_GERUND_RE.match(stripped):
         return False
@@ -489,6 +498,11 @@ def classify_candidate(text, role=None) -> str | None:
         return _drop("injected", stripped)
     if looks_like_brief(stripped):
         return _drop("task_brief", stripped)
+    # Narration is checked before the request rule: "Let me …" is both an
+    # imperative and a narrated move, and the distinct drop reason is what makes
+    # the telemetry readable.
+    if looks_like_narration(stripped):
+        return _drop("narration", stripped)
     if is_request(stripped):
         return _drop("request", stripped)
     if looks_like_announcement(stripped):

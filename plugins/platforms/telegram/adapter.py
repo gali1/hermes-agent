@@ -511,6 +511,45 @@ class _PollingStallError(RuntimeError):
     """
 
 
+# ── pending-picker registry ───────────────────────────────────────────────────────────
+# Pickers are addressed by (chat, message) rather than by chat alone: several pickers can be
+# alive in one chat, an interrupted tap must not consume another picker's state, and an
+# adapter instance can be replaced between send and tap (plugin reload, gateway restart).
+_PICKER_STATE_REGISTRY: Dict[str, dict] = {}
+_PICKER_STATE_TTL = 1800.0  # an abandoned picker stops answering after 30 minutes
+
+
+def _picker_registry_key(chat_id: str, msg_id) -> str:
+    return f"{chat_id}:{msg_id}"
+
+
+def _picker_state_register(chat_id: str, msg_id, state: dict) -> None:
+    if msg_id is None:
+        return
+    state["_registered_at"] = time.time()
+    _PICKER_STATE_REGISTRY[_picker_registry_key(str(chat_id), msg_id)] = state
+    if len(_PICKER_STATE_REGISTRY) > 200:  # bounded: drop the oldest half, never grow forever
+        for key in sorted(_PICKER_STATE_REGISTRY, key=lambda k: _PICKER_STATE_REGISTRY[k].get("_registered_at") or 0)[:100]:
+            _PICKER_STATE_REGISTRY.pop(key, None)
+
+
+def _picker_state_lookup(chat_id: str, msg_id) -> Optional[dict]:
+    if msg_id is None:
+        return None
+    state = _PICKER_STATE_REGISTRY.get(_picker_registry_key(str(chat_id), msg_id))
+    if state is None:
+        return None
+    if time.time() - float(state.get("_registered_at") or 0) > _PICKER_STATE_TTL:
+        _PICKER_STATE_REGISTRY.pop(_picker_registry_key(str(chat_id), msg_id), None)
+        return None
+    return state
+
+
+def _picker_state_retire(chat_id: str, msg_id) -> None:
+    if msg_id is not None:
+        _PICKER_STATE_REGISTRY.pop(_picker_registry_key(str(chat_id), msg_id), None)
+
+
 class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -700,6 +739,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         self._max_doc_bytes: int = 2 * 1024 * 1024 * 1024 if extra.get("base_url") else 20 * 1024 * 1024
         self._model_picker_state: Dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: Dict[str, dict] = {}
+        # Multi-select picker (e.g. /model-routing model list): per-chat toggles + Done.
+        self._multi_select_state: Dict[str, dict] = {}
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
@@ -4331,8 +4372,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             keyboard = InlineKeyboardMarkup(self._rows_of_two(buttons))
 
             def _remember(msg):
-                self._choice_picker_state[str(chat_id)] = {
+                state = {
                     "msg_id": msg.message_id, "choices": choices, "session_key": session_key, "on_choice_selected": on_choice_selected}
+                self._choice_picker_state[str(chat_id)] = state
+                _picker_state_register(chat_id, msg.message_id, state)
             return self.format_message(title), keyboard, _remember
         return await self._send_prompt(
             "send_choice_picker", chat_id, metadata, build, thread_id=metadata.get("thread_id") if metadata else None,
@@ -4348,7 +4391,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
 
     async def _handle_choice_picker_callback(self, query, data: str, chat_id: str) -> None:
         """Handle choice picker button taps (cp:<index>)."""
+        msg_id = getattr(getattr(query, "message", None), "message_id", None)
         state = self._choice_picker_state.get(chat_id)
+        # A chat slot belonging to a DIFFERENT message is not this tap's state.
+        if state is not None and msg_id is not None and state.get("msg_id") not in (None, msg_id):
+            state = None
+        if state is None:
+            state = _picker_state_lookup(chat_id, msg_id)
         if not state:
             await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
             return
@@ -4368,10 +4417,171 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             result_text = t("platform.telegram.picker.apply_error", error=str(exc))
         await self._edit_result_text(query, result_text)
         await query.answer()
-        # Drop only the state this tap consumed: a handler may have opened a follow-up picker
-        # (e.g. /model-routing's Enable → Confirm step) that registered its own state here.
-        if self._choice_picker_state.get(chat_id) is state:
+        tapped_msg = getattr(getattr(query, "message", None), "message_id", None)
+        _picker_state_retire(chat_id, tapped_msg)
+        if self._choice_picker_state.get(chat_id, {}).get("msg_id") in (None, tapped_msg):
             self._choice_picker_state.pop(chat_id, None)
+
+    # ── multi-select picker (toggle several values, then Done) ──
+    # Used by /model-routing's "change models" step. Callback payloads carry only an
+    # index (``mrs:3``), never a model name: Telegram caps callback_data at 64 bytes and
+    # routed model ids can be long. All state lives server-side, keyed by chat id.
+    _MULTI_SELECT_PAGE_SIZE = 8
+
+    def _multi_select_page(self, state: dict) -> tuple:
+        options = state.get("options") or []
+        size = max(1, int(state.get("page_size") or self._MULTI_SELECT_PAGE_SIZE))
+        pages = max(1, (len(options) + size - 1) // size)
+        page = max(0, min(int(state.get("page") or 0), pages - 1))
+        state["page"] = page
+        return options[page * size:(page + 1) * size], page, pages, size
+
+    def _multi_select_text(self, state: dict) -> str:
+        window, page, pages, size = self._multi_select_page(state)
+        selected = state.get("selected") or set()
+        lines = [str(state.get("title") or "Select values")]
+        for offset, option in enumerate(window):
+            idx = page * size + offset
+            mark = "✓" if idx in selected else "·"
+            lines.append(f"  {mark} {option.get('label') or option.get('value')}")
+        lines.append("")
+        lines.append(f"Selected {len(selected)} · page {page + 1}/{pages}")
+        lines.append("Tap a value to toggle it, then Done.")
+        return "\n".join(lines)
+
+    def _multi_select_keyboard(self, state: dict):
+        window, page, pages, size = self._multi_select_page(state)
+        selected = state.get("selected") or set()
+        buttons: list = []
+        for offset, option in enumerate(window):
+            idx = page * size + offset
+            label = str(option.get("label") or option.get("value") or "")
+            if len(label) > 30:
+                label = label[:27] + "..."
+            buttons.append(InlineKeyboardButton(
+                f"✓ {label}" if idx in selected else label, callback_data=f"mrs:{idx}"))
+        rows = self._rows_of_two(buttons) if buttons else []
+        if pages > 1:
+            rows.append([
+                InlineKeyboardButton("◀", callback_data=f"mrsv:{max(0, page - 1)}"),
+                InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="mrsz"),
+                InlineKeyboardButton("▶", callback_data=f"mrsv:{min(pages - 1, page + 1)}"),
+            ])
+        rows.append([InlineKeyboardButton("All", callback_data="mrsa"),
+                     InlineKeyboardButton("None", callback_data="mrsn")])
+        rows.append([InlineKeyboardButton("✅ Done", callback_data="mrsd"),
+                     InlineKeyboardButton("✖ Cancel", callback_data="mrsx")])
+        return InlineKeyboardMarkup(rows)
+
+    async def send_multi_select_picker(
+        self, chat_id: str, title: str, options: list, selected: Optional[list] = None,
+        session_key: str = "", on_selection_done=None, metadata: Optional[Dict[str, Any]] = None,
+        page_size: Optional[int] = None,
+    ) -> SendResult:
+        """Send a toggle list: one button per value, All / None / Done / Cancel.
+
+        ``options``: ``[{"value": str, "label": str}]``. ``selected``: values (not indexes).
+        ``on_selection_done(chat_id, [values in option order])`` runs on Done; its return
+        text replaces the picker. The platform's 64-byte callback cap is respected because
+        every button carries an index into this message's server-side state.
+        """
+        values = [str(o.get("value")) for o in (options or []) if o.get("value") is not None]
+        chosen = {i for i, value in enumerate(values) if value in {str(s) for s in (selected or [])}}
+        state: Dict[str, Any] = {
+            "options": list(options or []), "selected": chosen, "page": 0, "title": title,
+            "page_size": int(page_size or self._MULTI_SELECT_PAGE_SIZE), "session_key": session_key,
+            "on_selection_done": on_selection_done, "msg_id": None,
+        }
+
+        def build():
+            if not state["options"]:
+                return SendResult(success=False, error="No options")
+
+            def _remember(msg) -> None:
+                state["msg_id"] = getattr(msg, "message_id", None)
+                self._multi_select_state[str(chat_id)] = state
+                _picker_state_register(chat_id, state["msg_id"], state)
+            return self.format_message(self._multi_select_text(state)), self._multi_select_keyboard(state), _remember
+        return await self._send_prompt(
+            "send_multi_select_picker", chat_id, metadata, build,
+            thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode)
+
+    def _retire_multi_select(self, chat_id: str, msg_id) -> None:
+        """Forget the picker the tap came from — and only that one.
+
+        A chat can hold two live pickers, so finishing the older one must not drop the newer
+        one's slot, and the finished message must leave the registry (otherwise a repeated
+        Done tap finds it again and re-applies a selection that was already written).
+        """
+        _picker_state_retire(chat_id, msg_id)
+        slot = self._multi_select_state.get(str(chat_id))
+        if msg_id is None or slot is None or slot.get("msg_id") in (None, msg_id):
+            self._multi_select_state.pop(str(chat_id), None)
+
+    async def _handle_multi_select_callback(self, query, data: str, chat_id: str) -> None:
+        """``mrs:<idx>`` toggle · ``mrsv:<page>`` · ``mrsa``/``mrsn`` · ``mrsd`` done · ``mrsx`` cancel."""
+        msg_id = getattr(getattr(query, "message", None), "message_id", None)
+        state = self._multi_select_state.get(str(chat_id))
+        if state is not None and msg_id is not None and state.get("msg_id") not in (None, msg_id):
+            state = None
+        if state is None:
+            state = _picker_state_lookup(chat_id, msg_id)
+        if not state:
+            await query.answer(text=_toast("platform.telegram.picker.expired_rerun"))
+            return
+        options = state.get("options") or []
+        selected = state.get("selected")
+        if not isinstance(selected, set):
+            selected = state["selected"] = set()
+
+        if data == "mrsz":  # page indicator — nothing to do
+            await query.answer()
+            return
+        if data.startswith("mrsv:"):
+            try:
+                state["page"] = max(0, int(data[5:]))
+            except ValueError:
+                await query.answer(text=_toast("platform.telegram.picker.invalid_page"))
+                return
+        elif data == "mrsa":
+            selected.update(range(len(options)))
+        elif data == "mrsn":
+            selected.clear()
+        elif data == "mrsd":
+            callback = state.get("on_selection_done")
+            self._retire_multi_select(chat_id, msg_id)
+            if not callable(callback):
+                await query.answer(text=_toast("platform.telegram.picker.expired"))
+                return
+            picked = [str(options[idx].get("value")) for idx in sorted(selected)
+                      if 0 <= idx < len(options) and options[idx].get("value") is not None]
+            try:
+                result_text = await callback(chat_id, picked)
+            except Exception as exc:
+                logger.error("Multi-select done failed: %s", exc)
+                result_text = t("platform.telegram.picker.apply_error", error=str(exc))
+            await self._edit_result_text(query, result_text)
+            await query.answer(text=_toast("platform.telegram.picker.switched"))
+            return
+        elif data == "mrsx":
+            self._retire_multi_select(chat_id, msg_id)
+            await self._edit_result_text(query, "Cancelled — nothing applied.")
+            await query.answer()
+            return
+        elif data.startswith("mrs:"):
+            try:
+                idx = int(data[4:])
+            except ValueError:
+                await query.answer(text=_toast("platform.telegram.picker.invalid_selection"))
+                return
+            if not 0 <= idx < len(options):
+                await query.answer(text=_toast("platform.telegram.picker.invalid_selection"))
+                return
+            selected.symmetric_difference_update({idx})
+        else:
+            await query.answer()
+            return
+        await self._picker_edit(query, self._multi_select_text(state), self._multi_select_keyboard(state))
 
     _MODEL_PAGE_SIZE = 8
 
@@ -4696,7 +4906,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
-            (("cp:",), self._handle_choice_picker_callback)):
+            (("cp:",), self._handle_choice_picker_callback),
+            (("mrs:", "mrsa", "mrsn", "mrsd", "mrsx", "mrsz", "mrsv:"), self._handle_multi_select_callback)):
             if data.startswith(prefixes):
                 chat_id = str(query.message.chat_id) if query.message else None
                 # One auth gate for every chat-id picker: strangers in a shared group must not drive the owner's picker.

@@ -291,6 +291,16 @@ matrix = [
 # replacement for stdlib xml.etree.ElementTree) to block billion-laughs
 # and XXE. aiohttp/httpx are already in [messaging]; defusedxml lands
 # here to keep the dependency local to wecom_callback's threat model.
+# Local embedding backend for the enhanced memory layer's optional vector arm
+# (memory.enhanced.vector_backend: fastembed). Opt-in only; deliberately not
+# in [all], mirroring the other heavy/niche backends.
+# INSTALL SITE: the gateway imports third-party packages from the PM env
+# (~/.hermes/installs/<id>/environments/<hash>/venv), not the repo .venv, and that env is built
+# from its own extras list. A PM env built without this extra degrades retrieval to lexical-only
+# while the service still starts and says nothing. Two guards: ~/.hermes/tools/ensure_pm_deps.sh
+# runs as a systemd ExecStartPre (drop-in 10-ensure-pm-deps.conf) and installs it if the selected
+# env lacks it, and `python -c "import fastembed"` in that env is the dry check.
+fastembed = ["fastembed>=0.4,<1"]
 wecom = ["defusedxml==0.7.1"]
 tts-premium = ["elevenlabs==1.59.0"]
 voice = [
@@ -544,6 +554,13 @@ dev = [
 test = [
   "distlib==0.4.3; sys_platform == 'win32'",
   "anthropic==0.87.0",
+  # tests/acp_adapter/* import acp and acp.schema directly. Without the pin the whole directory
+  # fails at collection (16 errors, 216 static tests never executed) and the reason looks like a
+  # code defect rather than a missing dependency.
+  "agent-client-protocol==0.9.0",
+  # tests/tools/test_schema_boolean_required.py imports jsonschema; it was never declared, so the
+  # module could not even be collected.
+  "jsonschema==4.26.0",
 ]
 
 [build-system]

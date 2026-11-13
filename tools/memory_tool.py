@@ -324,7 +324,32 @@ def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> T
     return tuple(is_truthy_value(section.get(k), default=True) for k in ("memory_enabled", "user_profile_enabled"))
 
 
+def enhanced_memory_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
+    """Whether ``memory.enhanced.enabled`` is on, so the schema may advertise its actions.
+
+    Defaults to True: ``DEFAULT_CONFIG`` ships the enhanced layer on, so only an explicit
+    opt-out narrows the tool surface. An unreadable/absent config keeps the historical
+    (advertised) surface rather than hiding a capability that is on by default.
+    """
+    enhanced = get_builtin_memory_config(config).get("enhanced")
+    if isinstance(enhanced, dict):
+        return is_truthy_value(enhanced.get("enabled"), default=True)
+    if enhanced is not None:
+        return is_truthy_value(enhanced, default=True)
+    return True
+
+
 _ENHANCED_ACTIONS = {"search", "recall", "conflicts", "timeline", "topics", "health", "reinforce"}
+
+# Parameters only the enhanced actions read; withheld from the schema with them.
+_ENHANCED_ONLY_PARAMS = ("query", "limit", "memory_type", "graph_expand", "temporal", "memory_id")
+
+_ENHANCED_ADVERTISEMENT = (
+    "ENHANCED (when memory.enhanced is enabled): 'search' and 'recall' query the local "
+    "structured memory store ('recall' adds rank fusion, graph expansion and temporal "
+    "windows); 'conflicts' lists contradicting memories; 'timeline' and 'topics' browse; "
+    "'health' reports store status; 'reinforce' bumps a memory's evidence count."
+)
 
 
 def _enhanced_memory_action(
@@ -490,11 +515,7 @@ MEMORY_SCHEMA = {
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
         "procedures belong in a skill, not memory.\n\n"
-        "ENHANCED (when memory.enhanced is enabled): 'search' and 'recall' query the local "
-        "structured memory store ('recall' adds rank fusion, graph expansion and temporal "
-        "windows); 'conflicts' lists contradicting memories; 'timeline' and 'topics' browse; "
-        "'health' reports store status; 'reinforce' bumps a memory's evidence count. These "
-        "return an error when the enhanced layer is disabled."
+        + _ENHANCED_ADVERTISEMENT
     ),
     "parameters": {
         "type": "object",
@@ -583,7 +604,13 @@ _SINGLE_TARGET_TEXT = {
 
 
 def _build_memory_schema_overrides() -> Dict[str, Any]:
-    """Narrow the advertised target surface using the availability snapshot."""
+    """Narrow the advertised surface using the availability snapshot.
+
+    The enhanced read/diagnostic actions are advertised ONLY when the enhanced layer is
+    enabled (``memory.enhanced.enabled``, on by default): a disabled layer used to
+    advertise seven actions that could only answer "Enhanced memory is not enabled",
+    which is a schema that lies about capability.
+    """
     flags = _memory_surface_flags.get() or get_builtin_memory_store_flags()
     _memory_surface_flags.set(None)
     targets = [t for t, on in zip(("memory", "user"), flags) if on]
@@ -595,6 +622,13 @@ def _build_memory_schema_overrides() -> Dict[str, Any]:
         description = description.replace(
             "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
             "notes (environment, conventions, tool quirks, lessons).", replacement)
+    if not enhanced_memory_enabled():
+        properties = parameters["properties"]
+        for name in _ENHANCED_ONLY_PARAMS:
+            properties.pop(name, None)
+        action_schema = properties.get("action") or {}
+        action_schema["enum"] = [a for a in action_schema.get("enum") or [] if a not in _ENHANCED_ACTIONS]
+        description = description.replace(_ENHANCED_ADVERTISEMENT, "").rstrip()
     return {"description": description, "parameters": parameters}
 
 

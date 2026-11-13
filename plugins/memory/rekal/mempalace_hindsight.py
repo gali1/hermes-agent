@@ -126,11 +126,6 @@ def boosted_rrf_score(rrf_score, source_ranks, boosts, k=DEFAULT_RRF_K):
 RECENCY_LINEAR_WINDOW_DAYS = 365.0
 RECENCY_HALFLIFE_DAYS = 90.0
 
-# A date range spanning exactly one calendar month or year is a coarse date
-# ("sometime in 2015"), not a real interval. Tolerance absorbs the sub-second
-# offsets used to keep same-batch memories individually ordered.
-_CALENDAR_PERIOD_TOLERANCE_SECONDS = 86400.0
-
 
 def compute_recency_decay(days_ago, function="linear", linear_window_days=None, halflife_days=None):
     """Age -> freshness signal in [0,1] where 0.5 is neutral.
@@ -154,18 +149,29 @@ def compute_recency_decay(days_ago, function="linear", linear_window_days=None, 
 
 
 def spans_calendar_period(start, end):
-    """True when [start, end] covers exactly one calendar month or year."""
+    """True when [start, end] covers exactly one *aligned* calendar month or year.
+
+    Alignment is what separates a coarse date from a sliding window.  The
+    original length-only test accepted any span of about a month, so a 30-day
+    "past 30 days" window starting on the 13th classified as a coarse date and
+    every result of that query had its recency capped at neutral.  A coarse
+    date is a period a user *named* ("March 2026", "last year"), so it starts on
+    the first day of the period and covers its last one.
+    """
     if start is None or end is None:
         return False
-    span = (end - start).total_seconds()
-    if span <= 0:
+    if start.hour or start.minute or start.second or start.microsecond:
         return False
-    month_seconds = calendar.monthrange(start.year, start.month)[1] * 86400.0
-    year_seconds = (366.0 if calendar.isleap(start.year) else 365.0) * 86400.0
-    return any(
-        period - _CALENDAR_PERIOD_TOLERANCE_SECONDS <= span <= period
-        for period in (month_seconds, year_seconds)
-    )
+    if start.day == 1:
+        last_day = calendar.monthrange(start.year, start.month)[1]
+        month_end = start.replace(day=last_day)
+        if month_end <= end < month_end + timedelta(days=1):
+            return True
+    if (start.month, start.day) == (1, 1):
+        year_end = datetime(start.year, 12, 31)
+        if year_end <= end < year_end + timedelta(days=2):
+            return True
+    return False
 
 
 def recency_for_range(occurred_start, occurred_end, fallback, now, function="linear",
@@ -644,6 +650,146 @@ def _polarity_conflict(a_low, b_low):
     return False
 
 
+# ── Value substitution (numbers, named entities) ──────────────────────────
+#
+# Two statements can disagree without any negation or antonym: the subject and
+# predicate are identical and only the *value* differs.  "TTL is 300s" against
+# "TTL is 600s" is lexically nearly identical and identically polarised, so both
+# detectors above miss it -- and it is exactly the kind of change the operator
+# most wants flagged.
+#
+# These detectors are deliberately high precision.  A miss costs one review
+# opportunity; a false conflict fills the review queue with noise and, worse,
+# teaches the operator to stop reading it.  Each detector therefore requires the
+# two statements to collapse to the *same skeleton* once the differing slot is
+# masked: same number of slots, decorated by identical surrounding words, with
+# exactly one differing value.  Anything looser is left to human review.
+
+# Only used for the optional fuzzy fallback on numeric skeletons; kept far above
+# the ordinary similarity band so it cannot turn "related sentences with
+# numbers" into conflicts.
+VALUE_CONFLICT_SKELETON_SIMILARITY = 0.97
+
+_NUMBER_TOKEN = re.compile(r"(?<![\d.])\d+(?:\.\d+)?(?![\d])")
+# A whole capitalised phrase ("Session TTL"), so a substitution can be told
+# apart from a differently-scoped subject: see _proper_name_conflict.
+_PROPER_RUN = re.compile(r"\b[A-Z][A-Za-z0-9_]*(?:\s+[A-Z][A-Za-z0-9_]*)*\b")
+_SKELETON_DROP = {"the", "a", "an"}
+
+# Numbers that name a *slot* rather than state a value: "filler note number 3",
+# "step 4", "build 91", "item 12".  An index is not a fact, so two memories
+# that differ only in their index are two members of a series, not a
+# disagreement -- and stores are full of them.  Without this guard, bulk
+# ingestion of numbered notes links every pair it writes as contradictory,
+# which is the single worst false positive this detector can produce because it
+# fires O(n^2) over a batch.
+_ENUMERATOR_PREFIXES = frozenset({
+    "number", "no", "no.", "#", "item", "index", "idx", "step", "part",
+    "entry", "row", "line", "page", "chapter", "section", "version", "ver",
+    "build", "rev", "revision", "id", "note", "notes", "attempt", "try",
+    "level", "phase", "task", "issue", "ticket", "case", "run", "batch",
+    "round", "slot", "position", "positional",
+})
+
+
+def _skeleton_tokens(text):
+    """Words of `text` with articles dropped, punctuation collapsed.
+
+    Splitting on any non-alphanumeric character is what makes "300s" and
+    "300 s" produce the same skeleton, and what keeps the mask placeholder a
+    token of its own in both.
+    """
+    words = re.split(r"[^a-z0-9#]+", text.lower())
+    return [w for w in words if w and w not in _SKELETON_DROP]
+
+
+def _looks_ordinal(text):
+    """True when a number in `text` is an index rather than a stated value."""
+    for match in _NUMBER_TOKEN.finditer(text):
+        prefix = text[: match.start()].rstrip(" .:#")
+        words = re.split(r"[^a-z0-9#]+", prefix.lower())
+        previous = words[-1] if words else ""
+        if previous in _ENUMERATOR_PREFIXES:
+            return True
+        following = text[match.end():].lstrip()
+        if following[:3].lower() == "of ":
+            return True
+    return False
+
+
+def _numeric_conflict(a, b):
+    """True when both sides carry numbers and only the numbers differ."""
+    values_a = _NUMBER_TOKEN.findall(a)
+    values_b = _NUMBER_TOKEN.findall(b)
+    if not values_a or not values_b:
+        return False
+    if values_a == values_b:
+        return False
+    if len(values_a) != len(values_b):
+        return False
+    if _looks_ordinal(a) or _looks_ordinal(b):
+        return False
+
+    skeleton_a = _skeleton_tokens(_NUMBER_TOKEN.sub(" # ", a))
+    skeleton_b = _skeleton_tokens(_NUMBER_TOKEN.sub(" # ", b))
+    if "#" not in skeleton_a or "#" not in skeleton_b:
+        return False
+    # At least one real word of context: a bare number is not a statement.
+    if not any(w != "#" and len(w) >= 2 for w in skeleton_a):
+        return False
+    if skeleton_a == skeleton_b:
+        return True
+    if len(skeleton_a) != len(skeleton_b):
+        return False
+    return trigram_similarity(" ".join(skeleton_a), " ".join(skeleton_b)) >= VALUE_CONFLICT_SKELETON_SIMILARITY
+
+
+def _proper_name_conflict(a, b):
+    """True when exactly one single-token capitalised name is substituted.
+
+    The position and the surrounding wording must both match exactly, and the
+    substituted slot must be one word on each side.  That second condition is
+    what keeps the detector from firing on a *different subject*: "Session TTL
+    is 300s" and "Cache TTL is 300s" describe two separate settings, while
+    "Alice owns billing" and "Bob owns billing" cannot both hold for one
+    billing system.  Lexically the two cases differ only by whether the changed
+    phrase is a single name or a name-plus-noun, so that is the discriminator.
+    """
+    phrases_a = _PROPER_RUN.findall(a)
+    phrases_b = _PROPER_RUN.findall(b)
+    if not phrases_a or len(phrases_a) != len(phrases_b):
+        return False
+
+    diffs = [(left, right) for left, right in zip(phrases_a, phrases_b) if left != right]
+    if len(diffs) != 1:
+        return False
+    left, right = diffs[0]
+    if " " in left or " " in right:
+        return False
+
+    def _mask(text):
+        out = []
+        last = 0
+        for match in _PROPER_RUN.finditer(text):
+            out.append(text[last:match.start()])
+            out.append(" # ")
+            last = match.end()
+        out.append(text[last:])
+        return _skeleton_tokens("".join(out))
+
+    mask_a, mask_b = _mask(a), _mask(b)
+    if mask_a != mask_b:
+        return False
+    # "# owns billing" is a shared predicate; a lone "#" is not.
+    return len(mask_a) >= 3
+
+
+def _value_conflict(new_content, existing_content):
+    """Detect a value/number/entity substitution between similar statements."""
+    return (_numeric_conflict(new_content, existing_content)
+            or _proper_name_conflict(new_content, existing_content))
+
+
 def detect_contradiction(new_content, existing_content,
                          min_similarity=CONTRADICTION_MIN_SIMILARITY,
                          max_similarity=CONTRADICTION_MAX_SIMILARITY):
@@ -655,8 +801,14 @@ def detect_contradiction(new_content, existing_content,
     about the same thing, but not so similar that they are effectively the same
     sentence -- near-identical text is a duplicate, which is handled by content
     hashing, not a contradiction.  Within that band, either an explicit negation
-    marker on exactly one side or an antonym pair across the two is treated as
-    a candidate conflict.
+    marker on exactly one side, an antonym pair across the two, or a single
+    substituted value (a number or a capitalised name) is treated as a
+    candidate conflict.
+
+    Value substitution is checked last and only when neither negation nor a
+    polarity flip fired, so the existing observations keep exactly the
+    behaviour they had: the new detector can only add conflicts, never
+    reinterpret a negation hit.
     """
     if not new_content or not existing_content:
         return False, 0.0
@@ -672,7 +824,13 @@ def detect_contradiction(new_content, existing_content,
     polarity_differs = _polarity_conflict(new_low, existing_low)
 
     if not negation_differs and not polarity_differs:
-        return False, 0.0
+        if not _value_conflict(new_content, existing_content):
+            return False, 0.0
+        # Both sides are identically polarised and share their wording, so the
+        # only reading is a changed value.  Confidence stays below the negation
+        # band because lexical detection cannot tell an update from a
+        # restatement of a different scope.
+        return True, round(min(0.9, 0.62 + 0.3 * similarity), 3)
 
     # Confidence rises with topical overlap and with agreement between the two
     # independent detectors.

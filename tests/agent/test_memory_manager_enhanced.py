@@ -6,6 +6,9 @@ opt-out, coexists with external providers, and leaves the provider-only path
 byte-identical when disabled.
 """
 
+import threading
+import time
+
 from agent.memory_manager import MemoryManager
 
 
@@ -126,3 +129,82 @@ def test_enhanced_session_switch_updates_session(tmp_path):
     manager.on_session_switch("s2", parent_session_id="s1")
     assert manager._enhanced._session_id == "s2"
     manager.shutdown_all()
+
+
+# ---------------------------------------------------------------------------
+# B8: the enhanced prefetch must be bounded exactly like an external provider.
+# Before this, it ran inline: a slow FTS5 query or a cold embedding model
+# stalled the whole turn with no ceiling, while plugin providers had an 8s cap.
+# ---------------------------------------------------------------------------
+
+class _StubEnhanced:
+    """Minimal stand-in for EnhancedMemoryBackend: only prefetch is exercised."""
+
+    available = True          # MemoryManager.enhanced_enabled requires this
+
+    def __init__(self, *, delay=0.0, payload="enhanced recall", gate=None):
+        self.delay = delay
+        self.payload = payload
+        self.gate = gate
+        self.calls = 0
+
+    def prefetch(self, query, *, session_id=""):
+        self.calls += 1
+        if self.gate is not None:
+            self.gate.wait(10)
+        elif self.delay:
+            threading.Event().wait(self.delay)
+        return self.payload
+
+    def health(self):
+        return {}
+
+
+def _manager_with(stub, timeout=0.2):
+    manager = MemoryManager(external_prefetch_timeout=timeout,
+                            enhanced_config={"enabled": True})
+    manager._enhanced = stub
+    return manager
+
+
+def test_enhanced_prefetch_is_bounded_by_timeout():
+    stub = _StubEnhanced(delay=5.0)
+    manager = _manager_with(stub, timeout=0.2)
+
+    started = time.monotonic()
+    ctx = manager.prefetch_all("hello")
+    elapsed = time.monotonic() - started
+
+    assert ctx == ""                                   # stuck prefetch contributes nothing
+    assert elapsed < 2.0                               # and the turn is not held open
+    assert stub.calls == 1
+
+
+def test_enhanced_prefetch_stuck_call_is_skipped_on_later_turns():
+    gate = threading.Event()
+    stub = _StubEnhanced(gate=gate)
+    manager = _manager_with(stub, timeout=0.1)
+
+    assert manager.prefetch_all("first") == ""
+    assert manager.prefetch_all("second") == ""         # still running -> skipped, not stacked
+    assert stub.calls == 1                              # no second call was started
+
+    gate.set()                                          # let the daemon thread finish
+    time.sleep(0.2)
+
+
+def test_enhanced_prefetch_content_is_unchanged_when_fast():
+    stub = _StubEnhanced(payload="ENHANCED BLOCK")
+    manager = _manager_with(stub, timeout=5.0)
+
+    assert manager.prefetch_all("hello") == "ENHANCED BLOCK"
+    assert stub.calls == 1
+
+
+def test_enhanced_prefetch_error_is_non_fatal():
+    class Boom(_StubEnhanced):
+        def prefetch(self, query, *, session_id=""):
+            raise RuntimeError("store gone")
+
+    manager = _manager_with(Boom())
+    assert manager.prefetch_all("hello") == ""          # swallowed, turn continues

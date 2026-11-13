@@ -104,6 +104,48 @@ Bad: `Use when a user asks to monitor named competitors or companies for product
 <!-- no-tmp: ok — names the anti-pattern skill authors must avoid -->
 POSIX-only signals to search for in `scripts/`: `fcntl`, `termios`, `pty`, `os.fork`, `os.killpg`, `signal.SIGKILL`, `os.kill(pid, 0)` liveness checks, hardcoded `/tmp` `/proc` `/etc`. Default posture: fix cross-platform first (`tempfile.gettempdir()`, `pathlib.Path`, `psutil.pid_exists`); gate narrower only when the dependency is genuinely platform-bound, and say why in `## Pitfalls`.
 
+## Route before raw: never write a detour into a skill
+
+A skill that reaches for SQL, a raw file, or a shell pipeline where a native Hermes
+tool already answers the question costs every future run extra steps. Real case: a
+skill said *"do not fall back to `session_search`"* to stop an agent presenting 10
+results as the total — so an agent hand-rolled SQL for **"list the last 10
+sessions"**, which browse mode answers in one call. It then died on a Windows path
+inside a bash heredoc before succeeding on a second attempt. Four steps where one
+would do.
+
+Rules for anything you write:
+
+- **Name the cheap path first.** Open the workflow with the tool that answers the
+  common case, *then* say when the raw path is needed.
+- **Scope prohibitions to the case that motivated them.** "Don't use X for ALL
+  sessions" is not "don't use X". A blanket ban pushes readers into longer routes;
+  a carve-out (`for last N`, `except when…`) keeps the warning *and* the shortcut.
+- **Say what the raw path buys.** If SQL or a raw read belongs in the skill, state
+  the question it answers that the tool cannot (counts, bulk export, joins).
+  Otherwise cut it.
+- **A deferred tool is not an absent tool.** Where a tool loads on demand, one
+  `tool_describe` + `tool_call` is the whole cost — not a licence to hand-build a
+  query.
+- **Check the shell can run what you wrote.** A POSIX heredoc containing `C:\…`
+  fails with `unterminated string literal` under Git Bash. Forward slashes, or use
+  the tool.
+
+Lint before shipping — both scripts are read-only except for adding notes:
+
+```bash
+python3 scripts/skill-lint.py           # report: P1/P2/P3 counts + offenders
+python3 scripts/skill-lint-apply.py     # add platform + native-tool notes
+```
+
+(Same two scripts are mirrored at `~/.hermes/scripts/` for hosts running from a
+release install rather than a checkout; pass a directory as argv[1] to lint any
+other skill tree.)
+
+P1 = blanket ban with no carve-out (review by hand — most are legitimate safety
+warnings). P2 = POSIX-only command with no platform note. P3 = raw-store work with
+no native-tool hint. Aim for P2 = P3 = 0 on any library you ship.
+
 ## Size Limits
 
 - Full SKILL.md: ≤ 100,000 chars enforced (`MAX_SKILL_CONTENT_CHARS`), but target **~100 lines for a simple skill, ~200 for a complex one**. Peer skills sit at 8-14k chars.

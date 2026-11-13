@@ -330,3 +330,213 @@ def _prompt_auth_credentials_choice(title: str) -> str:
     print()
     choice = _ask("  Choice [1/2/3]: ", raw=True, cancel_msg=None, on_cancel="1")
     return {"2": "reauth", "3": "cancel"}.get(choice, "use")
+
+
+# ---------------------------------------------------------------------------
+# Smart model routing (optional post-selection step)
+# ---------------------------------------------------------------------------
+#: Providers whose model setup offers the routing step today.  The helper below
+#: is provider-agnostic; this tuple is the only OpenCode-specific gate, so
+#: another provider joins by adding its id here (and nothing else changes).
+ROUTING_SETUP_PROVIDERS = ("opencode-zen", "opencode-go")
+
+
+def routing_setup_applies(provider_id: str) -> bool:
+    """True when smart model routing can be offered for *provider_id*."""
+    return str(provider_id or "").strip().lower() in ROUTING_SETUP_PROVIDERS
+
+
+def _choice_index(title: str, rows: list, default_idx: int = 0):
+    """Radio (curses) or numbered fallback → index, *default_idx* on empty answer,
+    None on cancel — same conventions as ``_prompt_auth_credentials_choice``."""
+    idx = _curses_choice(title, rows, default_idx)
+    if idx is not None:
+        print()
+        return idx if idx >= 0 else None
+    _print_numbered(title, rows, default_idx)
+    print()
+    answer = _ask("  Choice: ", raw=True, cancel_msg=None, on_cancel="")
+    if not answer:
+        return default_idx
+    try:
+        idx = int(answer) - 1
+    except ValueError:
+        return default_idx
+    return idx if 0 <= idx < len(rows) else default_idx
+
+
+def _multi_pick_models(model_list, *, preselected=(), prompt: str = "Add model: ") -> list:
+    """Ordered subset of *model_list* picked one at a time ("add another" loop).
+
+    Built on the existing single-model picker (``_pick_model_or_prompt`` →
+    ``_prompt_model_selection``: curses radio, numbered fallback, search, custom
+    name), so it inherits that picker's UI and needs no new picker framework.
+    The user picks a model per pass and ends the loop with the picker's own
+    Skip/Ctrl-C; already-picked models drop out of the next pass.
+
+    Provider-agnostic: it only needs ids, so any provider can adopt it.  Each
+    pick is validated against *model_list* and rejected with a clear message
+    when it is not a known model.
+    """
+    known = [str(m) for m in model_list]
+    chosen: list = []
+    # An existing routing block's models are preserved even when today's discovery
+    # no longer offers them: re-running setup must never silently drop a choice.
+    for model in preselected or ():
+        model = str(model).strip()
+        if model and model not in chosen:
+            chosen.append(model)
+    while True:
+        remaining = [m for m in known if m not in chosen]
+        if not remaining:
+            break
+        if chosen:
+            print(f"  Selected so far ({len(chosen)}): {', '.join(chosen)}")
+        picked = _pick_model_or_prompt(
+            remaining, prompt, current_model=chosen[-1] if chosen else "")
+        if not picked:
+            break
+        picked = str(picked).strip()
+        if picked not in known:
+            print(f"  '{picked}' is not one of {len(known)} models offered here — not added.")
+            continue
+        if picked in chosen:
+            print(f"  '{picked}' is already selected.")
+            continue
+        chosen.append(picked)
+    return chosen
+
+
+def _print_routing_readback(result: dict) -> None:
+    """Report the routing block *as read back from disk* (never our own optimism)."""
+    settings = (result or {}).get("settings") or {}
+    models = list(settings.get("models") or [])
+    state = "enabled" if settings.get("enabled") else "disabled"
+    print(f"  ✓ Smart model routing {state}"
+          f" — {'selected models only' if settings.get('preferred_models_only') else 'all eligible models'}")
+    if models:
+        print(f"    models ({len(models)}): {', '.join(models)}")
+    print(f"    saved in: {result.get('path') or 'config.yaml'}")
+    print("    verify with: hermes model routing status")
+    # The wizard covers the opt-in and the model scope.  Everything else the
+    # engine reads (exclude, unknown metadata, weights, reliability) lives in
+    # `configure` and in /model-routing's preferences, not in a first-run flow —
+    # say where, so nobody has to hand-edit config.yaml to find it.
+    print("    tune further with: hermes model routing configure")
+
+
+def offer_model_routing(*, provider_id: str, model_list=(), current_model: str = "",
+                        existing_block=None) -> dict | None:
+    """Optional smart-model-routing step, run directly after the model choice.
+
+    Offered only when :func:`routing_setup_applies` holds, only in an
+    interactive stdin, and only when there is something to route across.  The
+    default answer is **skip**: nothing is written and ``config.yaml`` stays
+    byte-identical.  Any write goes through ``agent.model_router.update_routing``
+    (validate → atomic save → read back), so an invalid choice writes nothing.
+
+    An existing ``smart_model_routing`` block is never reset: the first prompt
+    offers to keep it, and a change starts from the models already listed.
+
+    Returns the block read back from disk, or None when nothing was written.
+    """
+    if not routing_setup_applies(provider_id):
+        return None
+    from hermes_cli.setup import is_interactive_stdin
+    if not is_interactive_stdin():
+        # Non-interactive / CI setup must not block or touch routing config.
+        return None
+    try:
+        from agent import model_router as router
+        from hermes_cli.config import load_config
+    except Exception:  # pragma: no cover - setup must never die here
+        return None
+    try:
+        raw_block = (load_config() or {}).get("smart_model_routing")
+    except Exception:  # pragma: no cover - defensive
+        raw_block = None
+    if existing_block is not None:
+        raw_block = existing_block
+    settings = router.routing_settings()
+    existing_models = [str(m) for m in settings.get("models") or []]
+    has_block = isinstance(raw_block, dict) and bool(raw_block)
+    model_list = [str(m) for m in (model_list or []) if str(m).strip()]
+
+    print()
+    print("  Smart model routing (optional)")
+    print("  Routes each request to the model that fits it — deterministic, no extra API call.")
+
+    if has_block:
+        state = "on" if settings.get("enabled") else "off"
+        print(f"  Currently {state}"
+              f"{f' with {len(existing_models)} model(s)' if existing_models else ''}.")
+        rows = ["Keep the current routing configuration (default)",
+                "Change the routing configuration"]
+        if settings.get("enabled"):
+            rows.append("Turn smart model routing off")
+        idx = _choice_index("Smart model routing", rows, 0)
+        if idx is None or idx == 0:
+            print("  Keeping the current routing configuration.")
+            return None
+        if idx == len(rows) - 1 and settings.get("enabled"):
+            try:
+                result = router.update_routing({"enabled": False})
+            except ValueError as exc:
+                print(f"  ✗ Smart model routing not changed: {exc}")
+                return None
+            print("  Smart model routing turned off.")
+            _print_routing_readback(result)
+            return result
+        mode_rows = ["Route across all eligible models",
+                     "Choose the models routing may use"]
+        default_mode = 1 if settings.get("preferred_models_only") else 0
+        mode_idx = _choice_index("Routing mode", mode_rows, default_mode)
+        if mode_idx is None:
+            print("  Nothing changed.")
+            return None
+        mode_all = mode_idx == 0
+    else:
+        if len(model_list) < 2:
+            print(f"  Only {len(model_list)} model(s) discovered for {provider_id}; routing needs at"
+                  " least two, so there is nothing to choose between. Left off.")
+            return None
+        rows = ["Skip — keep one model for every request (default)",
+                "Route across all eligible models",
+                "Choose the models routing may use"]
+        idx = _choice_index("Smart model routing", rows, 0)
+        if idx is None or idx == 0:
+            print("  Smart model routing left off — nothing changed.")
+            return None
+        mode_all = idx == 1
+
+    if mode_all:
+        changes = {"enabled": True, "preferred_models_only": False}
+    else:
+        if not model_list:
+            print("  No model list available for this provider — routing left unchanged.")
+            return None
+        print("  Pick the models routing may use, one at a time; choose Skip when done.")
+        unknown = [m for m in existing_models if m not in model_list]
+        if unknown:
+            print(f"  Keeping {', '.join(unknown)} from the current configuration"
+                  f" (not in today's {provider_id} list).")
+        picked = _multi_pick_models(model_list, preselected=existing_models,
+                                    prompt="Add routing model: ")
+        if len(picked) < 2:
+            print(f"  Smart model routing needs at least two models — {len(picked)} selected,"
+                  " so nothing was saved.")
+            return None
+        problems = router.validate_routing(
+            {"enabled": True, "preferred_models_only": True, "models": picked})
+        if problems:
+            print("  ✗ Smart model routing not saved: " + "; ".join(problems))
+            return None
+        changes = {"enabled": True, "preferred_models_only": True, "models": picked}
+
+    try:
+        result = router.update_routing(changes)
+    except ValueError as exc:
+        print(f"  ✗ Smart model routing not saved: {exc}")
+        return None
+    _print_routing_readback(result)
+    return result

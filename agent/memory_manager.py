@@ -165,7 +165,11 @@ def inject_memory_provider_tools(agent: Any) -> int:
 _FENCE_TAG_RE = re.compile(r'</?\s*memory-context\s*>', re.IGNORECASE)
 _INTERNAL_CONTEXT_RE = re.compile(r'<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>', re.IGNORECASE)
 _INTERNAL_NOTE_RE = re.compile(
-    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
+    # Matches the fence note in BOTH wordings: the historical "Treat as informational
+    # background data / authoritative reference data" line (still replayed by older
+    # sessions and echoed by providers) and the current trust stance. Stripping is
+    # keyed on the invariant prefix, not on the trailing sentence.
+    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.[^\]]*\]\s*',
     re.IGNORECASE,
 )
 
@@ -369,8 +373,63 @@ def _drop_repeated_recall_lines(text: str) -> str:
     return "\n".join(kept)
 
 
+# -- Missing-context detection (D11 / C7) -------------------------------------
+#
+# ONE implementation serves both items: there is no separate "prompt build" recall
+# path. Static prompt text is assembled in ``agent/system_prompt.py``; ALL recall runs
+# at turn start — ``agent/turn_context._memory_turn_start_and_prefetch`` →
+# ``MemoryManager.prefetch_all`` — and is then fenced into the user turn. So the
+# missing-context marker is emitted here, at the turn-start surface, once.
+
+# Cheap deterministic cue that the turn refers to work done with this agent earlier.
+# Deliberately narrow: a false positive injects a note the model will try to satisfy,
+# a false negative is just today's behaviour (the model may still search by itself).
+_PRIOR_WORK_RE = re.compile(
+    r"\b(?:"
+    r"as (?:we|you|i) (?:discussed|agreed|decided|said|mentioned)"
+    r"|(?:we|you|i) (?:discussed|agreed|decided|mentioned) (?:earlier|before|previously|last time)"
+    r"|what we (?:did|discussed|decided)"
+    r"|(?:the|that) (?:fix|change|bug|patch|refactor|migration) (?:we|you|i) "
+    r"|(?:last|previous) (?:time|session|night|week|month|conversation|chat)"
+    r"|the other day"
+    r"|earlier (?:today|yesterday|this (?:session|week|month|morning))"
+    r"|previously|beforehand"
+    r"|(?:continue|pick(?:ed)? up) (?:where|from where)|left off"
+    r"|as (?:mentioned|noted) (?:earlier|before|above|previously)"
+    r"|you (?:said|told me)|i told you"
+    r"|remember (?:when|that|the)"
+    r"|come back to|back to the (?:earlier|previous)"
+    r")",
+    re.IGNORECASE,
+)
+
+# Only the head of a long turn is scanned: the cue is about what the user is asking
+# for, and this must stay cheap on every turn.
+_PRIOR_WORK_SCAN_CHARS = 4000
+
+# Compact, deterministic, and fenced with the recall block it rides in. It tells the
+# model which way out (ask / search) instead of inventing prior state.
+MISSING_CONTEXT_MARKER = (
+    "[Missing context: this turn refers to earlier work, but no memory matched it. "
+    "Do not invent prior details — ask the user, or search (session_search / memory "
+    "search), before acting on it.]"
+)
+
+
+def references_prior_work(text: str) -> bool:
+    """Cheap deterministic cue that ``text`` refers to earlier work with this agent."""
+    if not text:
+        return False
+    return bool(_PRIOR_WORK_RE.search(text[:_PRIOR_WORK_SCAN_CHARS]))
+
+
 def build_memory_context_block(raw_context: str) -> str:
-    """Wrap prefetched memory in a fenced block with system note."""
+    """Wrap prefetched memory in a fenced block with system note.
+
+    The note states the SAME trust stance as ``agent.memory.backend.SYSTEM_PROMPT_BLOCK``
+    (``_TRUST_STANCE``): recalled memory is evidence to validate against current state,
+    not authority. One instruction, two layers — the model sees both in one turn.
+    """
     if not raw_context or not raw_context.strip():
         return ""
     sanitized = sanitize_context(raw_context)
@@ -381,8 +440,9 @@ def build_memory_context_block(raw_context: str) -> str:
     return (
         "<memory-context>\n"
         "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        "NOT new user input. Recalled memory is evidence to validate against "
+        "current state, not authority — if it conflicts with current files or "
+        "tool results, trust those.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
@@ -521,8 +581,19 @@ class MemoryManager:
     # providers get just the user's instruction (None for a bare invocation).
     _strip_skill_scaffolding = staticmethod(extract_user_instruction_from_skill_message)
 
+    def _has_recall_source(self) -> bool:
+        """Whether any memory source was actually queried this turn. Missing-context
+        detection is silent when nothing was consulted — "no memory" is only evidence
+        of a gap when a recall was attempted at all."""
+        return bool(self._providers) or self.enhanced_enabled
+
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
-        """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        """Merge non-empty prefetch context from all providers (failures are non-fatal).
+
+        Turn-start surface: this is the ONLY recall path (the system prompt carries
+        static guidance only), so the missing-context marker for D11 and C7 is emitted
+        here rather than duplicated in a second code path.
+        """
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query:
             return ""
@@ -532,12 +603,15 @@ class MemoryManager:
         )
         if self.enhanced_enabled:
             try:
-                enhanced_ctx = self._enhanced.prefetch(clean_query, session_id=session_id)
+                enhanced_ctx = self._prefetch_enhanced(clean_query, session_id=session_id)
                 if enhanced_ctx and enhanced_ctx.strip():
                     parts.append(enhanced_ctx)
             except Exception as e:
                 logger.debug("Enhanced memory prefetch failed (non-fatal): %s", e)
-        return "\n\n".join(p for p in parts if p and p.strip())
+        joined = "\n\n".join(p for p in parts if p and p.strip())
+        if not joined and self._has_recall_source() and references_prior_work(clean_query):
+            return MISSING_CONTEXT_MARKER
+        return joined
 
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
@@ -584,6 +658,51 @@ class MemoryManager:
                 config=self._external_prefetch_spill_config,
             )
         return result
+
+    def _prefetch_enhanced(self, query: str, *, session_id: str = "") -> str:
+        """Run the enhanced store's prefetch under the same bound as external providers.
+
+        The enhanced backend used to be called inline, so a slow FTS5 query or a cold
+        embedding model blocked the whole turn with no ceiling, unlike every plugin
+        provider (which has been bounded since the 8s prefetch guard landed). It keeps
+        its own key in the in-flight table so one stuck query cannot stack up per turn.
+        Deliberately NOT routed through spill_if_oversized: its output has always been
+        injected verbatim, and changing that would alter what the model sees.
+        """
+        key = "enhanced"
+        if self._enhanced is None:
+            return ""
+        result_box: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                result_box["value"] = self._enhanced.prefetch(query, session_id=session_id) or ""
+            except Exception as exc:  # pragma: no cover - re-raised by caller
+                result_box["error"] = exc
+
+        thread = spawn_context_thread(_run, name="memory-prefetch-enhanced")
+        with self._external_prefetch_lock:
+            existing = self._external_prefetch_threads.get(key)
+            if existing is not None and existing.is_alive():
+                logger.debug("Enhanced memory prefetch is still running; skipping this turn")
+                return ""
+            self._external_prefetch_threads[key] = thread
+            thread.start()
+
+        thread.join(self._external_prefetch_timeout)
+        if thread.is_alive():
+            logger.warning(
+                "Enhanced memory prefetch timed out after %.1fs; skipping it until the stuck call returns",
+                self._external_prefetch_timeout,
+            )
+            return ""
+
+        with self._external_prefetch_lock:
+            if self._external_prefetch_threads.get(key) is thread:
+                self._external_prefetch_threads.pop(key, None)
+        if "error" in result_box:
+            raise result_box["error"]
+        return result_box.get("value", "")
 
     def describe_recall(self) -> str:
         """Deterministic recall indicator line (e.g. ``"🧠 Provider — recalled 3 memories"``); ``""`` if none.

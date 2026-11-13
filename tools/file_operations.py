@@ -1069,9 +1069,89 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         utf16_result = self._try_read_utf16(path, offset, limit, file_size)
         if utf16_result is not None:
             return utf16_result
+        legacy_result = self._try_read_legacy_text(path, offset, limit, file_size, sample_bytes)
+        if legacy_result is not None:
+            return legacy_result
         return ReadResult(
             is_binary=True, file_size=file_size,
             error=describe_binary_file(sample_bytes, file_size))
+
+    #: Extensions that are text by contract, so a non-UTF-8 encoding is a decoding problem rather
+    #: than a reason to refuse the read. A cp1252 CSV used to arrive as "Binary file (unknown binary,
+    #: 28 bytes) - cannot display as text" while the same bytes decoded perfectly through the
+    #: delegation path. Anything not listed here keeps the strict binary verdict.
+    _LEGACY_TEXT_EXTENSIONS = frozenset({
+        ".csv", ".tsv", ".txt", ".log", ".md", ".json", ".jsonl", ".yaml", ".yml", ".ini",
+        ".conf", ".cfg", ".env", ".sql", ".srt", ".vtt", ".nfo",
+    })
+    _LEGACY_MAX_BYTES = 10 * 1024 * 1024
+
+    def _try_read_legacy_text(self, path: str, offset: int, limit: int, file_size: int,
+                              sample_bytes: "Optional[bytes]") -> "Optional[ReadResult]":
+        """Read a text-contract file as cp1252/latin-1 when UTF-8 decode failed, or None.
+
+        ``sample_bytes`` is the raw head: NUL bytes still mean binary, whatever the extension.
+        Replacement characters mean the guess was wrong, so the caller keeps the binary refusal
+        instead of showing mojibake.
+        """
+        suffix = os.path.splitext(str(path))[1].lower()
+        if suffix not in self._LEGACY_TEXT_EXTENSIONS or file_size > self._LEGACY_MAX_BYTES:
+            return None
+        if sample_bytes and b"\x00" in sample_bytes:
+            return None
+        snippet = (
+            "import sys, json\n"
+            f"p = {json.dumps(str(path))}\n"
+            f"offset = {int(offset)}\n"
+            f"limit = {int(limit)}\n"
+            "try:\n"
+            "    with open(p, 'rb') as f:\n"
+            "        data = f.read()\n"
+            "    enc = None\n"
+            "    for candidate in ('utf-8-sig', 'cp1252', 'latin-1'):\n"
+            "        try:\n"
+            "            text = data.decode(candidate)\n"
+            "            enc = candidate\n"
+            "            break\n"
+            "        except UnicodeDecodeError:\n"
+            "            continue\n"
+            "    if enc is None:\n"
+            "        print('HERMES_LEGACY:NO'); sys.exit(0)\n"
+            "    if '\\ufffd' in text:\n"
+            "        print('HERMES_LEGACY:NO'); sys.exit(0)\n"
+            "    text = text.replace('\\r\\n', '\\n')\n"
+            "    lines = text.split('\\n')\n"
+            "    out = {'total_lines': len(lines), 'encoding': enc,\n"
+            "           'content': '\\n'.join(lines[offset - 1: offset - 1 + limit])}\n"
+            "    print('HERMES_LEGACY:OK')\n"
+            "    print(json.dumps(out, ensure_ascii=True))\n"
+            "except Exception:\n"
+            "    print('HERMES_LEGACY:NO'); sys.exit(0)\n"
+        )
+        result = self._exec_python_snippet(snippet)
+        if result.exit_code != 0 and "python3" in (result.stdout or ""):
+            result = self._exec_python_snippet(snippet, py="python")
+        stdout = _strip_terminal_fence_leaks(result.stdout or "")
+        marker = stdout.find("HERMES_LEGACY:OK")
+        if result.exit_code != 0 or marker < 0:
+            return None
+        payload = stdout[marker + len("HERMES_LEGACY:OK"):].strip()
+        try:
+            data = json.loads(payload.split("\n", 1)[0] if "\n" in payload else payload)
+            content = data["content"]
+            total_lines = int(data["total_lines"])
+            encoding = str(data.get("encoding", "unknown"))
+        except (ValueError, KeyError, TypeError):
+            return None
+        end_line = offset + limit - 1
+        truncated = total_lines > end_line
+        hint = (f"Decoded as {encoding} (not UTF-8). Writes would re-encode as UTF-8."
+                + (f" Use offset={end_line + 1} to continue reading (showing {offset}-{end_line}"
+                   f" of {total_lines} lines)" if truncated else ""))
+        return ReadResult(
+            content=self._add_line_numbers(content, offset), total_lines=total_lines,
+            file_size=file_size, truncated=truncated, hint=hint,
+            truncated_lines=True if truncated else None)
 
     def _read_file_sequential(self, path: str, offset: int, limit: int) -> ReadResult:
         """One-probe-per-call read: the pre-compound form, kept as fallback for

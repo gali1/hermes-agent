@@ -1,7 +1,10 @@
-"""Google Custom Search JSON API — bundled, auto-loaded.
+"""Google Programmable Search (Custom Search JSON API) — bundled, auto-loaded.
 
-Canonical credentials: ``GOOGLE_CSE_API_KEY`` + ``GOOGLE_CSE_CX`` (``GOOGLE_API_KEY`` /
-``GOOGLE_CSE_ID`` accepted as aliases).
+Keyed fallback tier: see ``plugins.web.google_cse.provider`` and
+:data:`agent.web_search_registry._FALLBACK_PREFERENCE`.
+
+Credentials: ``GOOGLE_CSE_API_KEY`` + ``GOOGLE_CSE_ID`` (``GOOGLE_API_KEY`` /
+``GOOGLE_CSE_CX`` accepted as aliases).
 
 Search-only. Deliberately fails closed: with either credential missing the provider reports
 ``not configured`` rather than returning an empty success, so a caller can distinguish

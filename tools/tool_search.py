@@ -37,6 +37,9 @@ logger = logging.getLogger("tools.tool_search")
 # maps to one gateway request. Describe has no such remote limit.
 _MAX_QUERIES_PER_CALL = 7
 _MAX_DESCRIBE_NAMES_PER_CALL = 10
+# Zero-match model passes per tool_search call. A batch of empty queries must not
+# multiply the fallback latency (each pass has its own wall-clock cap).
+_MAX_ZERO_MATCH_PASSES = 3
 
 # Canonical name of the reliability-ranking flag, plus the pre-rename key kept as a
 # deprecated alias. Config drift here is silent by nature (a misspelled opt-in just does
@@ -49,8 +52,8 @@ _RELIABILITY_TRUTHY = frozenset({"1", "true", "yes", "on"})
 # believes is active but is not is worse than a warning.
 _KNOWN_TOOL_SEARCH_KEYS = frozenset({
     "enabled", "threshold_pct", "search_default_limit", "max_search_limit", "listing",
-    "listing_max_tokens", "defer", "zero_match_llm", RELIABILITY_FLAG,
-    RELIABILITY_FLAG_LEGACY,
+    "listing_max_tokens", "defer", "zero_match_llm", "zero_match_llm_timeout",
+    RELIABILITY_FLAG, RELIABILITY_FLAG_LEGACY,
 })
 
 
@@ -107,16 +110,24 @@ class ToolSearchConfig:
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
     # Opt-in: re-order already-admitted hits by recorded tool success (see
-    # load_tool_reliability). Off by default — ranking stays purely lexical until asked for,
-    # and because the factor is applied after the admission gate it can never hide a hit.
-    # Canonical key is ``reliability_rerank``; ``reliability`` is a deprecated alias resolved
-    # by _reliability_flag (canonical wins, alias warns).
-    reliability: bool = False
+    # load_tool_reliability / tools.tool_search_reliability). Off by default — ranking stays
+    # purely lexical until asked for, and because the factor is applied after the admission
+    # gate it can never hide a hit. Canonical key is ``reliability_rerank``; ``reliability``
+    # is a deprecated alias resolved by _reliability_flag (canonical wins, alias warns).
+    reliability_rerank: bool = False
     # Opt-in: on a zero-match query, make ONE bounded model call over the catalog listing to
     # recover candidates whose names are recognisable but whose descriptions did not match.
     # Off by default; steady-state cost is unchanged because it only fires when lexical
     # search returns nothing (see the AnyTool gap analysis, item 2).
     zero_match_llm: bool = False
+    # Wall-clock cap for that single pass (seconds); the call runs on a worker thread that is
+    # abandoned, not extended, when it expires.
+    zero_match_llm_timeout: float = 4.0
+
+    @property
+    def reliability(self) -> bool:
+        """``reliability_rerank`` under its pre-rename name — both lines' callers read it."""
+        return self.reliability_rerank
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -149,9 +160,10 @@ class ToolSearchConfig:
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
                          if isinstance(defer_raw, (list, tuple, set)) else None),
-            reliability=_reliability_flag(raw),
-            zero_match_llm=str(raw.get("zero_match_llm", "")).strip().lower()
-                        in ("1", "true", "yes", "on"))
+            reliability_rerank=_reliability_flag(raw),
+            zero_match_llm=_flag(raw.get("zero_match_llm")),
+            zero_match_llm_timeout=_clamped_float(
+                raw.get("zero_match_llm_timeout"), 4.0, 0.05, 15.0))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}
@@ -177,6 +189,27 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _clamped_float(value: Any, fallback: float, lo: float, hi: float) -> float:
+    """``float(value)`` (or ``fallback`` when unparseable) clamped to ``[lo, hi]``."""
+    return max(lo, min(hi, _safe_float(value, fallback)))
+
+
+_FLAG_TRUE = frozenset({"1", "true", "on", "yes", "y", "enabled"})
+
+
+def _flag(value: Any) -> bool:
+    """Strict opt-in boolean: only an explicit true-ish value enables a feature.
+
+    ``None``/absent/unknown -> ``False``, so a config typo can never turn on a
+    behaviour that reads a store or spends a model call.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value).strip().lower() in _FLAG_TRUE
 
 
 def _config_from_loader(loader_name: str) -> ToolSearchConfig:
@@ -216,11 +249,27 @@ _DIRECT_SURFACE_TOOLSETS = CLIENT_SURFACE_TOOLSETS | TOOLSET_SESSION_PLATFORMS.k
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
+def _ambient_toolset(name: str) -> bool:
+    """True when a tool's toolset is registered ambient on the host registry (fail-closed)."""
+    try:
+        from tools.registry import registry as _registry
+        toolset = _registry_toolset(name)
+        return bool(toolset) and _registry.is_ambient_toolset(toolset)
+    except Exception:
+        return False
+
+
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
     plugin tool). Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    # An ambient toolset is the plugin's declaration that its tools must be reachable in
+    # EVERY session (toolaria's rescuer_fetch redeems handles its hook created everywhere).
+    # A tool_search stub is not reachability: the tool must stay on the direct surface, for
+    # the same reason ``clarify`` does.
+    if _ambient_toolset(name):
         return False
     if defer_tools is not None and name in defer_tools:
         return True
@@ -512,10 +561,112 @@ def _string_list_arg(args: Dict[str, Any], key: str, *, dedupe: bool, max_items:
     return out, None
 
 
+def load_reliability_multipliers(*, db_path: Optional[Any] = None,
+                                 now: Optional[float] = None) -> Dict[str, float]:
+    """Outcome-derived multipliers from ``tools.tool_search_reliability`` (fail-open).
+
+    The import happens at CALL time so tests — and a host that ships without the module —
+    can swap or stub it. Any failure returns ``{}``: no history means no change to the
+    ranking, which is the only safe direction for this to fail.
+    """
+    try:
+        from tools.tool_search_reliability import load_reliability_multipliers as _load
+        return _load(db_path=db_path, now=now) or {}
+    except Exception as exc:  # noqa: BLE001 - ranking must never fail a search
+        logger.debug("tool_search reliability re-rank unavailable: %s", exc)
+        return {}
+
+
+def _reliability_multipliers(config: ToolSearchConfig) -> Optional[Dict[str, float]]:
+    """Per-tool re-rank multipliers from the recent outcome window, or None.
+
+    Strict no-op when the key is off: nothing is imported, nothing is read.
+    Both recorders of the same window are consulted once per dispatch — the
+    ``tools.tool_search_reliability`` counts and the catalog's
+    ``load_tool_reliability`` (which additionally penalises a run of consecutive
+    failures) — and merged by taking the STRONGER demotion per tool, so a tool either
+    recorder considers unreliable stays demoted. The flag is off by default, so this
+    costs nothing in the steady state.
+    Fail-open on any error (missing DB, old schema, junk row) — None means the
+    ranking is exactly the pre-rerank ranking.
+    """
+    if not config.reliability_rerank:
+        return None
+    merged: Dict[str, float] = {}
+    for loader in (load_reliability_multipliers, load_tool_reliability):
+        try:
+            mapping = loader() or {}
+        except Exception as exc:  # noqa: BLE001 - ranking must never fail a search
+            logger.debug("tool_search reliability re-rank unavailable (%s): %s", loader, exc)
+            continue
+        if not isinstance(mapping, dict):
+            continue
+        for name, value in mapping.items():
+            try:
+                multiplier = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(multiplier):
+                continue
+            key = str(name)
+            merged[key] = min(merged.get(key, 1.0), multiplier)
+    return merged or None
+
+
+def _zero_match_hits(query: str, catalog: List[CatalogEntry], corpus: List[CatalogEntry],
+                     limit: int, config: ToolSearchConfig,
+                     proposer: Optional[Any] = None) -> List[CatalogEntry]:
+    """One bounded LLM proposal pass for a query the lexical arm could not answer.
+
+    Returns [] on any failure (model error, timeout, unparsable answer, nothing
+    real proposed), which leaves the caller's empty result exactly as it was.
+    Proposals are filtered against ``corpus`` first, so a hallucinated name is
+    dropped rather than returned.
+    """
+    if not catalog:
+        return []
+    try:
+        from tools.tool_search_zero_match import propose_entries
+        return propose_entries(
+            query, catalog, corpus, call=proposer,
+            timeout=config.zero_match_llm_timeout, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - degrade silently to the empty result
+        logger.debug("tool_search zero-match fallback failed (%s: %s); returning the "
+                     "empty lexical result", type(exc).__name__, exc)
+        return []
+
+
+def _zero_match_recovery(query: str, catalog: List[CatalogEntry], corpus: List[CatalogEntry],
+                         limit: int, config: ToolSearchConfig, *,
+                         proposer: Optional[Any] = None,
+                         selector: Optional[Callable[[str, str], Sequence[str]]] = None,
+                         ) -> Tuple[List[CatalogEntry], Optional[str]]:
+    """One bounded model pass for a query the lexical arm could not answer.
+
+    Two injection shapes reach this, one per caller: ``zero_match_proposer``
+    (``(messages, timeout) -> response``, the ``tools.tool_search_zero_match`` contract)
+    and ``llm_select`` (``(query, listing) -> names``, the selector ``model_tools``
+    builds). Whichever the caller supplied runs, and both filter proposals against the
+    real corpus, so a hallucinated name can never leak into a result. Returns
+    ``(entries, match_mode)``; ``([], None)`` on any failure — this is a recovery path,
+    never a reason for a search to raise.
+    """
+    if proposer is not None:
+        return _zero_match_hits(query, catalog, corpus, limit, config, proposer=proposer), None
+    if selector is not None:
+        names = _zero_match_candidates(corpus, query, selector, limit)
+        if not names:
+            return [], None
+        by_name = {entry.name: entry for entry in corpus}
+        return [by_name[name] for name in names if name in by_name], "llm_name_pass"
+    return [], None
+
+
 def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
                          config: Optional[ToolSearchConfig] = None,
                          connector_search: Optional[Any] = None,
-                         llm_select: Optional[Callable[[str, str], Sequence[str]]] = None) -> str:
+                         llm_select: Optional[Callable[[str, str], Sequence[str]]] = None,
+                         zero_match_proposer: Optional[Any] = None) -> str:
     config = config or load_config()
     queries, err = _string_list_arg(args, "queries", dedupe=False, max_items=_MAX_QUERIES_PER_CALL,
                                     retry_hint="Retry with fewer, more targeted queries.")
@@ -538,22 +689,31 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     # case) instead of recomputing document lengths and frequencies for every query in a batch.
     base_stats = _corpus_stats(catalog) if catalog else None
     # Loaded once per dispatch, never inside the loop; None keeps ranking purely lexical.
-    reliability_map = load_tool_reliability() if config.reliability else None
+    multipliers = _reliability_multipliers(config)
+    fallback_passes = 0
     for position, query in enumerate(queries):
         corpus = catalog + remote_entries[position]
         stats = base_stats if not remote_entries[position] else None
         hits = search_catalog(corpus, query, limit=limit, corpus_stats=stats,
-                              reliability=reliability_map)
+                              multipliers=multipliers)
         for h in hits:
             tools_map.setdefault(h.name, _shared_tool_record(h))
         matches = [h.name for h in hits]
         group: Dict[str, Any] = {"query": query, "matches": matches}
-        if not matches and corpus and config.zero_match_llm and llm_select is not None:
-            recovered = _zero_match_candidates(corpus, query, llm_select, limit)
+        if (not matches and corpus and config.zero_match_llm
+                and fallback_passes < _MAX_ZERO_MATCH_PASSES
+                and (zero_match_proposer is not None or llm_select is not None)):
+            fallback_passes += 1
+            recovered, match_mode = _zero_match_recovery(
+                query, catalog, corpus, limit, config,
+                proposer=zero_match_proposer, selector=llm_select)
             if recovered:
-                matches = recovered
-                group["matches"] = recovered
-                group["match_mode"] = "llm_name_pass"
+                for h in recovered:
+                    tools_map.setdefault(h.name, _shared_tool_record(h))
+                matches = [h.name for h in recovered]
+                group["matches"] = matches
+                if match_mode:
+                    group["match_mode"] = match_mode
         if not matches and available_sources:
             group["available_sources"] = available_sources
             group["hint"] = (

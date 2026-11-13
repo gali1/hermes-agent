@@ -271,3 +271,32 @@ def test_voice_item_edit_keeps_the_voice_sentinel():
     assert len(items) == 1
     assert isinstance(items[0], _VoiceInputMessage)
     assert items[0].text == "spoken ask, refined"
+
+
+class TestCtrlEIsNeverSilentlyDropped:
+    """A key bound with a False filter is dropped without calling anything — no handler, no message.
+
+    That was Ctrl+E's state: ``filter=not modal_prompt_active(self)``. With a prompt open (approval,
+    clarify, model picker, slash palette) the key did nothing at all and looked broken. Measured in a
+    real application: the handler never ran, so not even "Queue is empty" appeared.
+    """
+
+    def test_the_binding_has_no_filter_and_points_at_the_editor(self):
+        shell = _shell()
+        shell.config = {}
+        handlers = {}
+        for binding in shell._tui_build_key_bindings().bindings:
+            if getattr(binding, "keys", None) == ("c-e",):
+                handlers.setdefault("c-e", []).append(binding.handler.__name__)
+        assert handlers.get("c-e") == ["_tui_handle_ctrl_e"], \
+            "c-e must be bound once, unfiltered, to the queue editor"
+
+    def test_ctrl_e_explains_itself_when_a_modal_prompt_is_open(self):
+        shell = _shell()
+        shell._pending_input.put("/yolo")
+        shell._model_picker_state = {"options": []}
+        buf = Buffer()
+        with patch("cli._cprint") as cprint:
+            shell._tui_handle_ctrl_e(_event(buf))
+        cprint.assert_called_once_with(f"  {t('cli.queue.edit_blocked_modal')}")
+        assert buf.text == "" and shell._queue_edit_index is None

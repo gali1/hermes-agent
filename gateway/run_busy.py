@@ -911,6 +911,9 @@ class GatewayBusySessionMixin:
         "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
+        # Routing changes only affect the NEXT turn (route_turn reads the block per turn), so
+        # configuring it mid-run is safe and useful.
+        "model-routing",
     )
     # Dispatched only on the idle path (busy dispatch has its own allowlist).
     _IDLE_COMMANDS = (
@@ -919,7 +922,7 @@ class GatewayBusySessionMixin:
         "suggestions", "save", "retry",
         "sethome", "compress", "usage", "topup", "insights", "reload-mcp", "reload-skills",
         "bundles", "debug", "title", "resume", "sessions", "branch", "rollback", "diff", "goal",
-        "loop", "refine", "review", "voice",
+        "loop", "refine", "review", "voice", "model-routing",
     )
 
     def _command_handler_table(self, names) -> Dict[str, Any]:
@@ -1419,3 +1422,963 @@ class GatewayBusySessionMixin:
         except Exception:
             return {}
         return cfg if isinstance(cfg, dict) else {}
+
+    # ------------------------------------------------------------------
+    # /model-routing — the shared routing contract, surfaced in chat
+    # ------------------------------------------------------------------
+    #
+    # Everything this flow reads and writes goes through ``agent.model_router``'s
+    # contract (``routing_settings`` / ``routing_report`` / ``routing_preview`` /
+    # ``update_routing``): there is no second config store, no second status
+    # renderer and no gateway-local business logic.  The flow is deliberately
+    # argument-driven (``/model-routing 3``) rather than hijacking bare replies:
+    # a plain "1" in chat must keep reaching the agent, and every platform can
+    # carry a command with args, buttons or not.
+
+    #: An abandoned flow applies nothing after this long.
+    _MODEL_ROUTING_FLOW_TTL = 900.0
+    #: Candidate rows per page in the model step.
+    # Picker-only bound: the whole catalog, deliberately far above _CATALOG_POOL_LIMIT.
+    _PICKER_POOL_LIMIT = 5000
+    _MODEL_ROUTING_PAGE_SIZE = 10
+    #: Words that discard the pending flow without applying anything.
+    _MODEL_ROUTING_CANCEL_WORDS = frozenset({"cancel", "close", "exit", "quit", "abort", "discard"})
+    _MODEL_ROUTING_YES_WORDS = frozenset({"yes", "y", "apply", "confirm", "save", "doit", "do-it"})
+    _MODEL_ROUTING_STRATEGIES = ("automatic", "cost", "quality", "tool_calls_only")
+    #: Short labels for the strategy step; the token is what gets saved to config.yaml.
+    _MODEL_ROUTING_STRATEGY_LABELS = {
+        "automatic": "automatic — capability first, then cost",
+        "cost": "cost — cheapest capable model",
+        "quality": "quality — strongest capable model",
+        "tool_calls_only": "tool_calls_only — default model stays primary; capability-only delegation",
+    }
+
+    def _model_routing_flows(self) -> Dict[str, Dict[str, Any]]:
+        """Per chat+user flow state (``platform:chat:user`` → flow), lazily created."""
+        flows = getattr(self, "_model_routing_flow_state", None)
+        if not isinstance(flows, dict):
+            flows = {}
+            self._model_routing_flow_state = flows
+        return flows
+
+    @staticmethod
+    def _model_routing_flow_key(event) -> str:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", None), "value", "") or ""
+        chat = str(getattr(source, "chat_id", "") or "")
+        user = str(getattr(source, "user_id", "") or "")
+        return f"{platform}:{chat}:{user}"
+
+    def _model_routing_authorized(self, source) -> bool:
+        """The same gate every other authorized action uses (``_is_user_authorized``).
+
+        The inbound path already refuses unauthorized senders; this is the
+        side-effect boundary, because a routing write changes model selection for
+        the whole profile.  A runner stub without the mixin method is trusted —
+        there is nobody to ask and no live config to protect.
+        """
+        checker = getattr(self, "_is_user_authorized", None)
+        if not callable(checker) or source is None:
+            return True
+        try:
+            return bool(checker(source))
+        except Exception:  # pragma: no cover - defensive: an erroring gate denies
+            logger.debug("model-routing: authorization check failed", exc_info=True)
+            return False
+
+    @staticmethod
+    def _model_routing_load_config() -> Dict[str, Any]:
+        """The live user config through the per-turn reader ``route_turn`` uses.
+
+        ``load_config_readonly`` is cached on the file signature, so a write from
+        any interface (CLI, another chat, a text editor) is visible to the very
+        next read with no gateway restart.
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+            cfg = load_config_readonly()
+        except Exception:
+            logger.debug("model-routing: config read failed", exc_info=True)
+            return {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    @classmethod
+    def _model_routing_scope_text(cls, settings: Dict[str, Any]) -> str:
+        models = [str(m) for m in (settings.get("models") or [])]
+        if not models:
+            return "all eligible models"
+        listed = ", ".join(models[:6]) + (f" (+{len(models) - 6} more)" if len(models) > 6 else "")
+        if settings.get("preferred_models_only"):
+            return f"only these, in priority order: {listed}"
+        return f"prefer {listed}, widening to the catalog when a task needs it"
+
+    @classmethod
+    def _model_routing_state_text(cls, report: Dict[str, Any], settings: Optional[Dict[str, Any]] = None) -> str:
+        """Current state, rendered from the shared report (never recomputed here)."""
+        settings = settings if settings is not None else (report.get("settings") or {})
+        request = report.get("request") or {}
+        on = bool(settings.get("enabled"))
+        lines = [f"🧭 Model routing: {'ON' if on else 'OFF'}"]
+        if not on:
+            lines.append("   Routing is not applied to turns; the selection below is hypothetical.")
+        lines.append(
+            f"   Strategy: {settings.get('strategy', 'automatic')} · stability threshold "
+            f"{settings.get('stability_threshold', 0.15)} · cost optimisation "
+            f"{'on' if settings.get('cost_optimization', True) else 'off'}"
+        )
+        lines.append(f"   Models: {cls._model_routing_scope_text(settings)}")
+        excluded = [str(m) for m in ((settings or {}).get("exclude") or [])]
+        if excluded:
+            lines.append(f"   Never auto-select: {', '.join(excluded)}")
+        candidates = report.get("candidates") or []
+        lines.append(
+            f"   Candidates: {report.get('eligible_count', 0)} eligible of {len(candidates)} considered"
+        )
+        tier = request.get("tier") or "unknown"
+        selected = report.get("selected") or ""
+        reason = (report.get("reason") or "").strip()
+        would = f"would select {selected}" if selected else "would select nothing"
+        suffix = f" — {reason}" if reason else ""
+        lines.append(f"   This prompt: tier {tier} → {would}{suffix}")
+        skip = report.get("skip_reason") or ""
+        if skip and skip != "disabled":
+            lines.append(f"   Skipped: {skip}")
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_pending_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
+        """``key: before → after`` for the keys the flow wants to write."""
+        order = ("enabled", "strategy", "stability_threshold", "models", "preferred_models_only",
+                 "cost_optimization", "switch_on_cost", "allow_unknown_metadata",
+                 "exclude", "weights", "reliability")
+        rows = []
+        for key in order:
+            if key not in changes:
+                continue
+            before, after = settings.get(key), changes[key]
+            if before == after:
+                continue
+            rows.append(f"   {key}: {cls._model_routing_value_text(key, before)} → "
+                        f"{cls._model_routing_value_text(key, after)}")
+        return "\n".join(rows)
+
+    @staticmethod
+    def _model_routing_map_text(mapping: Any, sep: str = ", ") -> str:
+        """``{capability: 0.45, ...}`` → ``capability=0.45, ...`` (sorted, stable)."""
+        if not isinstance(mapping, dict) or not mapping:
+            return ""
+        parts = []
+        for key, value in sorted(mapping.items()):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                parts.append(f"{key}={float(value):g}")
+            else:
+                parts.append(f"{key}={value}")
+        return sep.join(parts)
+
+    @classmethod
+    def _model_routing_value_text(cls, key: str, value: Any) -> str:
+        if key == "models":
+            models = [str(m) for m in (value or [])]
+            return "all eligible" if not models else ", ".join(models)
+        if key == "exclude":
+            excluded = [str(m) for m in (value or [])]
+            return "(none)" if not excluded else ", ".join(excluded)
+        if key in ("weights", "reliability"):
+            text = cls._model_routing_map_text(value) if isinstance(value, dict) else str(value)
+            return text or "(none)"
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        return str(value)
+
+    @classmethod
+    def _model_routing_menu_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
+        pending = cls._model_routing_pending_text(settings, changes)
+        lines = ["What would you like to do?",
+                 "  1 Enable routing",
+                 "  2 Disable routing",
+                 "  3 Change models",
+                 "  4 Change preferences",
+                 "  5 Switch to single-model mode (same as disable)",
+                 "  6 Close"]
+        if pending:
+            lines += ["", "Pending (not saved yet):", pending]
+        lines += ["", "Reply /model-routing <number> — nothing is saved until you confirm."]
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_prefs_text(cls, settings: Dict[str, Any], changes: Dict[str, Any]) -> str:
+        def mark(key: str) -> str:
+            return " *" if key in changes else ""
+        pending = cls._model_routing_pending_text(settings, changes)
+        excluded = [str(m) for m in (settings.get("exclude") or [])]
+        weights_text = cls._model_routing_map_text(settings.get("weights"), sep=" · ") or "(none)"
+        reliability_text = cls._model_routing_map_text(settings.get("reliability")) or "(none — 0.5 assumed)"
+        lines = [
+            "Preferences (reply /model-routing <number>; * = pending change):",
+            f"  1 Strategy — {settings.get('strategy', 'automatic')}{mark('strategy')}",
+            f"  2 Stability threshold — {settings.get('stability_threshold', 0.15)}{mark('stability_threshold')}",
+            f"  3 Cost optimisation — {'on' if settings.get('cost_optimization', True) else 'off'}"
+            f"{mark('cost_optimization')}",
+            f"  4 Mid-session cost downgrade — {'on' if settings.get('switch_on_cost') else 'off'}"
+            f"{mark('switch_on_cost')}",
+            f"  5 Route only among my selected models — "
+            f"{'yes' if settings.get('preferred_models_only') else 'no (widen when needed)'}"
+            f"{mark('preferred_models_only')}",
+            f"  6 Allow unknown capability metadata — "
+            f"{'yes (unknown is penalised, not disqualified)' if settings.get('allow_unknown_metadata', True) else 'no (strict)'}"
+            f"{mark('allow_unknown_metadata')}",
+            f"  7 Never auto-select — {', '.join(excluded) if excluded else '(none)'}{mark('exclude')}",
+            f"  8 Scoring weights — {weights_text}{mark('weights')}",
+            f"  9 Declared reliability — {reliability_text}{mark('reliability')}",
+            "  10 Back to the main menu",
+        ]
+        if pending:
+            # Say how to finish, right where the pending change is shown. Without this the
+            # prefs page looked like a dead end and confirm/yes appeared to do nothing.
+            lines += ["", "Not saved yet:", pending, "",
+                      "Reply /model-routing confirm to save, or /model-routing cancel to discard."]
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_confirm_text(cls, settings: Dict[str, Any], changes: Dict[str, Any],
+                                    preview: Dict[str, Any]) -> str:
+        diff = cls._model_routing_pending_text(settings, changes) or "   (no effective change)"
+        selected = preview.get("selected") or "nothing"
+        reason = (preview.get("reason") or "").strip()
+        lines = [
+            "Save these routing changes?",
+            diff,
+            "",
+            f"A sample prompt would select {selected}" + (f" ({reason})" if reason else ""),
+            "",
+            "Reply /model-routing confirm to save, or /model-routing cancel to discard.",
+        ]
+        return "\n".join(lines)
+
+    @classmethod
+    def _model_routing_state_oneliner(cls, settings: Dict[str, Any]) -> str:
+        """`Routing is ON . automatic . N models in effect` - the one line a pending reply needs."""
+        models = [str(m) for m in (settings.get("models") or []) if m]
+        pool = f"{len(models)} models selected" if models else "all eligible models"
+        return (f"Live now: routing {'ON' if settings.get('enabled') else 'OFF'} \u00b7 "
+                f"{settings.get('strategy') or 'automatic'} \u00b7 {pool}")
+
+    @classmethod
+    def _model_routing_pending_block(cls, settings: Dict[str, Any],
+                                     changes: Dict[str, Any]) -> str:
+        """One short block for "you have unsaved changes" - same wording everywhere."""
+        diff = cls._model_routing_pending_text(settings, changes)
+        if not diff:
+            return ""
+        return ("Not saved yet:\n" + diff
+                + "\n\nReply /model-routing confirm to save, or /model-routing cancel to discard.")
+
+    def _model_routing_current_models(self, settings: Dict[str, Any],
+                                      changes: Dict[str, Any]) -> List[str]:
+        """The models actually in effect, so the picker arrives with them pre-selected.
+
+        Without this nothing is ticked, the toggle list can only add, and removing the model
+        that is currently in use is impossible - which is exactly the complaint this answers.
+        """
+        if changes.get("models"):
+            return [str(m) for m in changes["models"] if m]
+        if settings.get("models"):
+            return [str(m) for m in settings["models"] if m]
+        cfg = self._model_routing_load_config() or {}
+        provider = str((cfg.get("model") or {}).get("provider") or "")
+        declared = ((cfg.get("providers") or {}).get(provider) or {}).get("models") or []
+        if declared:
+            return [str(m) for m in declared if m]
+        default_model = str((cfg.get("model") or {}).get("default") or "")
+        return [default_model] if default_model else []
+
+    def _model_routing_model_choices(self, settings: Dict[str, Any]) -> List[str]:
+        """Models the picker may offer: the operator's list, then the provider catalog.
+
+        Order is meaningful - existing entries keep their priority - so a confirmed
+        selection has a stable interpretation.
+        """
+        from agent import model_router as mr
+
+        cfg = self._model_routing_load_config()
+        provider = str(((cfg or {}).get("model") or {}).get("provider") or "")
+        declared = [str(m) for m in (settings.get("models") or []) if m]
+        default_model = str(((cfg or {}).get("model") or {}).get("default") or "")
+        if default_model and default_model not in declared:
+            declared.insert(0, default_model)
+        try:
+            # `widen_pool` defaults to _CATALOG_POOL_LIMIT (60) because *runtime selection*
+            # must stay cheap. A picker is not selection: truncating here silently hid every
+            # model past the sixtieth catalog entry (gpt-6-luna is entry 101).
+            pool = mr.widen_pool(provider, declared,
+                                 limit=getattr(self, "_PICKER_POOL_LIMIT", 5000))
+        except Exception:  # a catalog miss must not break the picker
+            pool = list(declared)
+        return [str(m) for m in pool if m]
+
+    def _model_routing_models_page(self, flow: Dict[str, Any]) -> str:
+        candidates = flow.get("candidates") or []
+        page = int(flow.get("page") or 0)
+        size = self._MODEL_ROUTING_PAGE_SIZE
+        pages = max(1, (len(candidates) + size - 1) // size)
+        page = max(0, min(page, pages - 1))
+        flow["page"] = page
+        window = candidates[page * size:(page + 1) * size]
+        lines = [f"Models routing may choose from (page {page + 1}/{pages}):"]
+        for offset, name in enumerate(window):
+            lines.append(f"  {page * size + offset + 1} {name}")
+        if pages > 1:
+            line = f"Models {page * size + 1}\u2013{page * size + len(window)} of {len(candidates)}"
+            lines.append(line + "  \u00b7  next / prev")
+        # Every caller of this page is a reply the user answers with text: a text-only
+        # platform, or a button platform where the toggle picker could not be sent. Without
+        # this line the list is a dead end (the reported "I type something and get the same
+        # text back"). Compact on purpose - one line, no paging prose.
+        lines.append("Reply /model-routing 1,3 (first = highest priority), all, none, back or "
+                     "cancel \u2014 or name one: add <model> / remove <model>.")
+        return "\n".join(lines)
+
+    async def _handle_model_routing_command(self, event: MessageEvent) -> Optional[str]:
+        """`/model-routing` + `/model_routing`: view and change smart routing in chat.
+
+        One handler serves both spellings: ``_command_handler_table`` maps ``-`` to
+        ``_``, and the registry carries ``model_routing`` as an alias.
+
+        Returns ``None`` when a button picker was sent (the adapter owns the reply then).
+        """
+        from agent import model_router as mr
+
+        source = getattr(event, "source", None)
+        if not self._model_routing_authorized(source):
+            return ("🔒 Model routing changes model selection for the whole profile, so it is "
+                    "limited to authorized users. Ask the operator to allowlist you, or run "
+                    "`hermes model routing status` on the host.")
+
+        args = (event.get_command_args() or "").strip()
+        token = args.lower()
+        cfg = self._model_routing_load_config()
+        settings = mr.routing_settings(cfg)
+        report = mr.routing_report(cfg, "")
+
+        flows = self._model_routing_flows()
+        key = self._model_routing_flow_key(event)
+        flow = flows.get(key)
+        now = time.time()
+        expired = False
+        if flow is not None and now - float(flow.get("ts") or 0) > self._MODEL_ROUTING_FLOW_TTL:
+            flows.pop(key, None)
+            flow = None
+            expired = True
+
+        def start(step: str, **extra) -> Dict[str, Any]:
+            # Candidates are the pool routing COULD choose. They used to come from
+            # report["candidates"], which only holds the models currently being evaluated - so
+            # every step that offered a choice could only re-offer what was already configured.
+            try:
+                pool = self._model_routing_model_choices(settings)
+            except Exception:  # pragma: no cover - defensive: never break the flow
+                pool = []
+            state = {"step": step, "changes": {}, "ts": now, "page": 0,
+                     "candidates": pool or [str(c.get("model")) for c in
+                                            (report.get("candidates") or []) if c.get("model")],
+                     "settings": dict(settings)}
+            state.update(extra)
+            flows[key] = state
+            return state
+
+        def touch(state: Dict[str, Any]) -> None:
+            state["ts"] = now
+            flows[key] = state
+
+        def finish() -> None:
+            flows.pop(key, None)
+
+        expired_note = "⌛ That routing session timed out — nothing was applied.\n\n" if expired else ""
+
+        # `add <model>` / `remove <model>`: 132 catalog models is eleven pages of eight, so an
+        # exact name has to be expressible in one line. Both verbs stage the same change-set the
+        # picker produces, so confirm/apply is unchanged.
+        verb = args.split()[0].lower() if args.split() else ""
+        if verb in {"add", "remove", "rm", "del", "delete"} and len(args.split()) > 1:
+            names = [n for n in args.split()[1].replace(",", " ").split() if n]
+            state = flow or start("menu")
+            state["step"] = "menu"
+            touch(state)
+            changes_now: Dict[str, Any] = state.setdefault("changes", {})
+            pool = self._model_routing_model_choices(settings)
+            if not pool:  # never override a real pool with an empty one
+                pool = [str(c) for c in (state.get("candidates") or []) if c]
+            state["candidates"] = pool
+            current = self._model_routing_current_models(settings, changes_now)
+            added, dropped, unsure, already, missing = [], [], [], [], []
+            for name in names:
+                if verb == "add":
+                    match = next((m for m in pool if m.lower() == name.lower()), None)
+                    if match is None:
+                        # The operator naming a model is a stronger signal than a possibly stale
+                        # catalog cache, and `allow_unknown_metadata: yes` means an undeclared
+                        # model is penalised rather than disqualified - so add it, but say so.
+                        match = name
+                        unsure.append(name)
+                    if match in current:
+                        already.append(match)
+                    else:
+                        current.append(match)
+                        added.append(match)
+                else:
+                    match = next((m for m in current if m.lower() == name.lower()), None)
+                    if match is None:
+                        missing.append(name)
+                    else:
+                        current.remove(match)
+                        dropped.append(match)
+            if not current and dropped:
+                # An empty list does not mean "no models", it means "the whole eligible
+                # catalog" (section 4) - never let a removal quietly widen the pool.
+                current.extend(dropped)
+                dropped = []
+                return ("Refused: that would empty the list, and an empty list means *every* "
+                        "eligible model rather than none. Disable routing instead "
+                        "(/model-routing disable) if you want routing off.\n\n"
+                        + self._model_routing_models_page(state))
+            changes_now["models"] = list(current)
+            changes_now["preferred_models_only"] = bool(current)
+            flow = state
+            state["page"] = max(0, next((i for i, m in enumerate(pool) if m in current), 0)
+                                // self._MODEL_ROUTING_PAGE_SIZE) if pool else 0
+            notes = []
+            if added:
+                notes.append("Added: " + ", ".join(added))
+            if dropped:
+                notes.append("Removed: " + ", ".join(dropped))
+            if already:
+                notes.append("Already in the list: " + ", ".join(already))
+            if missing:
+                notes.append("Not in your selection, so nothing to remove: "
+                             + ", ".join(missing))
+            if unsure:
+                notes.append("\u26a0\ufe0f Not in the provider catalog (added anyway - routing "
+                             "treats unknown capability metadata as a penalty, not a "
+                             "disqualification): " + ", ".join(unsure)
+                             + "\n   Check the spelling, or run `hermes model routing refresh` "
+                               "if the model is new.")
+            head = "\n".join(notes)
+            if added or dropped:
+                state["step"] = "confirm"
+                touch(state)
+                chosen = ", ".join(current)
+                return (f"{head}\n\nSelected ({len(current)}): {chosen}"
+                        "\n\nReply /model-routing confirm to save, "
+                        "/model-routing cancel to discard, or add/remove another model.")
+            return head
+
+        # Bare ``/model-routing``: show the state and the actions, keeping any pending
+        # (unsaved) changes.  This is also how a user re-anchors after a wrong keypress.
+        if not token:
+            state = flow or start("menu")
+            if state.get("changes"):
+                # There is unsaved work: show it and how to finish, and leave the step alone so
+                # the next `confirm` applies rather than restarting the menu.
+                touch(state)
+                # Pending first, and a one-line summary of what is live - printing the full
+                # state block here repeated 'Models: all eligible models' right under a
+                # pending line that says the models are about to change.
+                return (expired_note + self._model_routing_pending_block(settings, state["changes"])
+                        + "\n\n" + self._model_routing_state_oneliner(settings))
+            state["step"] = "menu"
+            touch(state)
+            text = (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
+                    + self._model_routing_menu_text(settings, state.get("changes") or {}))
+            # Section 6.3: platforms with buttons get the same actions as a keyboard; the
+            # numbered text above stays the fallback (and the only form on text-only platforms).
+            if await self._try_send_routing_menu(event, report, settings, note=expired_note):
+                return None
+            return text
+
+        if token in self._MODEL_ROUTING_CANCEL_WORDS or (
+            flow is not None and flow.get("step") == "confirm" and token in {"no", "n"}
+        ):
+            finish()
+            return (expired_note + self._model_routing_state_text(report, settings)
+                    + "\n\nCancelled — nothing applied.")
+
+        # Apply from wherever the user is. `confirm` only used to be honoured in the confirm
+        # step, so a bare `/model-routing` in between stranded the change-set and answered the
+        # same text forever.
+        pending_changes = dict((flow or {}).get("changes") or {})
+        if pending_changes and token in self._MODEL_ROUTING_YES_WORDS:
+            finish()
+            return await self._model_routing_commit(pending_changes)
+
+        if flow is None:
+            if token in {"1", "enable", "on", "2", "disable", "off", "3", "models",
+                         "4", "preferences", "prefs", "5", "single"}:
+                # A one-shot action typed without opening the menu first.
+                flow = start("menu")
+            else:
+                return (expired_note + self._model_routing_state_text(report, settings) + "\n\n"
+                        + self._model_routing_menu_text(settings, {})
+                        + "\n(Unknown option — start with /model-routing on its own.)")
+
+        touch(flow)
+        step = flow.get("step") or "menu"
+        changes: Dict[str, Any] = flow.setdefault("changes", {})
+
+        if step == "menu":
+            if token in {"1", "enable", "on"}:
+                changes["enabled"] = True
+            elif token in {"2", "disable", "off", "5", "single"}:
+                changes["enabled"] = False
+                if token in {"5", "single"}:
+                    # Section 6.3: "switch to single-model mode" is the *same action* as
+                    # disable, so it must produce the same change-set. Drop a pending
+                    # selection, and clear the scope flag only when it is actually on —
+                    # an unconditional ``preferred_models_only: False`` made this spelling
+                    # materialise a routing block on a config that never had one (C16),
+                    # while ``2``/``disable`` correctly writes nothing.
+                    changes.pop("models", None)
+                    if bool(changes.get("preferred_models_only",
+                                        settings.get("preferred_models_only"))):
+                        changes["preferred_models_only"] = False
+                    else:
+                        changes.pop("preferred_models_only", None)
+            elif token in {"3", "models"}:
+                flow["step"] = "models"
+                flow["page"] = 0
+                # This page used to read flow["candidates"], which nothing ever set, so the
+                # step reported "no eligible models" and the list could never be changed.
+                flow["candidates"] = self._model_routing_model_choices(settings)
+                touch(flow)
+                # Same interaction as the 🎛 button: on a platform with a toggle picker, the
+                # numbered text list is never the reply (it is 132 rows of prose).
+                if await self._model_routing_send_models_picker(event, flow, settings):
+                    return None
+                return (self._model_routing_state_text(report, settings) + "\n\n"
+                        + self._model_routing_models_page(flow))
+            elif token in {"4", "preferences", "prefs"}:
+                flow["step"] = "prefs"
+                touch(flow)
+                return self._model_routing_prefs_text(settings, changes)
+            elif token in {"6", "close", "done"}:
+                finish()
+                return self._model_routing_state_text(report, settings) + "\n\nClosed — nothing applied."
+            else:
+                return (self._model_routing_state_text(report, settings) + "\n\n"
+                        + self._model_routing_menu_text(settings, changes))
+            flow["step"] = "confirm"
+            touch(flow)
+            return self._model_routing_confirm_text(
+                settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+
+        if step == "models":
+            candidates = flow.get("candidates") or []
+            if token in {"next", "n"}:
+                flow["page"] = int(flow.get("page") or 0) + 1
+                touch(flow)
+                return self._model_routing_models_page(flow)
+            if token in {"prev", "previous", "p"}:
+                flow["page"] = max(0, int(flow.get("page") or 0) - 1)
+                touch(flow)
+                return self._model_routing_models_page(flow)
+            if token in {"back", "menu"}:
+                flow["step"] = "menu"
+                touch(flow)
+                return self._model_routing_menu_text(settings, changes)
+            if not candidates:
+                finish()
+                return ("No eligible models were reported for the current provider, so there is "
+                        "nothing to pick from here. Run `hermes model routing configure` on the host.")
+            if token in {"all", "none"}:
+                chosen = candidates if token == "all" else []
+            else:
+                picked: List[str] = []
+                for raw in args.replace(" ", ",").split(","):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    if not raw.isdigit():
+                        picked = []
+                        break
+                    index = int(raw) - 1
+                    if not (0 <= index < len(candidates)):
+                        picked = []
+                        break
+                    if candidates[index] not in picked:
+                        picked.append(candidates[index])
+                if not picked and token not in {"none"}:
+                    # The page below carries the instruction line (C19), so this sentence must
+                    # not repeat it - that is exactly the "two ways to say the same thing"
+                    # clutter the operator reported.
+                    return ("Could not read that selection.\n\n"
+                            + self._model_routing_models_page(flow))
+                chosen = picked
+            changes["models"] = list(chosen)
+            # Section 4 semantics: an explicit list means "only these"; an empty list means
+            # "the whole eligible catalog", which needs the flag explicitly off.
+            changes["preferred_models_only"] = bool(chosen)
+            flow["step"] = "confirm"
+            touch(flow)
+            return self._model_routing_confirm_text(
+                settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+
+        if step == "prefs":
+            if token in {"1", "strategy"}:
+                flow["step"] = "prefs_strategy"
+                touch(flow)
+                opts = "\n".join(
+                    f"  · {self._MODEL_ROUTING_STRATEGY_LABELS.get(name, name)}"
+                    for name in self._MODEL_ROUTING_STRATEGIES
+                )
+                return (f"Which strategy? Reply /model-routing <name> (or cancel):\n{opts}")
+            if token in {"2", "threshold"}:
+                flow["step"] = "prefs_threshold"
+                touch(flow)
+                return ("Stability threshold: how much better a rival must score before it takes "
+                        "the turn (0–1, default 0.15). Reply /model-routing 0.2 (or cancel).")
+            if token in {"3", "cost"}:
+                changes["cost_optimization"] = not bool(settings.get("cost_optimization", True))
+            elif token in {"4", "downgrade"}:
+                changes["switch_on_cost"] = not bool(settings.get("switch_on_cost"))
+            elif token in {"5", "scope"}:
+                changes["preferred_models_only"] = not bool(settings.get("preferred_models_only"))
+            elif token in {"6", "unknown", "metadata"}:
+                changes["allow_unknown_metadata"] = not bool(
+                    settings.get("allow_unknown_metadata", True))
+            elif token in {"7", "exclude"}:
+                flow["step"] = "prefs_exclude"
+                touch(flow)
+                return ("Models that must never be auto-selected (they stay usable through an "
+                        "explicit model choice).\n"
+                        "Reply /model-routing exclude model-a,model-b — or "
+                        "/model-routing exclude none to clear, or cancel.")
+            elif token in {"8", "weights"}:
+                flow["step"] = "prefs_weights"
+                touch(flow)
+                return (
+                    "Scoring weights. Reply /model-routing weights capability=0.5,cost=0.3 — "
+                    "only the dimensions you name change: "
+                    + ", ".join(sorted(mr.default_weights()))
+                    + ".\nReply /model-routing weights default to reset them, or cancel."
+                )
+            elif token in {"9", "reliability"}:
+                flow["step"] = "prefs_reliability"
+                touch(flow)
+                return (
+                    "Declared success rate per model, used to price expected retries. "
+                    "Reply /model-routing reliability model-a=0.98,model-b=0.95 — or "
+                    "/model-routing reliability none to clear, or cancel."
+                )
+            elif token in {"10", "back", "menu"}:
+                flow["step"] = "menu"
+                touch(flow)
+                return self._model_routing_menu_text(settings, changes)
+            else:
+                return self._model_routing_prefs_text(settings, changes)
+            touch(flow)
+            return self._model_routing_prefs_text(settings, changes)
+
+        if step in ("prefs_exclude", "prefs_weights", "prefs_reliability"):
+            return self._model_routing_apply_prefs_value(flow, settings, changes, step, args)
+
+        if step == "prefs_strategy":
+            if token not in self._MODEL_ROUTING_STRATEGIES:
+                return (f"Strategy must be one of {', '.join(self._MODEL_ROUTING_STRATEGIES)} — "
+                        "reply /model-routing automatic|cost|quality, or cancel.")
+            changes["strategy"] = token
+            flow["step"] = "prefs"
+            touch(flow)
+            return self._model_routing_prefs_text(settings, changes)
+
+        if step == "prefs_threshold":
+            try:
+                value = float(token)
+            except ValueError:
+                return ("Stability threshold must be a number between 0 and 1 — reply "
+                        "/model-routing 0.2, or cancel.")
+            if not 0.0 <= value <= 1.0:
+                return "Stability threshold must be between 0 and 1 — reply /model-routing 0.2, or cancel."
+            changes["stability_threshold"] = value
+            flow["step"] = "prefs"
+            touch(flow)
+            return self._model_routing_prefs_text(settings, changes)
+
+        if step == "confirm":
+            if token not in self._MODEL_ROUTING_YES_WORDS:
+                return (self._model_routing_confirm_text(
+                    settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+                    + "\n(Reply /model-routing yes to save or /model-routing cancel to discard.)")
+            finish()
+            return await self._model_routing_commit(changes)
+
+        finish()
+        return self._model_routing_state_text(report, settings)
+
+    def _model_routing_apply_prefs_value(self, flow: Dict[str, Any], settings: Dict[str, Any],
+                                         changes: Dict[str, Any], step: str, args: str) -> str:
+        """Apply one typed value (exclude / weights / reliability) from the prefs flow.
+
+        Parsing is ``agent.model_router``'s, validation is the writer's own
+        ``validate_routing`` — the same pair the CLI uses, so a payload the chat
+        accepts is one ``hermes model routing configure`` accepts too.  Nothing
+        is written here: the value joins the pending ``changes`` and the final
+        confirmation still decides.
+        """
+        from agent import model_router as mr
+
+        keyword = step.split("_", 1)[1]
+        text = (args or "").strip()
+        if text.lower().startswith(keyword):
+            text = text[len(keyword):].strip()
+
+        def retry(message: str) -> str:
+            flow["step"] = "prefs"
+            flow["ts"] = time.time()
+            return f"{message}\n\n" + self._model_routing_prefs_text(settings, changes)
+
+        if not text:
+            return retry(f"Reply /model-routing {keyword} <value>, or /model-routing cancel.")
+
+        cfg = self._model_routing_load_config()
+        raw_block = dict(cfg.get("smart_model_routing") or {}) if isinstance(cfg, dict) else {}
+        lowered = text.lower()
+        try:
+            if keyword == "exclude":
+                value = [] if lowered in {"none", "clear", "-"} else mr.parse_model_ids(text)
+            elif keyword == "weights":
+                if lowered in {"default", "reset", "-"}:
+                    value = mr.default_weights()
+                else:
+                    value = mr.parse_weights(
+                        text, base=raw_block.get("weights")
+                        if isinstance(raw_block.get("weights"), dict) else mr.default_weights())
+            else:  # reliability
+                value = {} if lowered in {"none", "clear", "-"} else mr.parse_reliability(
+                    text, base=raw_block.get("reliability")
+                    if isinstance(raw_block.get("reliability"), dict) else None)
+        except ValueError as err:
+            return retry(f"❌ {err}")
+
+        problems = mr.validate_routing({**raw_block, keyword: value})
+        if problems:
+            return retry("❌ Not accepted:\n" + "\n".join(f"   {p}" for p in problems))
+
+        changes[keyword] = value
+        flow["step"] = "prefs"
+        flow["ts"] = time.time()
+        return self._model_routing_prefs_text(settings, changes)
+
+    @staticmethod
+    def _model_routing_hypothetical(cfg: Dict[str, Any], changes: Dict[str, Any]) -> Dict[str, Any]:
+        """*cfg* with *changes* merged into ``smart_model_routing`` — for preview only."""
+        block = dict(cfg.get("smart_model_routing") or {}) if isinstance(cfg, dict) else {}
+        block.update(changes or {})
+        hypothetical = dict(cfg) if isinstance(cfg, dict) else {}
+        hypothetical["smart_model_routing"] = block
+        return hypothetical
+
+    async def _model_routing_commit(self, changes: Dict[str, Any]) -> str:
+        """Write through ``update_routing`` and report the block read back from disk."""
+        from agent import model_router as mr
+
+        try:
+            result = mr.update_routing(dict(changes))
+        except ValueError as err:
+            return (f"❌ Not saved — the change was rejected: {err}\nNothing was written; "
+                    "the previous configuration is intact.")
+        except Exception as err:  # pragma: no cover - defensive: I/O failure
+            logger.warning("model-routing: update_routing failed: %s", err, exc_info=True)
+            return (f"❌ Not saved — {type(err).__name__}: {err}\n"
+                    "The previous configuration is intact.")
+
+        # Read back from disk, not from the write result: routing_settings() with no argument
+        # loads config.yaml, so this cannot echo the caller's optimism.
+        saved = mr.routing_settings()
+        report = mr.routing_report(self._model_routing_load_config(), "")
+        if not result.get("written"):
+            # A verb that changes nothing must not claim a write (C14/C16). Where the block
+            # is absent, ``enabled: false`` *is* the state the file already describes, so
+            # ``update_routing`` returns written=False — the reply has to say so instead of
+            # printing the "Saved ... Takes effect on the next turn" pair the CLI stopped
+            # claiming in M15/C16.
+            return "\n".join([
+                f"ℹ️ Nothing saved — {result.get('no_op') or 'config.yaml already holds this state'}.",
+                "config.yaml was not modified. Current state:",
+                self._model_routing_state_text(report, saved),
+                "",
+                "Verify from the host: hermes model routing status",
+            ])
+        changed = ", ".join(result.get("changed") or []) or "nothing"
+        lines = [f"✅ Saved smart_model_routing (changed: {changed}).",
+                 "Read back from config.yaml:"]
+        lines.append(self._model_routing_state_text(report, saved))
+        lines.append("")
+        lines.append("Takes effect on the next turn — the running gateway re-reads "
+                     "smart_model_routing per turn, so no gateway restart is needed.")
+        lines.append("Verify from the host: hermes model routing status")
+        for warning in result.get("warnings") or []:
+            lines.append(f"⚠️ {warning}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # /model-routing — inline-button surface
+    # ------------------------------------------------------------------
+    # Section 6.3: on a platform that can render buttons, the same actions are offered
+    # as a keyboard; the numbered text flow above remains the fallback and the only form
+    # where the adapter has no picker. Every button path funnels into the same appliers
+    # and the same ``update_routing`` writer as the typed flow, so the two cannot diverge.
+
+    async def _try_send_routing_menu(self, event, report: Dict[str, Any],
+                                     settings: Dict[str, Any], note: str = "") -> bool:
+        """Send the six entry actions as a button picker; False means "render text instead"."""
+        title = (note + self._model_routing_state_text(report, settings)
+                 + "\n\nWhat would you like to do?")
+        choices = [
+            {"value": "1", "label": "✅ Enable routing"},
+            {"value": "2", "label": "⏸ Disable routing"},
+            {"value": "3", "label": "🎛 Change models"},
+            {"value": "4", "label": "⚙ Preferences"},
+            {"value": "5", "label": "🔀 Single-model mode"},
+            {"value": "6", "label": "✖ Close"},
+        ]
+        return await self._try_send_routing_picker(event, title, choices)
+
+    async def _try_send_routing_picker(self, event, title: str, choices: list) -> bool:
+        """Flat one-tap picker whose taps land in ``_model_routing_button_action``."""
+        async def _on_action(_chat_id: str, value: str) -> str:
+            return await self._model_routing_button_action(event, value)
+        return await self._try_send_choice_picker(
+            event, self._model_routing_flow_key(event), title=title, choices=choices,
+            on_choice_selected=_on_action)
+
+    async def _model_routing_send_models_picker(self, event, flow: Dict[str, Any],
+                                                settings: Dict[str, Any]) -> bool:
+        """Show the toggle picker for the current pool; False when the platform has none."""
+        candidates = [str(c) for c in (flow.get("candidates") or []) if c]
+        if not candidates:
+            return False
+        changes = flow.setdefault("changes", {})
+        current = self._model_routing_current_models(settings, changes)
+        return await self._try_send_routing_model_select(
+            event, candidates, current,
+            lambda _chat_id, picked: self._model_routing_models_picked(event, picked, changes))
+
+    async def _try_send_routing_model_select(self, event, candidates: List[str],
+                                             current: List[str], on_done) -> bool:
+        """Toggle list of candidate models when the adapter type supports multi-select."""
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None or getattr(type(adapter), "send_multi_select_picker", None) is None:
+            return False
+        options = [{"value": str(m), "label": str(m)} for m in candidates if m]
+        if not options:
+            return False
+        known = {o["value"] for o in options}
+        try:
+            result = await adapter.send_multi_select_picker(
+                chat_id=event.source.chat_id,
+                title=("Models routing may choose from — tap to toggle; the order shown is used "
+                       "as the priority order. Faster for a long list: type "
+                       "`/model-routing add <model>` or `/model-routing remove <model>`."),
+                options=options,
+                selected=[str(m) for m in current if str(m) in known],
+                session_key=self._model_routing_flow_key(event),
+                on_selection_done=on_done,
+                metadata=self._reply_metadata(event),
+            )
+            return bool(getattr(result, "success", False))
+        except Exception as exc:  # a failed button send must never swallow the flow
+            logger.warning("model-routing: send_multi_select_picker failed: %s", exc)
+            return False
+
+    async def _model_routing_confirm_buttons(self, event, cfg: Dict[str, Any], settings: Dict[str, Any],
+                                             changes: Dict[str, Any]) -> str:
+        """Send (or render) the final confirmation — nothing is written before Save."""
+        from agent import model_router as mr
+
+        flows = self._model_routing_flows()
+        key = self._model_routing_flow_key(event)
+        flows[key] = {"step": "confirm", "changes": dict(changes), "ts": time.time()}
+        confirm = self._model_routing_confirm_text(
+            settings, changes, mr.routing_preview("", self._model_routing_hypothetical(cfg, changes)))
+        sent = await self._try_send_routing_picker(
+            event, confirm,
+            [{"value": "save", "label": "✅ Save"}, {"value": "discard", "label": "✖ Discard"}])
+        return "Confirmation below ↓ — nothing is saved until you tap Save." if sent else confirm
+
+    async def _model_routing_models_picked(self, event, picked: list, changes: Dict[str, Any]) -> str:
+        """Multi-select Done: record the priority-ordered list, then confirm."""
+        from agent import model_router as mr
+
+        cfg = self._model_routing_load_config()
+        settings = mr.routing_settings(cfg)
+        changes = dict(changes or {})
+        changes["models"] = [str(m) for m in (picked or [])]
+        # Section 4 semantics, identical to the typed step: a non-empty list means
+        # "only these"; an empty list means "the whole eligible catalog".
+        changes["preferred_models_only"] = bool(changes["models"])
+        return await self._model_routing_confirm_buttons(event, cfg, settings, changes)
+
+    async def _model_routing_button_action(self, event, token: str) -> str:
+        """Apply one button action; returns the text that replaces the tapped message."""
+        from agent import model_router as mr
+
+        token = (token or "").strip().lower()
+        cfg = self._model_routing_load_config()
+        settings = mr.routing_settings(cfg)
+        report = mr.routing_report(cfg, "")
+        flows = self._model_routing_flows()
+        key = self._model_routing_flow_key(event)
+        flow = flows.get(key) or {}
+        changes: Dict[str, Any] = dict(flow.get("changes") or {})
+
+        if token in self._MODEL_ROUTING_CANCEL_WORDS or token == "6":
+            flows.pop(key, None)
+            return (self._model_routing_state_text(report, settings)
+                    + "\n\nCancelled — nothing applied.")
+
+        if token in self._MODEL_ROUTING_YES_WORDS:
+            # The side-effect boundary: a button tap carries no session of its own.
+            if not self._model_routing_authorized(getattr(event, "source", None)):
+                return ("🔒 Model routing changes model selection for the whole profile, so it is "
+                        "limited to authorized users. Nothing was written.")
+            flows.pop(key, None)
+            return await self._model_routing_commit(changes)
+
+        if token in {"1", "enable", "on"}:
+            changes["enabled"] = True
+        elif token in {"2", "disable", "off", "5", "single"}:
+            changes["enabled"] = False
+            if token in {"5", "single"}:
+                # Same change-set as the typed `5`: see the typed applier's note — the
+                # flag is cleared only when it is actually on, so this spelling does not
+                # materialise a block on a config that never had one (C16/C17).
+                changes.pop("models", None)
+                if bool(changes.get("preferred_models_only",
+                                    settings.get("preferred_models_only"))):
+                    changes["preferred_models_only"] = False
+                else:
+                    changes.pop("preferred_models_only", None)
+        elif token in {"3", "models"}:
+            # Offer what routing COULD choose, not only what it currently chooses: with the
+            # configured rows alone the picker could never add a model, only re-pick it.
+            candidates = self._model_routing_model_choices(settings) or [
+                str(c.get("model")) for c in (report.get("candidates") or []) if c.get("model")]
+            # "Current" must be the models actually in effect, or nothing arrives pre-ticked
+            # and the picker can add but never remove.
+            current = self._model_routing_current_models(settings, changes)
+            if await self._try_send_routing_model_select(
+                    event, candidates, list(current),
+                    lambda _chat_id, picked: self._model_routing_models_picked(event, picked, changes)):
+                flows[key] = {"step": "models", "changes": changes, "ts": time.time(),
+                              "candidates": candidates, "settings": dict(settings)}
+                return ("Model selection below ↓ — tap models to toggle, then Done. "
+                        "Nothing is saved until you confirm.")
+            # No multi-select support: fall back to the numbered list the typed flow uses.
+            state = {"step": "models", "changes": changes, "ts": time.time(), "page": 0,
+                     "candidates": candidates, "settings": dict(settings)}
+            flows[key] = state
+            return self._model_routing_models_page(state)
+        elif token in {"4", "preferences", "prefs"}:
+            flows[key] = {"step": "prefs", "changes": changes, "ts": time.time()}
+            return self._model_routing_prefs_text(settings, changes)
+
+        return await self._model_routing_confirm_buttons(event, cfg, settings, changes)

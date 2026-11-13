@@ -10,9 +10,12 @@ from datetime import datetime
 from agent.memory.ranking import (
     BOOST_LEVELS,
     DEFAULT_RRF_K,
+    LEXICAL_ANCHOR_MARGIN,
+    LEXICAL_ANCHOR_MIN_FTS,
     boosted_rrf_score,
     combined_score,
     compute_recency_decay,
+    infer_strategy_boosts,
     proof_norm,
     reciprocal_rank_fusion,
     recency_for_range,
@@ -29,7 +32,7 @@ def close(a, b, tol=1e-6):
 def test_rrf():
     fused = reciprocal_rank_fusion([("fts", ["a", "b"]), ("vec", ["b", "a"])])
     assert sorted(r["id"] for r in fused) == ["a", "b"]
-    assert close(fused[0]["rrf_score"], 1 / 61 + 1 / 62)
+    assert close(fused[0]["rrf_score"], 1 / (DEFAULT_RRF_K + 1) + 1 / (DEFAULT_RRF_K + 2))
 
     # b is rank1 in vec and rank2 in fts; a is rank1 in fts and rank2 in vec.
     # Identical totals -> stable order, first appearance ("a") wins.
@@ -45,6 +48,49 @@ def test_rrf():
 
     many = reciprocal_rank_fusion([("fts", [str(i) for i in range(50)])])
     assert [r["id"] for r in many] == [str(i) for i in range(50)]
+
+
+def test_infer_strategy_boosts():
+    # Natural-language questions lean on vector/graph, FTS damped.
+    for question in (
+        "what do we know about the gateway?",
+        "why was caching disabled",
+        "explain the deployment decision",
+        "summarize the auth changes",
+    ):
+        boosts = infer_strategy_boosts(question)
+        assert boosts["vec"] == "high"
+        assert boosts["fts"] == "low"
+
+    # Identifiers, quoted spans, filenames, versions, short bags -> FTS leads.
+    for lookup in (
+        "ERR_4512 auth_service",
+        "mutual_tls",
+        "deploy.py",
+        "v2.13.4 release notes",
+        "cafebabedeadbeef",
+        "fix `parse_config` crash",
+        '"blue-green releases"',
+        "gateway timeout",
+    ):
+        boosts = infer_strategy_boosts(lookup)
+        assert boosts.get("fts") == "high", lookup
+        assert boosts.get("vec") == "low", lookup
+
+    # Long statement-like phrases lean lexical but stay balanced enough.
+    statement = infer_strategy_boosts(
+        "The deployment pipeline uses blue-green releases for every service"
+    )
+    assert statement.get("fts") == "medium"
+
+    # Balanced short phrases and empty input.
+    assert infer_strategy_boosts("blue green deploy strategy")["fts"] == "medium"
+    assert infer_strategy_boosts("") == {}
+    assert infer_strategy_boosts(None) == {}
+
+    # The anchor threshold is a real BM25 strength, not a trivial bar.
+    assert 0.0 < LEXICAL_ANCHOR_MIN_FTS < 1.0
+    assert 0.0 < LEXICAL_ANCHOR_MARGIN < LEXICAL_ANCHOR_MIN_FTS
 
 
 def test_rrf_boosts():

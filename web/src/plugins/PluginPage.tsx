@@ -60,5 +60,10 @@ export function PluginPage({ name }: { name: string }) {
 function formatPluginError(code: string, t: Translations): string {
   if (code === "LOAD_FAILED") return t.common.pluginLoadFailed;
   if (code === "NO_REGISTER") return t.common.pluginNotRegistered;
+  // Deliberately not an i18n key: Translations is a closed shape derived from the
+  // locale files, and adding a key here means touching every translation. This is
+  // an operator-facing diagnostic, not product copy.
+  if (code === "NO_UI")
+    return "This plugin has no dashboard page. It ships API routes only — its user interface lives in the desktop app.";
   return code;
 }

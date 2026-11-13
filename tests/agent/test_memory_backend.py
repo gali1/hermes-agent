@@ -282,3 +282,24 @@ def test_junk_purge_can_be_disabled(tmp_path):
     assert backend.purge_junk() == {"skipped": "disabled"}
     assert store.get(junk, track_access=False)["status"] == "active"
     backend.shutdown()
+
+
+def test_search_results_surface_evidence_attribution(tmp_path):
+    """B6 travels through the facade without changing the result contract."""
+    backend = EnhancedMemoryBackend(str(tmp_path), {"enabled": True})
+    backend.initialize("s1")
+    backend.observe_turn(
+        "The gateway terminates mutual TLS with rotating certificates", "ok"
+    )
+
+    result = backend.search("gateway mutual TLS")
+    assert result["results"]
+    row = result["results"][0]
+    # observe_turn stores source type "conversation" (quality 0.7).
+    assert row["source_type"] == "conversation"
+    assert row["source_quality"] == 0.7
+    assert 0.0 <= row["evidence_confidence"] <= 0.95
+    # The stored record confidence and the ranking fields are untouched.
+    assert row["confidence"] == 0.5
+    assert "score" in row and row["source"] == "engine"
+    backend.shutdown()

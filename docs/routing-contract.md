@@ -342,6 +342,376 @@ present, the verb still prints `Saved to config.yaml`. That statement is about t
 resulting config, which does hold that state; it was left alone rather than widening the
 diff.
 
+## C17 — A no-op reply may not claim a write, and "single-model mode" is disable on the file too
+
+C16 governs the file; this governs what the chat says about it, and closes the one
+spelling of disable that still changed the file.
+
+* **The gateway reports a write only when the file changed.** `_model_routing_commit`
+  reads the writer's own `written` flag before composing its reply. When the writer
+  returns `written: false` (the C16 absent-block no-op), the reply is
+  `Nothing saved — <no_op reason>`, it says `config.yaml was not modified`, and it never
+  carries `✅ Saved` or `Takes effect on the next turn`. This is C14's rule (a footer is a
+  claim about the file) applied to §6.3's result message; the CLI has held it since M13.
+* **`Switch to single-model mode` produces disable's change-set.** §6.3 makes it the same
+  action, so it may not add `preferred_models_only: false` unconditionally: on a config
+  that never carried a block that extra key made the *writer* see a real change and
+  materialise `{enabled: false, preferred_models_only: false}` where `2`/`disable` wrote
+  nothing. The flag is cleared only when it is actually on (pending or saved), and a
+  pending `models` selection is always dropped.
+* **Both input surfaces.** The typed applier and the button applier carry the same
+  change-set logic (C12); the rule is asserted through the real dispatch path and through
+  `_model_routing_button_action`.
+
+Control that keeps the assertions honest: `enable` on the same blockless config must
+still print `✅ Saved smart_model_routing` and must still write, and `single` with the
+flag genuinely on must still turn it off.
+
+## C18 — Picker state is per (chat, message), and one finished picker is finished
+
+`/model-routing` sends a toggle list whose buttons carry indexes into server-side state. Two
+pickers can be alive in one chat (the user asks again before finishing), Telegram can deliver
+the same callback twice, and a plugin reload can replace the adapter between the send and the
+tap. The state therefore belongs to a message, not to a chat:
+
+* **A tap applies to the picker it came from.** The handler resolves state by
+  `(chat_id, message_id)`; a chat slot belonging to a *different* message is not this tap's
+  state, and the process-wide registry is the fallback (it survives an adapter swap).
+* **Finishing retires that message's entry, and only that entry.** Done and Cancel retire the
+  tapped message in both the chat slot (only when the slot *is* that message) and the
+  registry. Leaving the registry entry behind lets a repeat Done tap find the consumed state
+  and run `on_selection_done` a second time — a second write for one confirmation, which is
+  C17's class of defect reached through the adapter instead of the writer.
+* **Retirement is not a chat-wide reset.** Tapping Done on an older picker while a newer one
+  is live must leave the newer one's slot intact, or a live picker becomes answerable only
+  through the registry and dies if its entry is pruned (bounded size, 30-minute TTL).
+
+Control that keeps the assertions honest: a tap from an older message must still apply to
+that message's options, and a picker must still answer after the adapter's per-chat maps are
+cleared (simulating a plugin reload).
+
+## C19 — A page the user must answer with text has to say how
+
+The numbered models page is not a menu graphic: every caller of it is a reply the user answers
+by typing. It is reachable only where no button picker was used — a text-only platform, or a
+button platform whose toggle send failed — so it must name the accepted answers:
+
+* one compact line, not a prose dump: the numbered form (`1,3`, first = highest priority), the
+  word forms (`all`, `none`, `back`, `cancel`), and the exact-name form (`add <model>` /
+  `remove <model>`);
+* the pager stays one line (`Models 1–10 of 132 · next / prev`) rather than a second sentence
+  of instructions;
+* removing the instruction line is a regression even though the row list still renders: a
+  user who cannot see what to type is the reported "I type something and get the same text
+  back" loop, reached through the page instead of the flow.
+
+Control that keeps this honest: a button platform's typed `3` must send the picker and never
+this page (C12: same interaction as the 🎛 button), so the page only exists where the line
+above is the only guidance available.
+
+## C20 — `tool_calls_only` keeps the default model primary
+
+The fourth strategy is not a weighting of the other three: it removes selection from the turn.
+
+* An **eligible incumbent is never displaced** — not for price, not for a higher score, not for
+  a closer capability fit, and not by `switch_on_cost`. `rank_candidates` returns it before the
+  hysteresis block, so none of those knobs are consulted.
+* The only thing that moves the turn is **ineligibility**: the incumbent failed a hard
+  requirement (a modality it does not accept, a context window it cannot hold, a tier floor),
+  so it never reaches the "keep the incumbent" branch and the specialist is chosen instead.
+* The specialist is then chosen **capability-first, cost as tiebreak** — the pool's job in this
+  strategy is to cover a requirement, not to win on price.
+* `providers.<provider>.models` therefore reads as *the assistant plus its specialists*, and a
+  model listed there is not thereby a candidate to take over ordinary conversation.
+
+Consequence worth stating in the reply, not just here: the routing hook runs once per **turn**,
+before the model is invoked. `tool_calls_only` decides *which model serves the turn*.
+Sub-task delegation inside a turn is a separate mechanism — see **C21**, which now exists and
+is tested. C20's own limit stands: this hook still never sends a file to a specialist.
+
+## C21 — Capability delegation is a sub-call, not a second router
+
+`agent/capability_delegation.py` answers a different question from C20's: *which model performs one
+sub-task inside a turn the primary model still owns*. The primary is never displaced by it.
+
+* **Audio is a transcript, not a model call.** The capability the primary lacks for audio is
+  speech-to-text, which is infrastructure here; the row below shows it working, with the PyAV
+  incompatibility (`faster_whisper` wants `av.open(metadata_errors=...)`, PyAV 19 removed it)
+  routed around by an isolated venv behind the documented command-provider seam.
+* **Portable first, native part only as an opt-in.** Nothing in this tree builds a `file` or
+  `input_audio` part — `gateway/platforms/api_server.py` rejects both and `agent/image_routing.py`
+  states that a PDF must never become a vision part — so the default path is the one every provider
+  accepts: a **pdf is extracted locally** (`tools.read_extract.extract_document_text`) and the text
+  is sent; an **audio file is transcribed** with the existing STT stack
+  (`tools.transcription_tools.transcribe_audio`) and the transcript is sent; text-like files are
+  inlined (truncated, marked); images travel as `image_url` data URLs. `transport="native"` sends
+  the provider part instead (`file` / `input_audio`) and reports the provider's own words when it
+  refuses. Video has **no** transport at all: the layer refuses with "extract frames or text first".
+* **The specialist is chosen by the routing pool and the routing rules.** `preferred_models_only`
+  is honoured, capability leads and price only breaks ties, and the config's own model is excluded —
+  delegating to the model already holding the conversation is a no-op with a price tag.
+* **A refusal is reported verbatim, never retried into a success.** Provider 410/403/404 markers
+  ("deprecated", "access is disabled", "no such model") are recorded in
+  `$HERMES_HOME/state/capability_delegation/unusable.json` for 24 h so the next resolve skips that
+  model instead of walking into the same wall. An ordinary `400` is **not** remembered: that is a
+  malformed part, which is this layer's bug and must stay visible.
+* **No success without text.** Empty content, a decode failure, an oversized body (20 MB default) or
+  a missing specialist all produce `success: false` with a reason; nothing is fabricated.
+
+Verified on this host (live config, deepseek primary, gpt-6-luna specialist):
+
+| case | result |
+|---|---|
+| image (PNG) → `gpt-6-luna`, asked for the visible string | `DELEGATE-OK-7319` returned |
+| pdf (688 B, real xref) → extraction (80 chars) → `gpt-6-luna` | `PDF-OK-4412` returned: the specialist saw text, never bytes |
+| audio (Ogg Vorbis) → local STT → transcript | **works**: `stt.provider: local_command` → `HERMES_LOCAL_STT_COMMAND` → `~/.hermes/tools/stt-venv` (isolated faster-whisper); the transcript is the delegation result and **no model request is spent** |
+| `gemini-3-flash` (catalog-listed, provider-retired) | 410 `ModelDeprecated` reported, then skipped on the next resolve |
+| audio / video specialists on opencode-zen | **none live**: `gemini-3.5/3.7-flash` answer 403 "model access is disabled" — audio and video delegation are unavailable until a live multimodal specialist exists |
+
+That last row is the honest boundary of this feature on this provider, not a code gap: the layer
+picks correctly and reports what the provider says.
+
+## C22 — Capability registry: native, via-Hermes, unknown, unavailable
+
+`agent/capability_registry.py` is the one place that answers "can this model do X *here*", and it
+refuses to flatten four different answers into one boolean:
+
+| state | meaning | consequence |
+|---|---|---|
+| `native` | the model/provider accepts it (catalog metadata, overlaid by the operator's declarations) | send the part |
+| `hermes` | the model cannot take it, but this installation converts it: PDF text layer, OCR, speech-to-text, image data-URL | send the converted form |
+| `unknown` | nobody declared it and metadata is silent | eligible only when the routing config allows unknown metadata, and reported as unknown |
+| `unavailable` | the provider refused the model (retired/forbidden, memoised 24 h) or the local facility is absent (no tesseract, no STT) | do not claim it works |
+
+The distinction matters most for PDFs: a model with no native PDF input is **not** a model that
+cannot handle a PDF — Hermes extracts the text (or OCRs a scan) and sends text. Reporting that as
+"unsupported" would misdescribe the system, not the model.
+
+Verified on this host: `deepseek-v4.1-flash` → native image/tools/structured, **hermes** for pdf +
+audio + ocr, unavailable video; `gpt-6-luna` → native image/pdf, hermes audio/ocr.
+
+## C23 — OCR is a fallback that must detect the extractor's own placeholder
+
+`tools.read_extract` does not return an empty string for a scanned page: it returns a bracketed
+`[NEEDS OCR: pages 1 …]` **instruction addressed to the model**. Treating that as text made a scan
+look readable, and a specialist answered "the page isn't available" from the instruction itself —
+a failure that looks like a model problem and is not one. `capability_delegation.usable_text()`
+strips those notices; only then is the length threshold meaningful, and only then does OCR run.
+
+Order for a pdf: **text layer → OCR (poppler + tesseract) → native `file` part**, last resort only.
+
+Verified end to end: an image-only PDF (no text layer) → OCR read `MAGIC-OCR-8842` → `gpt-6-luna`
+returned exactly that string.
+
+## C24 — Video is decomposed, not demanded
+
+No provider in this pool accepts a native video part, and waiting for one is not a design. A clip
+becomes a labelled, timestamped text representation with the tools already on the host:
+
+```
+ffprobe  -> duration + dimensions
+ffmpeg   -> sampled frames (scene changes first, evenly spaced as a fallback), capped
+tesseract-> on-screen text per frame, with the frame's timestamp
+ffmpeg   -> 16 kHz mono wav -> local STT -> speech transcript
+```
+
+`agent/video_context.py` assembles that into `VIDEO / SPEECH / ON SCREEN / NOTES` and the result is
+sent as **text** to a text-reading specialist (`resolve_specialist("text")`), because asking for a
+model with native video input would refuse work this installation can already do. Frames are kept
+in a temp dir and deleted unless `keep_frames=True`; sending frames to a vision model is opt-in
+(`frame_image_parts`), because a frame costs tokens and OCR costs nothing.
+
+Verified: a 6.1 s clip carrying on-screen codes and an audio track → 8 frames, all OCR'd
+(`MAGIC-VIDEO-5510`, `ACTION ITEM ship OCR path`), speech transcribed locally → `gpt-6-luna`
+answered *"shows MAGIC-VIDEO-5510 until about 3.1 seconds, then ACTION ITEM ship…"*, i.e. it
+reasoned over timestamps it never saw as video.
+
+**Coverage is stated, never implied.** Every stage stops at the wall-clock budget and the payload
+says how much was read: a 4:05 clip transcribed `audio transcribed 0:00-2:25 of 4:05 (budget) — the parenthetical now also **names the cause**: `; speech ran on 1 of 4 workers because the host was loaded (load 34.8 on 8 cores)` or `; the 240s wall budget ran out on a loaded host (…)`, so a short coverage line is never mistaken for a defect`
+under `budget_seconds=240` (STT alone took 222.6 s at RTF 1.53 on CPU). A complete run says
+`(complete)`, a clip with no audio track says `SPEECH: unavailable (no audio track)`.
+
+**Speech yields to live traffic.** Worker count follows *free* cores, not all cores: the default is
+half the cores clamped to `cores - round(load1)` (minimum 1), an explicitly configured
+`stt.video.workers` is honoured as written, and the worker processes run at `nice 10`. Measured on a
+loaded host (load 12-15 from qBittorrent and Plex, 8 cores): a 5:01 clip covered 1:30-2:00 and the
+note said `(budget)`, while a live one-word turn took 11 s with no STT running and 13 s with the
+workers going — ~2 s of interference instead of a stall. On a quiet host the same clip is
+`(complete)` in 197.6 s.
+
+**Speakers are unavailable, and the payload says so.** Local STT has no diarization, so the block
+carries `SPEAKERS: unavailable (local STT has no diarization; speech is unattributed — do not guess
+who spoke)`. Without that line a primary will happily invent "the second speaker".
+
+**The result carries the verbatim timeline.** A specialist summarises and drops timestamps, and the
+primary then re-reads frames with vision to pin a second (measured: 8 vision calls and an exhausted
+turn). The result therefore appends `RAW ON-SCREEN TIMELINE`, the OCR text with each frame's
+timestamp, from the decomposition that already ran — no extra cost.
+
+## C25 — Several operations per request, bounded
+
+One request can need more than one capability (a recording that must be transcribed *and* have its
+slides read). `max_operations` (default 1, replaces `max_per_request` — still honoured) allows
+several, but never unbounded:
+
+| guard | mechanism |
+|---|---|
+| operation count | `max_operations`, and one operation per `(path, modality)` |
+| time | `budget_seconds` — no new operation starts past the deadline |
+| money | `budget_usd` — estimated cost accumulates as results arrive; the rest is skipped |
+| repeats | per-turn memo keyed by `turn_id`/`session_id` plus the material marker (TTL 30 min): the injected note is not enough, because the loop rebuilds the request from history on the next model call and would delegate again |
+| recursion | thread-local guard on the middleware |
+| partial results | a skipped or failed operation becomes a labelled note; the primary answers from what came back |
+| audit | one `delegation` line per operation + one `delegation_batch` line with `operations`, `est_cost_usd`, `budget_hit` |
+
+**The money bound is fail-safe, not exact.** With `parallel: true` the budget is checked between
+launches and again as results land, so a batch can overshoot by at most *workers × the per-operation
+estimate* (4 × estimate by default). Under-charging is the failure that matters — an unknown cost
+charged as zero means the budget can never trip — so overshoot is accepted and stated rather than
+hidden.
+
+Operations are independent by construction, so they run in parallel (`ThreadPoolExecutor`, max 4);
+`parallel: false` runs them in order. Verified live: one turn with an audio note and a scanned
+invoice → two operations (audio → `stt/local`, pdf → `gpt-6-luna`), one answer containing the OCR
+code, `delegation_batch` showing `operations: 2`.
+
+## C26 — Path trust: only adapter-produced files are delegated on remote surfaces
+
+On `telegram`, `api_server` and any other remote platform, the delegation planner accepts **only**
+the adapter's own `saved at:` note pointing inside Hermes' media caches
+(`cache/documents`, `cache/images`, `cache/audio`, `cache/video`, `cache/media`) plus the local Bot
+API server's own directories (`telegram-bot-api/local`, `telegram-bot-api/data` — in `--local` mode
+the adapter reads telegram files straight off disk there), resolved with
+symlinks and `..` collapsed (`Path.resolve(strict=True)` then `relative_to(root)`). A path that was
+typed, pasted, recalled from memory, or echoed by a tool or a web page delegates nothing.
+
+Why it is not merely tidy: a typed path that is treated as an attachment lets anyone who can put
+text in front of the agent — another member of a group chat, a web page the agent fetched — make it
+read a local file and send the contents to a third-party provider. One such source was already
+found in the wild: recalled memory injected into the user message contained my own scratch paths,
+and four `platform=telegram` events were produced for files nobody had attached.
+
+On the **CLI** typed paths stay allowed: it is the operator's own machine, and refusing them would
+break every local workflow. `strip_injected_context()` removes `<memory-context>` and system-note
+blocks before scanning, and tool/web output is never scanned at all (only the last user message is).
+
+## C27 — Cost: measured, estimated, or free — never silently zero
+
+| `cost_basis` | meaning | how produced |
+|---|---|---|
+| `usage` | measured | the provider reported token usage; priced from the specialist's own rates |
+| `estimated_from_bytes` / `_binary` | estimated, and labelled | provider silent: `bytes/3` input tokens (pessimistic) + the configured output allowance (floor 1024) |
+| `free_local` | genuinely free | local STT/OCR: no model call was made |
+| `failed` | nothing was spent | the operation failed before a call |
+
+`cost_known` is true only for `usage` and `free_local`. **A money budget charges the estimate**,
+because a budget that treats a silent provider as free never trips — which is the same as having no
+budget. `delegation_batch.cost_known` is the AND of its members, and its `cost_basis` reads
+`mixed_or_estimated` when they differ. Verified: a 2 MB audio payload with a silent provider
+estimates above a 1-cent budget; a 4-delegation run with the budget below the per-op estimate stops
+launching after the first.
+
+## C28 — api_server parity means its part types, not a workaround
+
+`gateway/platforms/api_server.py:466-468` defines the whole surface:
+
+```
+_TEXT_PART_TYPES   = {"text", "input_text", "output_text"}
+_IMAGE_PART_TYPES  = {"image_url", "input_image"}
+_FILE_PART_TYPES   = {"file", "input_file"}       # normaliser raises before any provider call
+```
+
+Accepted = **five** part types (text/input_text/output_text/image_url/input_image), plus a bare
+string and a list item that is a bare string, which are stringified. By design, and documented
+rather than routed around:
+
+* `file` / `input_file` parts are refused at normalisation, not at the provider.
+* A `data:application/pdf` URL is refused for both `file` and `image_url` ("Only image data URLs
+  are supported"), so a document reaches a model on this surface **only as extracted text** — which
+  is what the delegation layer produces anyway.
+* No audio parts (`audio_api: False`), no magic-byte inspection of inbound image payloads.
+
+So api_server parity is: the same delegation *behaviour* (note → local extraction/OCR/STT →
+labelled context → primary answers), over the part types this route accepts.
+
+## C29 — Telegram inbound size: this install is not bound by the 20 MB hosted cap
+
+`telegram.extra.base_url: http://127.0.0.1:8081/bot` with `telegram.extra.local_mode: true`: a
+self-hosted local Bot API server. The hosted-API 20 MB **download** limit therefore does not apply
+(2 GB send cap retained), and inbound files land on disk where the adapter records their paths —
+which is exactly the material C26 trusts.
+
+## C30 — Document limits are enforced and announced
+
+| guard | where | behaviour |
+|---|---|---|
+| zip bomb | `read_extract._zip_inflation_error`, before any inflation | refuses when the central directory declares > 200 MB uncompressed, or a ratio > 200:1 above 8 MB |
+| xlsx rows | `_MAX_XLSX_ROWS_PER_SHEET` = 5000, 256 cols | appends `…[truncated: showed 5000 of 6000 rows on sheet 'Q3' (limit 5000)]` |
+| csv/tsv charset | `decode_text_payload`: BOM → utf-8-sig/utf-16/utf-32, else strict utf-8, else cp1252 | a cp1252 file no longer arrives as `Ren\ufffd M\ufffdller`; a UTF-16 file no longer arrives NUL-separated |
+| csv/tsv truncation | `clip_text_with_counts`, on a line boundary | `truncated: showed 4762 of 9001 rows, 119991 of 230205 chars` — never a silent cut mid-row |
+| sqlite | `mode=ro&immutable=1` | read-only; 200 tables / 5 preview rows / 80 chars per cell |
+| macros | never read | `vbaProject.bin` is not opened; nothing is executed |
+| formulas | cached values only | `=A1*B1` surfaces as its cached result; the formula text is invisible |
+
+Verified on generated files: a 12 KB package declaring 315 MB → *"Not a safe DOCX: … refusing to
+inflate it"*; a 6000-row sheet → the truncation line above; a 230 KB CSV → the counted clip above.
+
+## C31 — The stop condition is the instruction, not `tool_choice`
+
+When a delegation succeeds, the injected block says the content was extracted from the actual file,
+is complete, and that re-extracting it is wasted work — then the call proceeds unchanged.
+
+`tool_choice: "none"` was tried first and rejected on evidence. With it set, `deepseek-v4.1-flash`
+emits the tool call as **XML text**: a normal video prompt produced
+`<tool_calls><invoke name="terminal">…` instead of an answer, on the pdf, video and silent-video rows.
+Tools therefore stay available, and the wording carries the instruction.
+
+Measured after the change, normal prompt, no special instruction, tools enabled: video answered
+`MAGIC-VIDEO-5510` switching to `ACTION ITEM ship OCR path`, **0 tool calls, no leaked XML**. The
+per-turn memo (`_DONE_THIS_TURN`) still guarantees the same file is never delegated twice, and the
+same prompt no longer re-derives the material.
+
+## C32 — The memo key is content plus operation, and failures are never memoised
+
+`<modality>:<sha256(content)[:16]>:<sha256(instruction)[:16]>`. Content, not path: a renamed copy is
+the same operation, a re-recorded file at the same path is a new one. The instruction is in the key
+because the same file asked about differently is a different operation — the exact case a path-only
+key swallowed. Files over the hashing threshold are digested from their first and last megabyte plus
+their size, never read whole; each candidate is hashed once per pass.
+
+**Only success is memoised.** A failure, a timeout or a budget skip leaves the key unclaimed so the
+next model call of that turn tries again instead of the primary being told "already handled" about
+work that never happened. Entries expire after 30 minutes (1800 s).
+
+## C33 — Where the result is injected, and what is allowed to stop re-derivation
+
+The delegated result goes into the **system message**, not the user turn. Measured: appended to the
+user turn the primary treated a finished extraction as a hint and re-ran its own OCR/frame work over
+the same file, exhausting the turn. As a runtime statement in the system message, the same file
+produced **0 tool calls and a correct answer on 3 consecutive runs** (scanned PDF and video).
+
+Two things were tried and rejected on evidence:
+
+* `tool_choice: "none"` on the carrying call — `deepseek-v4.1-flash` then emits the tool call as
+  **XML text**, so the user gets `<tool_calls><invoke name="terminal">…` instead of an answer.
+* Replacing a `read_file` result with the extracted text — the primary called it "a fabricated
+  notice" and refused to give the code even though it was correct.
+
+What stands instead: the note states the material was extracted from the actual file and is
+complete; a `tool_execution` guard answers a *terminal* or *execute_code* call that names a file
+already delegated in the last 30 minutes from the completed extraction, without re-running it. The
+guard never touches `read_file`, the vision tools, or `delegate_capability`.
+
+## C34 — `read_file` decodes text-contract files instead of calling them binary
+
+A cp1252 CSV read through `read_file` used to return *"Binary file (unknown binary, 28 bytes) —
+cannot display as text"* while the same bytes decoded perfectly through the delegation path. Files
+whose extension is text by contract (`.csv .tsv .txt .log .md .json .jsonl .yaml .yml .ini .conf
+.cfg .env .sql .srt .vtt .nfo`) are now decoded `utf-8-sig` → `cp1252` → `latin-1` when the strict
+UTF-8 read fails, with the chosen encoding in the hint and writes still re-encoding as UTF-8. NUL
+bytes still mean binary whatever the extension, and a decode that would produce replacement
+characters keeps the original refusal instead of showing mojibake.
+
 ## Extensions that are allowed to differ
 `switch_on_cost`, `llm_assisted_classification`, `weights`, `reliability`,
 `exclude`, `models` (per-provider lists), and MoA detection are local
@@ -388,3 +758,30 @@ Still open:
 5. **Name collision to document** — C4 `reliability` (routing preference) and the tool
    search's `reliability_rerank` (call-outcome re-rank) are unrelated knobs with similar
    names; never let one config imply the other.
+
+## C35 — A refusal the model cannot see is only half a refusal
+
+On a remote surface (`telegram`, `api_server`) a path the adapter did not produce is refused: no
+delegation, no fetch, no re-read. Logging that for the operator is not enough — the primary does not
+read our log. Measured: an api_server turn whose prompt named a scanned PDF answered correctly but
+spent **220k prompt tokens** re-deriving the file with its own tools, because nothing told it the
+surface could not carry material.
+
+So the plan result now carries its refusals (`Plan.refusals`), and when a remote request planned
+nothing *because of a refusal* the system message gains one sentence naming the surface and the
+materials: no delegation is available here, no local path in text is trusted here either, answer from
+the text and say plainly if that is not enough — do not search the filesystem, do not render or OCR
+anything. The note is absent when nothing was refused, so a working surface is never told it cannot
+delegate.
+
+A refusal carries a **reason**, because the two failures need different advice: `untrusted` (a path
+this surface cannot carry — including one spelled out in prose, which path trust refuses and which is
+now detected only so the note can name it) and `unsupported` (an adapter-delivered type nothing on
+this host can read, e.g. `.zip`). Before this, both were silent: the prose-path case planned nothing
+and refused nothing, and the `.zip` case planned nothing and said nothing, leaving the model to
+discover the dead end itself. Edge-case sweep (`edge_cases.json`, 17 cases): every case now yields
+either a delegation or a named note — no silence, no loop.
+
+api_server carries no delegatable material by design: `file`/`input_file` and `data:application/pdf`
+are refused, and images are native to the incumbent — so the surface's honest row is "parts accepted,
+answered natively", never "delegated".

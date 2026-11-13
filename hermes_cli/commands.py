@@ -196,10 +196,13 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[model] [--provider name] [--reasoning level] [--global|--session] [--refresh]",
                busy_policy="reject", busy_handler="model", desktop="hidden"),
     # Registered under both spellings: Telegram's menu accepts only [a-z0-9_] so it shows
-    # ``model_routing``, while users type ``/model-routing``. Both must reach one handler.
-    CommandDef("model-routing", "Inspect or change smart model routing", "Configuration",
+    # ``model_routing``, while users type ``/model-routing``. Hyphens are NOT folded by
+    # ``get_command``, so both spellings must resolve to this one CommandDef — and
+    # ``_command_handler_table`` maps ``-`` -> ``_``, so both reach one handler.
+    CommandDef("model-routing", "Inspect, enable, disable or configure smart model routing",
+               "Configuration",
                aliases=("model_routing",), args_hint="[status|on [confirm]|off]",
-               busy_policy="reject", desktop="hidden"),
+               busy_policy="dispatch", desktop="hidden"),
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",), args_hint="[auto|codex_app_server]",
                busy_policy="reject", busy_handler="codex-runtime"),

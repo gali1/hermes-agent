@@ -2,8 +2,10 @@
 defs plus the budgeted, byte-stable catalog listing embedded in the bridge.
 
 Ranking is lexical only. Recorded call outcomes can re-order the hits a query already
-admitted (:func:`load_tool_reliability` + ``search_catalog(reliability=...)``) but never
-decide which tools are offered."""
+admitted (:func:`load_tool_reliability` + ``search_catalog(reliability=...)``, or the
+``tools.tool_search_reliability`` module's map via ``search_catalog(multipliers=...)``) but
+never decide which tools are offered.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple
 try:  # optional: pure Python, but absent from lean/3.12 installs
     import snowballstemmer
 except ImportError:  # no stemmer -> raw tokens still index and match
-    snowballstemmer = None
+    snowballstemmer = None  # type: ignore[assignment]
 
 from tools.delegate_tool_results import _looks_like_error_output
 
@@ -59,7 +61,12 @@ _thread_local = threading.local()
 def _stem(token: str) -> str:
     """Stem one token, memoized across stateless catalog rebuilds. Snowball stemmers carry
     mutable parsing state and bridge dispatch runs on parallel tool-call threads, so the
-    stemmer is one-per-thread, created lazily."""
+    stemmer is one-per-thread, created lazily.
+
+    If the package is absent (a lean install on Python < 3.14, where the pinned
+    requirement's marker skips it) the token is returned unchanged rather than raising:
+    matching degrades to exact prefixes, which is worse recall, not a broken tool search.
+    """
     stemmer_mod = snowballstemmer  # local: narrows cleanly for type checkers
     if stemmer_mod is None:  # no stemmer installed: the raw token is the key
         return token
@@ -336,7 +343,8 @@ def load_tool_reliability(db_path: Optional[Path] = None, *, days: int = RELIABI
 
 def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
                    corpus_stats: Optional[_CorpusStats] = None,
-                   reliability: Optional[Dict[str, Any]] = None) -> List[CatalogEntry]:
+                   reliability: Optional[Dict[str, Any]] = None,
+                   multipliers: Optional[Dict[str, float]] = None) -> List[CatalogEntry]:
     """Top-``limit`` catalog entries for ``query`` by BM25 (exact name match ranks first).
 
     Admission is by the query's rarest token (:func:`_gate_token`), not by ``score > 0``:
@@ -346,10 +354,12 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
     carries admits nothing; the caller's empty-group hint tells the model to retry without it.
     Long queries additionally need :func:`_required_term_coverage` of their answerable terms.
 
-    ``reliability`` (:func:`load_tool_reliability`) re-orders the admitted hits by how often
-    each tool has actually worked. It is applied AFTER the gate, so it can demote a hit but
-    never remove one; an exact-name hit keeps its infinite score and therefore its first place.
-    ``None`` — the default — ranks exactly as before."""
+    ``reliability`` and ``multipliers`` are the same knob under the two names its callers
+    use (``reliability`` from :func:`load_tool_reliability`, ``multipliers`` from
+    ``tools.tool_search_reliability``); a caller passes one. Either re-orders the admitted
+    hits by how often each tool has actually worked. It is applied AFTER the gate, so it can
+    demote a hit but never remove one, and an exact-name hit keeps its infinite score and
+    therefore its first place. ``None`` — the default — ranks exactly as before."""
     query_tokens = _tokenize(query) if catalog and limit > 0 else []
     if not query_tokens:
         return []
@@ -375,6 +385,9 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
         scored = [(score * _clamp_reliability(reliability.get(entry.name, 1.0)), entry)
                   for score, entry in scored]
     scored.sort(key=lambda x: x[0], reverse=True)
+    if multipliers:
+        from tools.tool_search_reliability import rerank_scored
+        scored = rerank_scored(scored, multipliers)
     return [e for _, e in scored[:limit]]
 
 

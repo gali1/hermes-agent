@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 
 import contextlib
+import time
 
 from .method_ctx import bind_module
 
@@ -547,6 +548,46 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
 # Wall-clock timestamps, like session last_active; retained after close/reap.
 _closed_session_activity: dict[str, float] = {}
 
+# Runtime ids THIS gateway tore down, sid -> wall-clock reap time. A background poll (the desktop
+# status stack's ``process.list``, every 5s while a row is on screen) that was already in flight when
+# the teardown landed arrives a few ms later and used to be logged as "client should resume the stored
+# session" — but that client is not stuck: it asked for the teardown (``session.new``/``session.close``),
+# the poll lost the race, and the 4001 latch moves it on. Remembering what we reaped lets
+# ``_sess_nowait`` tell that race from a client genuinely parked on a stale id (an id we never held, or
+# one evicted long ago), which must still warn.
+_REAPED_ID_MEMORY_S = 10.0  # > 2x the 5s status-stack poll interval
+_REAPED_ID_MEMORY_MAX = 256
+_reaped_session_ids: dict[str, float] = {}
+
+
+def _note_reaped_session_id(sid: str | None) -> None:
+    """Record that this gateway reaped ``sid``. Called by the teardown claim (already under
+    ``_sessions_lock``), so the entry is visible to a poll that lands immediately afterwards."""
+    if not sid:
+        return
+    now = time.time()
+    _reaped_session_ids[sid] = now
+    if len(_reaped_session_ids) <= _REAPED_ID_MEMORY_MAX:
+        return
+    cutoff = now - _REAPED_ID_MEMORY_S
+    for stale in [s for s, at in _reaped_session_ids.items() if at < cutoff]:
+        _reaped_session_ids.pop(stale, None)
+    while len(_reaped_session_ids) > _REAPED_ID_MEMORY_MAX:
+        _reaped_session_ids.pop(min(_reaped_session_ids, key=_reaped_session_ids.__getitem__), None)
+
+
+def recently_reaped_session(sid: str | None) -> float | None:
+    """Seconds since this gateway reaped ``sid``, or ``None`` when it did not (recently).
+
+    The "the client asked for this teardown" signal ``_sess_nowait`` uses to stay quiet."""
+    if not sid:
+        return None
+    at = _reaped_session_ids.get(sid)
+    if at is None:
+        return None
+    age = time.time() - at
+    return age if 0.0 <= age <= _REAPED_ID_MEMORY_S else None
+
 
 def _pop_session_by_id(sid: str) -> dict | None:
     """Atomically detach one live session from the registry — the ownership claim for teardown (a concurrent
@@ -561,6 +602,7 @@ def _pop_session_by_id(sid: str) -> dict | None:
             _closed_session_activity[home] = max(_closed_session_activity.get(home, 0), last_active)
             session["_closing"] = True
             session["_sid"] = sid  # out of _sessions now, so teardown can't recover the live id by scanning
+            _note_reaped_session_id(sid)
     return session
 
 

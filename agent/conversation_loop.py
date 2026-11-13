@@ -1573,6 +1573,34 @@ def _run_conversation_turn(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    # Model routing runs first, once per turn and before the system prompt is
+    # restored/built, so the prompt describes the model that will actually serve
+    # this turn.  With ``smart_model_routing.enabled`` false (the default) this
+    # is one cached config read plus a dict lookup and returns; a single-model
+    # config returns after one list build.  See ``agent/model_router.route_turn``.
+    if getattr(agent, "api_mode", "") != "codex_app_server":
+        try:
+            from agent.model_router import message_text_and_attachments, route_turn
+
+            # The turn may be a parts list (text + images/audio/files). Routing
+            # needs both halves: the text for complexity, the attachments for the
+            # input-modality requirement (contract C9a).
+            _route_text, _route_attachments = message_text_and_attachments(user_message)
+            # The MoA skip is decided inside route_turn so the reason is recorded
+            # rather than lost at the call site (contract C10).
+            route_turn(
+                agent,
+                _route_text,
+                attachments=_route_attachments,
+                # Context fit is a hard eligibility gate: without the live
+                # conversation's size a long session can be routed onto a
+                # model whose window cannot hold it (Section 7 item 6).
+                conversation_history=conversation_history,
+                moa_active=moa_config is not None,
+            )
+        except Exception as _routing_err:  # routing must never break a turn
+            logger.debug("smart model routing skipped: %s", _routing_err)
+
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
         _ctx = build_turn_context(
