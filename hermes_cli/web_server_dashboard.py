@@ -2,6 +2,9 @@
 """
 
 import asyncio
+import dis
+
+import inspect
 import logging
 import importlib.util
 import json
@@ -538,6 +541,16 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
             "not be mounted",
             name, raw_api,
         )
+    # A plugin may ship a dashboard *API* (plugin_api.py) without shipping a UI
+    # bundle at all — lib-docs, done-bell and needs-you do exactly that: they are
+    # desktop-app UIs with a dashboard manifest. Defaulting ``entry`` to
+    # dist/index.js regardless made the SPA advertise a tab and then fail with
+    # "Could not load this plugin's script" on a path that never existed.
+    # Resolve the bundle here and report whether there is a UI to mount.
+    entry = data.get("entry", "dist/index.js")
+    has_ui = bool(entry) and (dashboard_dir / str(entry)).is_file()
+    if not has_ui:
+        tab_info["hidden"] = True
     return {
         "name": name,
         "label": data.get("label", name),
@@ -546,7 +559,8 @@ def _dashboard_plugin_entry(data: Dict[str, Any], name: str, dashboard_dir: Path
         "version": data.get("version", "0.0.0"),
         "tab": tab_info,
         "slots": slots,
-        "entry": data.get("entry", "dist/index.js"),
+        "entry": entry,
+        "has_ui": has_ui,
         "css": data.get("css"),
         "has_api": bool(safe_api),
         "source": source,
@@ -855,6 +869,112 @@ def _hosted_plugin_for_request(name: str) -> Optional[tuple]:
     return None
 
 
+_SUSPEND_OPCODES = frozenset({"GET_AWAITABLE", "GET_AITER", "GET_ANEXT", "BEFORE_ASYNC_WITH", "SEND"})
+# Parameters whose objects are created on the event loop and are not safe to hand to a worker thread.
+_LOOP_AFFINE_PARAMS = frozenset({"request", "raw_request", "websocket", "background_tasks", "response"})
+
+
+def _route_is_blocking_sync_work(endpoint) -> bool:
+    """True when a coroutine handler provably never suspends — i.e. blocking work wearing ``async def``.
+
+    An ``async def`` route runs on the dashboard event loop. A plugin that writes ``async def`` around
+    plain work (read config, open sqlite, build a payload) has nothing to await, so the loop is held
+    for the whole call. ``dis`` proves the negative: no await / async-for / async-with opcode means the
+    coroutine cannot suspend, so moving it to a worker thread cannot change its semantics. Handlers
+    that do suspend, or that take a loop-owned request/response object, are left untouched — offloading
+    those would move them to a thread with no running loop and break them.
+    """
+    if not inspect.iscoroutinefunction(endpoint):
+        return False
+    try:
+        if any(op.opname in _SUSPEND_OPCODES for op in dis.get_instructions(endpoint)):
+            return False
+        params = inspect.signature(endpoint).parameters
+    except (TypeError, ValueError):  # C callable / builtin: no signature to copy, leave it alone
+        return False
+    return not any(name in _LOOP_AFFINE_PARAMS for name in params)
+
+
+def _threadpool_endpoint(endpoint):
+    """Re-expose a never-suspending coroutine handler as a plain ``def``.
+
+    Starlette runs a sync endpoint in the worker threadpool, so the body leaves the event loop. The
+    handler never awaits, so ``asyncio.run`` merely drives it to completion on that thread and the
+    private loop it creates is never touched. ``__signature__`` keeps FastAPI's dependency/parameter
+    resolution identical to the original.
+    """
+    def _run(*args, **kwargs):
+        return asyncio.run(endpoint(*args, **kwargs))
+
+    # Copy the identity FastAPI derives names from, but deliberately NOT ``__wrapped__``:
+    # ``Dependant.is_coroutine_callable`` unwraps it and would see the original coroutine, then
+    # await this wrapper on the loop again (RuntimeError: asyncio.run from a running loop).
+    _run.__name__ = getattr(endpoint, "__name__", "_run")
+    _run.__qualname__ = getattr(endpoint, "__qualname__", _run.__name__)
+    _run.__doc__ = getattr(endpoint, "__doc__", None)
+    _run.__module__ = getattr(endpoint, "__module__", __name__)
+    setattr(_run, "__signature__", inspect.signature(endpoint))
+    return _run
+
+
+# APIRoute constructor arguments copied verbatim when a route is re-registered. ``endpoint`` and
+# ``path`` are the replaced ones; ``methods`` is a set and is normalised by the caller.
+_API_ROUTE_COPY_ATTRS = (
+    "response_model", "status_code", "tags", "dependencies", "summary", "description",
+    "response_description", "responses", "deprecated", "name", "operation_id",
+    "response_model_include", "response_model_exclude", "response_model_by_alias",
+    "response_model_exclude_unset", "response_model_exclude_defaults", "response_model_exclude_none",
+    "include_in_schema", "response_class", "callbacks", "openapi_extra",
+    "generate_unique_id_function", "strict_content_type",
+)
+
+
+def _offload_blocking_plugin_routes(router, plugin_name: str) -> List[str]:
+    """Move a plugin's never-suspending ``async def`` routes off the event loop, in place.
+
+    The host owns the loop; a plugin cannot be trusted to know it does. Measured cause of the
+    2026-11-12 17:09:38 "event loop stalled 12.1s" warning: memory-wiki's ``GET /overview`` is
+    ``async def`` and spent 10.7s inside ``build_memory_overview`` (a full scan of a 348MB
+    ``state.db``), freezing every dashboard request and WebSocket for the duration.
+
+    Routes are rebuilt by constructing a fresh route of the same class rather than swapping
+    ``route.endpoint``: ``APIRoute`` resolves the dependant and the request handler from the endpoint
+    at construction, so a post-hoc attribute assignment would be ignored. Returns the moved routes
+    for the log.
+    """
+    from fastapi.routing import APIRoute
+
+    moved: List[str] = []
+    rebuilt: List[tuple[int, Any]] = []
+    # Copy only what this FastAPI version's APIRoute actually accepts (the constructor grew
+    # ``strict_content_type`` in 0.133), so the rebuild works across versions.
+    ctor_params = inspect.signature(APIRoute.__init__).parameters
+    for index, route in enumerate(list(getattr(router, "routes", []) or [])):
+        endpoint = getattr(route, "endpoint", None)
+        if not isinstance(route, APIRoute) or not _route_is_blocking_sync_work(endpoint):
+            continue
+        kwargs = {
+            attr: getattr(route, attr) for attr in _API_ROUTE_COPY_ATTRS
+            if attr in ctor_params and hasattr(route, attr)
+        }
+        rebuilt.append((index, (route, kwargs)))
+        moved.append(f"{'/'.join(sorted(route.methods or []))} {route.path}")
+    if not rebuilt:
+        return moved
+
+    kept = [route for index, route in enumerate(list(router.routes)) if index not in {i for i, _ in rebuilt}]
+    for index, (route, kwargs) in rebuilt:
+        kwargs["methods"] = sorted(route.methods or [])
+        new_route = type(route)(route.path, _threadpool_endpoint(route.endpoint), **kwargs)
+        kept.insert(min(index, len(kept)), new_route)
+    router.routes[:] = kept
+    _log.info(
+        "Plugin %s: %d API route(s) run in the threadpool (async def with no await): %s",
+        plugin_name, len(moved), ", ".join(moved),
+    )
+    return moved
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
 
@@ -933,6 +1053,7 @@ def _mount_plugin_api_routes():
             if router is None:
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
                 continue
+            _offload_blocking_plugin_routes(router, plugin["name"])
             app.include_router(
                 router,
                 prefix=f"/api/plugins/{plugin['name']}",

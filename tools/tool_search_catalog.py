@@ -1,20 +1,35 @@
 """Deferred-tool catalog for tool search: BM25 retrieval over deferrable tool
-defs plus the budgeted, byte-stable catalog listing embedded in the bridge."""
+defs plus the budgeted, byte-stable catalog listing embedded in the bridge.
+
+Ranking is lexical only. Recorded call outcomes can re-order the hits a query already
+admitted (:func:`load_tool_reliability` + ``search_catalog(reliability=...)``, or the
+``tools.tool_search_reliability`` module's map via ``search_catalog(multipliers=...)``) but
+never decide which tools are offered.
+"""
 
 from __future__ import annotations
 
 import functools
+import json
+import logging
 import math
 import re
+import sqlite3
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-try:  # pure-Python Snowball stemmer; see the guarded fallback in ``_stem``
+try:  # optional: pure Python, but absent from lean/3.12 installs
     import snowballstemmer
-except ImportError:  # pragma: no cover - exercised by the lean-install test
+except ImportError:  # no stemmer -> raw tokens still index and match
     snowballstemmer = None  # type: ignore[assignment]
+
+from tools.delegate_tool_results import _looks_like_error_output
+
+logger = logging.getLogger(__name__)
 
 # Reserved bridge names: a user/plugin/MCP tool may not take them (registry override
 # protection rejects such registrations).
@@ -52,10 +67,11 @@ def _stem(token: str) -> str:
     requirement's marker skips it) the token is returned unchanged rather than raising:
     matching degrades to exact prefixes, which is worse recall, not a broken tool search.
     """
-    if snowballstemmer is None:
+    stemmer_mod = snowballstemmer  # local: narrows cleanly for type checkers
+    if stemmer_mod is None:  # no stemmer installed: the raw token is the key
         return token
     if getattr(_thread_local, "stemmer", None) is None:
-        _thread_local.stemmer = snowballstemmer.stemmer("english")
+        _thread_local.stemmer = stemmer_mod.stemmer("english")
     return _thread_local.stemmer.stemWord(token)
 
 
@@ -184,8 +200,150 @@ def _required_term_coverage(answerable_term_count: int) -> int:
     return math.ceil(answerable_term_count * MIN_QUERY_TERM_COVERAGE)
 
 
+# Recorded-outcome weighting. Hermes persists every tool result already (``messages``:
+# ``role='tool'``, ``tool_name``, ``content``) and never reads it back into retrieval: a tool
+# that fails most of the time is still the best lexical match for its query, so it keeps
+# winning the slot and keeps failing. This is AnyTool's ``ToolQualityManager.adjust_ranking``
+# in narrow form — a post-hoc multiplier over outcomes Hermes already recorded. It is applied
+# AFTER admission, so it re-orders the hits lexical search admitted and can never hide one.
+MIN_CALLS_FOR_RELIABILITY = 3      # no penalty without evidence: a new tool is not a bad tool
+RELIABILITY_HEALTHY_RATE = 0.4     # at or above this success rate a tool is never penalised
+RELIABILITY_FLOOR = 0.2            # hard clamp: the worst tool still ranks, just last
+RELIABILITY_WINDOW_DAYS = 30       # older outcomes say nothing about today's tool
+RELIABILITY_MAX_CALLS = 2000       # bounded read; the newest recorded calls are the evidence
+# The read walks only the newest N message rows (a rowid range scan), so its cost tracks this
+# number rather than the size of the state DB: 8ms over 8k rows, vs 1.6s cold-scanning a 154MB
+# DB that has no index on `role`. A tool quieter than this window has no evidence yet.
+RELIABILITY_SCAN_ROWS = 8000
+
+
+def _clamp_reliability(value: Any) -> float:
+    """Clamp a multiplier into ``[RELIABILITY_FLOOR, 1.0]``; junk is neutral.
+
+    A caller-supplied mapping is untrusted input and no value it can hold may demote a tool
+    out of the results, so the floor is enforced here rather than trusted from the caller.
+    """
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(multiplier):
+        return 1.0
+    return min(1.0, max(RELIABILITY_FLOOR, multiplier))
+
+
+def tool_reliability_multiplier(successes: int, calls: int, consecutive_failures: int = 0) -> float:
+    """Score multiplier in ``[RELIABILITY_FLOOR, 1.0]`` for one tool's recorded outcomes.
+
+    Neutral below :data:`MIN_CALLS_FOR_RELIABILITY` calls (insufficient evidence) and at or
+    above :data:`RELIABILITY_HEALTHY_RATE` successes; below that it slides from 1.0 at the
+    threshold to 0.3 at a zero success rate, with a further penalty once a tool has failed its
+    last three calls in a row (a run of failures is a stronger signal than a low average).
+    """
+    if calls < MIN_CALLS_FOR_RELIABILITY:
+        return 1.0
+    success_rate = successes / calls
+    if success_rate >= RELIABILITY_HEALTHY_RATE:
+        return 1.0
+    multiplier = 0.3 + (success_rate / RELIABILITY_HEALTHY_RATE) * 0.7
+    if consecutive_failures >= 3:  # the newest calls all failed: still broken, not just patchy
+        multiplier -= min(0.3, (consecutive_failures - 2) * 0.1)
+    return _clamp_reliability(multiplier)
+
+
+def _result_failed(content: Any) -> bool:
+    """Whether one recorded tool result is a failure.
+
+    Structural signals first: the ``{"output", "exit_code", "error"}`` envelope the terminal
+    and exec tools persist, where a non-zero exit code is the canonical failure signal. Results
+    that are not an envelope fall back to the shared text heuristic (MCP tools return prose).
+    Mirrors the signals in ``agent.display._detect_tool_failure``; that module (i18n, rich) is
+    not imported here because this runs inside the retrieval path.
+    """
+    if not isinstance(content, str) or not content:
+        return False
+    try:
+        data = json.loads(content)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        exit_code = data.get("exit_code")
+        return bool(
+            data.get("error")
+            or data.get("success") is False
+            or (isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0)
+        )
+    return _looks_like_error_output(content)
+
+
+_RELIABILITY_SQL = (
+    "SELECT tool_name, content FROM messages"
+    " WHERE id > (SELECT MAX(id) FROM messages) - ?"
+    " AND role = 'tool' AND tool_name IS NOT NULL AND timestamp >= ?"
+    " ORDER BY id DESC LIMIT ?"
+)
+
+
+def _recent_tool_results(db_path: Optional[Path], *, days: int, max_calls: int,
+                         now: Optional[float]) -> List[Tuple[Any, Any]]:
+    """Newest recorded ``(tool_name, content)`` tool results, or ``[]``.
+
+    Every failure mode returns empty history — no state DB, a schema without ``tool_name``, a
+    locked or half-written file, a pytest process resolving the production DB (the state
+    layer's own live-DB guard) — because the caller then ranks exactly as it did before, which
+    is the only safe direction for this to fail. Read-only, no write lock, bounded row count.
+    """
+    try:
+        from hermes_state import _default_db_path, _ensure_test_isolation
+        from hermes_state_holders import read_only_db_uri
+
+        path = Path(db_path) if db_path is not None else _default_db_path()
+        _ensure_test_isolation(path)
+        cutoff = (time.time() if now is None else now) - days * 86400
+        conn = sqlite3.connect(read_only_db_uri(path), uri=True, timeout=1.0)
+        try:
+            return conn.execute(
+                _RELIABILITY_SQL, (RELIABILITY_SCAN_ROWS, cutoff, max_calls)).fetchall()
+        finally:
+            conn.close()
+    except Exception:  # a broken state DB is not a search failure: history stays empty
+        logger.debug("tool reliability history unavailable; ranking stays neutral", exc_info=True)
+        return []
+
+
+def load_tool_reliability(db_path: Optional[Path] = None, *, days: int = RELIABILITY_WINDOW_DAYS,
+                          max_calls: int = RELIABILITY_MAX_CALLS,
+                          now: Optional[float] = None) -> Dict[str, float]:
+    """Reliability multiplier per tool name, derived from the outcomes Hermes already recorded.
+
+    ``{tool_name: multiplier}`` for every tool called inside the window; a tool with no
+    history is absent and ranks neutrally. Call this ONCE per search dispatch and pass the
+    result to :func:`search_catalog` — the ranking loop must never touch the database.
+    Read-only, bounded, and never raises: no history means no change to the ranking.
+    """
+    calls: Dict[str, int] = {}
+    successes: Dict[str, int] = {}
+    failing_streak: Dict[str, int] = {}
+    streak_over: set = set()  # a newer success ended this tool's run of failures
+    for name, content in _recent_tool_results(db_path, days=days, max_calls=max_calls, now=now):
+        if not isinstance(name, str) or not name:
+            continue
+        calls[name] = calls.get(name, 0) + 1
+        if _result_failed(content):
+            if name not in streak_over:  # rows arrive newest first
+                failing_streak[name] = failing_streak.get(name, 0) + 1
+        else:
+            successes[name] = successes.get(name, 0) + 1
+            streak_over.add(name)
+    return {
+        name: tool_reliability_multiplier(successes.get(name, 0), count, failing_streak.get(name, 0))
+        for name, count in calls.items()
+    }
+
+
 def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
                    corpus_stats: Optional[_CorpusStats] = None,
+                   reliability: Optional[Dict[str, Any]] = None,
                    multipliers: Optional[Dict[str, float]] = None) -> List[CatalogEntry]:
     """Top-``limit`` catalog entries for ``query`` by BM25 (exact name match ranks first).
 
@@ -196,11 +354,12 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
     carries admits nothing; the caller's empty-group hint tells the model to retry without it.
     Long queries additionally need :func:`_required_term_coverage` of their answerable terms.
 
-    ``multipliers`` (tool name -> value in 0.2..1.0, see
-    ``tools.tool_search_reliability``) re-weights the ADMITTED and scored candidates
-    immediately before truncation. It is a pure permutation of the candidate list: the
-    admission gate has already run, so the set of candidates considered is identical with
-    and without multipliers and no hit is ever filtered out — only their order changes."""
+    ``reliability`` and ``multipliers`` are the same knob under the two names its callers
+    use (``reliability`` from :func:`load_tool_reliability`, ``multipliers`` from
+    ``tools.tool_search_reliability``); a caller passes one. Either re-orders the admitted
+    hits by how often each tool has actually worked. It is applied AFTER the gate, so it can
+    demote a hit but never remove one, and an exact-name hit keeps its infinite score and
+    therefore its first place. ``None`` — the default — ranks exactly as before."""
     query_tokens = _tokenize(query) if catalog and limit > 0 else []
     if not query_tokens:
         return []
@@ -222,6 +381,9 @@ def search_catalog(catalog: List[CatalogEntry], query: str, limit: int = 5, *,
         (float("inf") if entry.name.lower() == exact_name
          else _bm25_score(query_tokens, entry._tokens, *corpus_stats), entry)
         for entry in catalog if _admitted(entry)]
+    if reliability:
+        scored = [(score * _clamp_reliability(reliability.get(entry.name, 1.0)), entry)
+                  for score, entry in scored]
     scored.sort(key=lambda x: x[0], reverse=True)
     if multipliers:
         from tools.tool_search_reliability import rerank_scored

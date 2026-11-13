@@ -126,6 +126,14 @@ CREATE TABLE IF NOT EXISTS memory_links (
     to_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
     relation TEXT NOT NULL CHECK (relation IN ('supersedes','contradicts','related_to')),
     created_at TEXT NOT NULL,
+    -- Conflict review state (D7).  A contradiction is a *proposal* that two
+    -- memories disagree, and a proposal needs an outcome.  Recording it on the
+    -- link keeps both memories and the link itself intact: dismissing a
+    -- conflict records that it was reviewed, it does not erase the history of
+    -- having been flagged.  NULL means "open / not yet reviewed".
+    resolution TEXT,
+    resolved_at TEXT,
+    resolution_note TEXT,
     PRIMARY KEY (from_id, to_id, relation)
 );
 
@@ -134,6 +142,28 @@ CREATE TABLE IF NOT EXISTS rekal_config (
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY (project, key)
+);
+
+-- Entity store (C2).  Knowledge-graph work used to be delegated entirely to
+-- the optional MemPalace package, so on a host without it there was no way to
+-- record that a memory mentions a thing.  These two tables are the minimum
+-- that makes entity CRUD -- and graph queries over it -- work with the stdlib
+-- alone: `entities` holds one row per (case-insensitively) distinct name and
+-- `memory_entities` is the memory→entity edge set.
+CREATE TABLE IF NOT EXISTS entities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    name_key TEXT NOT NULL UNIQUE,
+    entity_type TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_entities (
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, entity_id)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -153,6 +183,8 @@ CREATE INDEX IF NOT EXISTS idx_memories_importance   ON memories(importance DESC
 CREATE INDEX IF NOT EXISTS idx_links_from            ON memory_links(from_id);
 CREATE INDEX IF NOT EXISTS idx_links_to              ON memory_links(to_id);
 CREATE INDEX IF NOT EXISTS idx_links_relation        ON memory_links(relation);
+CREATE INDEX IF NOT EXISTS idx_entities_type         ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_memory_entities_ent   ON memory_entities(entity_id);
 
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memories_fts(rowid, content, tags, project)
@@ -184,6 +216,17 @@ _MIGRATIONS = [
     # Last time evidence for this memory was re-observed; lets recency reflect
     # reinforcement without overwriting the original created_at.
     "ALTER TABLE memories ADD COLUMN last_reinforced_at TEXT",
+]
+
+# Migrations for columns added to the link table.  Kept separate because the
+# column probe has to run against a different table; applied with the same
+# idempotent "add only what is missing" rule.
+_LINK_MIGRATIONS = [
+    # D7: conflict review state.  Nullable, so every pre-existing contradiction
+    # link reads as "open" exactly as it did before the columns existed.
+    "ALTER TABLE memory_links ADD COLUMN resolution TEXT",
+    "ALTER TABLE memory_links ADD COLUMN resolved_at TEXT",
+    "ALTER TABLE memory_links ADD COLUMN resolution_note TEXT",
 ]
 
 
@@ -292,6 +335,87 @@ def _new_id():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  Entities (stdlib; no MemPalace required)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _entity_key(name):
+    """Case- and whitespace-insensitive identity for an entity name."""
+    return re.sub(r"\s+", " ", str(name or "").strip()).lower()
+
+
+# Only shapes that are unambiguous on sight.  A general noun-phrase extractor
+# would fill the table with noise ("The", "Retry") and, because entities are
+# joined on, noise compounds: two memories sharing the word "the" would look
+# connected.  Versions are deliberately excluded -- they change on every
+# release and would make every pair of release notes look related.
+_ENTITY_PATTERNS = (
+    ("file_path", re.compile(r"(?:/[\w.\-]+)+\.\w+")),
+    ("url", re.compile(r"https?://[^\s<>\"')]+")),
+    ("email", re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")),
+    ("identifier", re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:[._][A-Za-z0-9_]+)+\b")),
+    ("camel_case", re.compile(r"\b(?=[A-Za-z0-9]{3,}\b)[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b")),
+    ("constant", re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")),
+    ("backtick", re.compile(r"`([^`\n]+)`")),
+)
+
+ENTITY_EXTRACTION_LIMIT = 16
+
+
+def extract_entities(content, limit=ENTITY_EXTRACTION_LIMIT):
+    """Extract (name, kind) pairs from free text, in order of first appearance.
+
+    Deduplicated case-insensitively and bounded by `limit`, so a pathological
+    memory cannot turn one store() call into thousands of entity writes.
+    """
+    if not content or limit <= 0:
+        return []
+    text = content if isinstance(content, str) else str(content)
+    found = []
+    seen = set()
+    for kind, pattern in _ENTITY_PATTERNS:
+        for match in pattern.finditer(text):
+            name = (match.group(1) if pattern.groups else match.group(0)) or ""
+            name = name.strip().strip(".,;:)]}\"'")
+            key = _entity_key(name)
+            if not key or key in seen or len(key) > 200:
+                continue
+            # A backtick span is only interesting when it names something, not
+            # when it quotes a whole sentence or a shell command.
+            if kind == "backtick" and (len(key) > 60 or " " in key and len(key.split()) > 3):
+                continue
+            seen.add(key)
+            found.append((name, kind))
+            if len(found) >= limit:
+                return found
+    return found
+
+
+class _StoreKnowledgeGraph:
+    """KG-compatible view over the engine's own entity tables.
+
+    The engine talks to a knowledge graph in exactly one shape --
+    `query_entity(name, direction=...)` returning fact dicts with
+    subject/predicate/object/ended -- so that is the only method this adapter
+    needs.  It exists so `multi_hop`, `contradiction_check` and `fact_check`
+    work on a host with no optional dependency: the "facts" are derived from
+    the memory→entity edges the engine maintains, which is a real (if
+    coarse-grained) entity graph rather than a stub.
+    """
+
+    backend = "rekal-entities"
+
+    def __init__(self, engine):
+        self._engine = engine
+
+    def query_entity(self, entity, direction="both"):
+        return self._engine.query_entity(entity, direction=direction)
+
+    def __bool__(self):
+        # Truthy so existing `if self.kg:`-shaped call sites keep working.
+        return True
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  Engine
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -316,6 +440,10 @@ class RekalEngine:
         self.palace_path = palace_path or data_dir
         self.kg = kg
         self.search_memories_fn = search_memories_fn
+        # C2: the stdlib entity graph backing the KG-shaped calls when the
+        # optional MemPalace package (and therefore its KnowledgeGraph) is
+        # absent.  Constructed before the DB so _graph() is always safe to call.
+        self._local_kg = _StoreKnowledgeGraph(self)
 
         # In-memory row cache (id → dict); 2-minute TTL, 512 entries max
         self._cache = _TTLCache(maxsize=512, ttl=120)
@@ -344,16 +472,33 @@ class RekalEngine:
 
     def _run_migrations(self):
         """Idempotently apply schema migrations for columns added post-release."""
-        existing_cols = {row[1] for row in self.db.execute("PRAGMA table_info(memories)")}
-        for stmt in _MIGRATIONS:
-            col = stmt.split("ADD COLUMN")[1].strip().split()[0]
-            if col not in existing_cols:
-                try:
-                    self.db.execute(stmt)
-                    logger.debug("Migration applied: %s", stmt)
-                except sqlite3.OperationalError as e:
-                    logger.debug("Migration skipped (%s): %s", e, stmt)
+        self._apply_column_migrations("memories", _MIGRATIONS)
+        self._apply_column_migrations("memory_links", _LINK_MIGRATIONS)
         self.db.commit()
+
+    def _apply_column_migrations(self, table, statements):
+        """Add any column from `statements` that `table` does not have yet.
+
+        The probe is a PRAGMA scan, so re-opening a migrated database is a
+        no-op and two processes racing to open the same fresh file converge on
+        the same schema instead of failing.
+        """
+        try:
+            existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.DatabaseError as exc:
+            logger.debug("Migration probe skipped for %s: %s", table, exc)
+            return
+        if not existing:
+            return
+        for stmt in statements:
+            col = stmt.split("ADD COLUMN")[1].strip().split()[0]
+            if col in existing:
+                continue
+            try:
+                self.db.execute(stmt)
+                logger.debug("Migration applied: %s", stmt)
+            except sqlite3.OperationalError as e:
+                logger.debug("Migration skipped (%s): %s", e, stmt)
 
     def _migrate_legacy_hermes_schema(self):
         """Migrate the schema written by Hermes's pre-upstream Rekal port.
@@ -689,6 +834,14 @@ class RekalEngine:
         if conflicts:
             result["contradicts"] = conflicts
 
+        # C2: record what the memory mentions.  The entity edges are what makes
+        # graph queries work without the optional MemPalace package; a failure
+        # here is contained inside _link_entities_for_memory and cannot cost
+        # the caller the memory.
+        entities = self._link_entities_for_memory(memory_id, content)
+        if entities:
+            result["entities"] = entities
+
         return result
 
     def _reinforce(self, memory_id):
@@ -777,6 +930,7 @@ class RekalEngine:
         results = []
         stored = 0
         skipped = 0
+        pending_entities = []
 
         try:
             self.db.execute("BEGIN")
@@ -794,11 +948,29 @@ class RekalEngine:
                         "SELECT id FROM memories WHERE content_hash = ?", (chash,)
                     ).fetchone()
                     if existing:
-                        results.append({
+                        # B12: re-observing a fact inside a batch is evidence, exactly
+                        # as it is in store(). Mirrors _reinforce() but without its
+                        # commit(), because batch_store owns the surrounding transaction
+                        # and must stay atomic.
+                        self.db.execute(
+                            "UPDATE memories SET proof_count = COALESCE(proof_count, 1) + 1, "
+                            "last_reinforced_at = ? WHERE id = ?",
+                            (ts, existing["id"]),
+                        )
+                        strengthened = self.db.execute(
+                            "SELECT proof_count FROM memories WHERE id = ?",
+                            (existing["id"],),
+                        ).fetchone()
+                        self._cache.invalidate(existing["id"])
+                        batch_hit = {
                             "success": True,
                             "memory_id": existing["id"],
                             "duplicate": True,
-                        })
+                            "reinforced": True,
+                        }
+                        if strengthened is not None:
+                            batch_hit["proof_count"] = int(strengthened["proof_count"])
+                        results.append(batch_hit)
                         skipped += 1
                         continue
 
@@ -820,11 +992,19 @@ class RekalEngine:
                 )
                 results.append({"success": True, "memory_id": memory_id})
                 stored += 1
+                pending_entities.append((memory_id, content))
 
             self.db.execute("COMMIT")
         except Exception as exc:
             self.db.execute("ROLLBACK")
             return {"success": False, "error": str(exc), "results": results}
+
+        # C2: entity edges are written after the transaction, not inside it --
+        # add_entity commits on its own, which would break batch atomicity.
+        # They are derived data, so a failure here leaves the memories stored
+        # (the caller's data) rather than rolling them back.
+        for memory_id, content in pending_entities:
+            self._link_entities_for_memory(memory_id, content)
 
         return {"success": True, "results": results, "stored": stored, "skipped": skipped}
 
@@ -890,8 +1070,18 @@ class RekalEngine:
             "VALUES (?, ?, 'supersedes', ?)",
             (new_id, old_id, ts),
         )
+        # D7: an open contradiction about the memory that has just been replaced
+        # is settled by the supersede, not left in the review queue.  The link
+        # and both memories are kept; only its review state changes.
+        self._execute(
+            "UPDATE memory_links SET resolution = 'superseded', resolved_at = ?, "
+            "resolution_note = ? WHERE relation = 'contradicts' AND resolution IS NULL "
+            "AND (from_id = ? OR to_id = ?)",
+            (ts, f"closed by supersede {new_id}", old_id, old_id),
+        )
         self.db.commit()
         self._cache.invalidate(old_id)
+        self._link_entities_for_memory(new_id, new_content)
 
         try:
             from mempalace.mcp_server import tool_add_drawer
@@ -920,6 +1110,224 @@ class RekalEngine:
         if cursor.rowcount == 0:
             return {"success": False, "error": f"Memory {memory_id} not found"}
         return {"success": True, "memory_id": memory_id}
+
+    # ── Entities (C2) ─────────────────────────────────────────────────
+    #
+    # Idempotent by construction: names are keyed on a normalised form, so
+    # adding "Postgres", "postgres" and "Postgres " all resolve to one row, and
+    # re-running the migration or re-opening the engine never duplicates them.
+
+    def add_entity(self, name, entity_type=None):
+        """Create an entity, or return the existing one.  Idempotent."""
+        key = _entity_key(name)
+        if not key:
+            return {"success": False, "error": "Entity name is required"}
+        row = self._execute(
+            "SELECT * FROM entities WHERE name_key = ?", (key,)
+        ).fetchone()
+        ts = _now()
+        if row:
+            if entity_type and not row["entity_type"]:
+                # A later, more specific call fills in the kind; it never
+                # overwrites one that is already known.
+                self._execute(
+                    "UPDATE entities SET entity_type = ?, updated_at = ? WHERE id = ?",
+                    (entity_type, ts, row["id"]),
+                )
+                self.db.commit()
+            return {
+                "success": True,
+                "entity_id": row["id"],
+                "name": row["name"],
+                "entity_type": entity_type or row["entity_type"],
+                "created": False,
+            }
+        entity_id = _new_id()
+        self._execute(
+            "INSERT INTO entities (id, name, name_key, entity_type, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (entity_id, str(name).strip(), key, entity_type, ts, ts),
+        )
+        self.db.commit()
+        return {
+            "success": True,
+            "entity_id": entity_id,
+            "name": str(name).strip(),
+            "entity_type": entity_type,
+            "created": True,
+        }
+
+    def get_entity(self, name):
+        row = self._execute(
+            "SELECT * FROM entities WHERE name_key = ?", (_entity_key(name),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_entities(self, limit=100, entity_type=None):
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 100
+        rows = self._execute(
+            "SELECT * FROM entities WHERE (? IS NULL OR entity_type = ?) "
+            "ORDER BY name LIMIT ?",
+            (entity_type, entity_type, limit),
+        )
+        return [dict(row) for row in rows]
+
+    def link_memory_entity(self, memory_id, name, entity_type=None):
+        """Attach an entity to a memory, creating the entity when it is new."""
+        if not self._execute(
+            "SELECT 1 FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone():
+            return {"success": False, "error": f"Memory {memory_id} not found"}
+        added = self.add_entity(name, entity_type)
+        if not added.get("success"):
+            return added
+        self._execute(
+            "INSERT OR IGNORE INTO memory_entities (memory_id, entity_id, created_at) "
+            "VALUES (?, ?, ?)",
+            (memory_id, added["entity_id"], _now()),
+        )
+        self.db.commit()
+        return {
+            "success": True,
+            "memory_id": memory_id,
+            "entity_id": added["entity_id"],
+            "name": added["name"],
+        }
+
+    def memory_entities(self, memory_id):
+        """Entities mentioned by one memory."""
+        rows = self._execute(
+            "SELECT e.* FROM memory_entities me JOIN entities e ON e.id = me.entity_id "
+            "WHERE me.memory_id = ? ORDER BY e.name",
+            (memory_id,),
+        )
+        return [dict(row) for row in rows]
+
+    def entity_memories(self, name, limit=20):
+        """Live (non-superseded) memories mentioning an entity, newest first."""
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 20
+        rows = self._execute(
+            """SELECT m.* FROM memory_entities me
+               JOIN entities e ON e.id = me.entity_id
+               JOIN memories m ON m.id = me.memory_id
+               WHERE e.name_key = ?
+                 AND m.id NOT IN (
+                     SELECT to_id FROM memory_links WHERE relation = 'supersedes'
+                 )
+               ORDER BY m.created_at DESC LIMIT ?""",
+            (_entity_key(name), limit),
+        )
+        return [self._row_to_dict(row) for row in rows]
+
+    def delete_entity(self, name):
+        """Remove an entity and its edges.  Never touches the memories."""
+        row = self._execute(
+            "SELECT id, name FROM entities WHERE name_key = ?", (_entity_key(name),)
+        ).fetchone()
+        if not row:
+            return {"success": False, "error": f"Entity {name} not found"}
+        edges = self._execute(
+            "SELECT COUNT(*) FROM memory_entities WHERE entity_id = ?", (row["id"],)
+        ).fetchone()[0]
+        self._execute("DELETE FROM entities WHERE id = ?", (row["id"],))
+        self.db.commit()
+        return {
+            "success": True,
+            "entity_id": row["id"],
+            "name": row["name"],
+            "edges_removed": int(edges),
+        }
+
+    def query_entity(self, entity, direction="both"):
+        """KG-shaped facts for an entity, derived from shared memories.
+
+        Returns dicts with the same keys MemPalace's `query_entity` yields --
+        `subject`, `predicate`, `object`, `ended` -- so `multi_hop`,
+        `contradiction_check` and `fact_check` can run unchanged against this
+        stdlib backend.  `direction` is accepted for signature compatibility and
+        ignored: co-occurrence evidence is symmetric.
+        """
+        key = _entity_key(entity)
+        if not key:
+            return []
+        try:
+            rows = self._execute(
+                """SELECT e.name AS other, COUNT(*) AS shared
+                   FROM memory_entities mine
+                   JOIN entities me ON me.id = mine.entity_id
+                   JOIN memory_entities peer ON peer.memory_id = mine.memory_id
+                   JOIN entities e ON e.id = peer.entity_id
+                   JOIN memories m ON m.id = mine.memory_id
+                   WHERE me.name_key = ?
+                     AND peer.entity_id != mine.entity_id
+                     AND m.id NOT IN (
+                         SELECT to_id FROM memory_links WHERE relation = 'supersedes'
+                     )
+                   GROUP BY e.id
+                   ORDER BY shared DESC, e.name
+                   LIMIT 50""",
+                (key,),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            logger.debug("entity query failed: %s", exc)
+            return []
+
+        return [
+            {
+                "subject": entity,
+                "predicate": "co_occurs_with",
+                "object": row["other"],
+                "ended": None,
+                "shared_memories": int(row["shared"]),
+                "fact": f"{entity} —[co_occurs_with]→ {row['other']}",
+            }
+            for row in rows
+        ]
+
+    def _link_entities_for_memory(self, memory_id, content, entity_type_hint=None):
+        """Record the entities a freshly stored memory mentions.
+
+        Best effort by design: an entity that cannot be extracted or written
+        must never cost the caller the memory itself.
+        """
+        try:
+            found = extract_entities(content)
+        except Exception as exc:  # pragma: no cover - extraction cannot fail
+            logger.debug("entity extraction skipped: %s", exc)
+            return []
+        linked = []
+        for name, kind in found:
+            try:
+                result = self.link_memory_entity(memory_id, name, kind or entity_type_hint)
+            except sqlite3.DatabaseError as exc:
+                logger.debug("entity link skipped (%s): %s", exc, name)
+                continue
+            if result.get("success"):
+                linked.append(result["name"])
+        return linked
+
+    def _graph(self):
+        """The knowledge graph to answer entity questions from.
+
+        Prefers an injected MemPalace KG.  Falls back to the stdlib entity
+        graph when there is none -- and also when the injected handle is the
+        *class* rather than an instance, which is what the plugin's import path
+        yields when `mempalace` exposes `KnowledgeGraph` without a live `_kg`;
+        calling it would raise TypeError and silently report "no facts".
+        """
+        kg = self.kg
+        if kg is not None:
+            if isinstance(kg, type) or not callable(getattr(kg, "query_entity", None)):
+                logger.debug("ignoring unusable knowledge graph handle: %r", type(kg))
+            else:
+                return kg
+        return self._local_kg
 
     # ── Link ──────────────────────────────────────────────────────────
 
@@ -1138,7 +1546,12 @@ class RekalEngine:
             seen_content_keys.add(ck)
             vec_dist = vec_scores.get(ck, 1.0)
             vec_norm = _normalize_vec(vec_dist)
-            days = _days_since(mem["created_at"])
+            # B11: freshness follows the last observation, not the original insert.
+            # last_reinforced_at was written on every corroboration and never read,
+            # so a fact confirmed yesterday still decayed from the day it was first
+            # captured. Falls back to created_at when the memory was never reinforced.
+            observed_at = mem.get("last_reinforced_at") or mem["created_at"]
+            days = _days_since(observed_at)
             rec_norm = _recency_score(days, weights["half_life"])
             acc_norm = _access_score(mem["access_count"])
             imp_boost = _importance_boost(mem["importance"])
@@ -1165,11 +1578,18 @@ class RekalEngine:
                 "created_at": mem["created_at"],
                 "updated_at": mem["updated_at"],
                 "access_count": mem["access_count"],
+                # B1: proof_count must travel with the candidate. The scorer reads
+                # entry["proof_count"] below; without this key it defaulted to 1,
+                # which proof_norm() maps to exactly neutral (0.5), so repeated
+                # corroboration never changed the ranking.
+                "proof_count": mem["proof_count"],
+                "last_reinforced_at": mem.get("last_reinforced_at"),
                 "score": round(score, 4),
                 "fts_score": round(fts_norm, 3),
                 "vec_score": round(vec_norm, 3),
                 "recency_score": round(rec_norm, 3),
                 "access_score": round(acc_norm, 3),
+                "proof_score": round(_hs.proof_norm(mem["proof_count"]), 3) if _hs else 0.5,
                 "source": "rekal",
             })
 
@@ -1255,7 +1675,11 @@ class RekalEngine:
                 self._cache.invalidate(s["id"])
         self.db.commit()
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        # Coverage selection (B4) has already decided the head of the list;
+        # re-sorting by score would rebuild exactly the temporal cluster the
+        # selection exists to break up.
+        if not (fusion_meta and fusion_meta.get("ordered_by_coverage")):
+            scored.sort(key=lambda x: x["score"], reverse=True)
         if fusion_meta:
             return {
                 "query": query,
@@ -1329,13 +1753,26 @@ class RekalEngine:
             # the strongest current candidates only -- expanding from the whole
             # pool would pull in most of a densely linked store.
             activations = {}
+            superseded_ids = set()
             if graph_expand:
+                # C3: an expanded node must pass the same exclusion as a direct
+                # hit.  Without this, a superseded memory is filtered out of the
+                # FTS arm and then walked straight back in through the
+                # `supersedes`/`contradicts` edge -- the two relations that carry
+                # the *largest* propagation multipliers, so the retired memory
+                # could arrive with more activation than a live neighbour.
+                superseded_ids = {
+                    row[0] for row in self._execute(
+                        "SELECT to_id FROM memory_links WHERE relation = 'supersedes'"
+                    )
+                }
                 seeds = [e["id"] for e in sorted(scored, key=lambda x: x["score"], reverse=True)[:10]
                          if e.get("source") == "rekal"]
                 adjacency = self._link_adjacency(seeds)
                 activations = _hs.expand_links(seeds, adjacency, max_hops=2, budget=max(limit * 2, 20))
+                expanded_added = 0
                 for mem_id, activation in activations.items():
-                    if mem_id in by_id:
+                    if mem_id in by_id or mem_id in superseded_ids:
                         continue
                     mem = self._fetch_memory(mem_id)
                     if not mem:
@@ -1372,18 +1809,27 @@ class RekalEngine:
                     }
                     scored.append(entry)
                     by_id[mem_id] = entry
-                meta["graph_expanded"] = len(activations)
+                    expanded_added += 1
+                meta["graph_expanded"] = expanded_added
 
             # Temporal analysis: derive a window from the query text and score
             # each candidate by how close it sits to that window's midpoint.
             proximity = {}
+            coarse_window = False
+            window = None
             if temporal:
                 # Reuse the window computed during query analysis so the
                 # lexical rewrite and the proximity scoring can never disagree.
                 window = temporal_window if temporal_window is not None else _hs.extract_temporal_constraint(query)
                 if window:
                     start, end = window
+                    # A window covering exactly one calendar month or year is a
+                    # coarse date ("in March 2026", "last year"), not an
+                    # interval: the user named a period, they did not claim the
+                    # event happened at its centre.
+                    coarse_window = _hs.spans_calendar_period(start, end)
                     meta["temporal_window"] = [start.isoformat(), end.isoformat()]
+                    meta["temporal_shape"] = "coarse" if coarse_window else "interval"
                     for entry in scored:
                         created = _parse_ts(entry.get("created_at"))
                         proximity[entry["id"]] = _hs.temporal_proximity(created, start, end)
@@ -1446,11 +1892,29 @@ class RekalEngine:
                     item["rrf_score"], item["source_ranks"], strategy_boosts or {}
                 )
                 created = _parse_ts(entry.get("created_at"))
-                recency = _hs.recency_for_range(created, None, None, now)
-                if entry["id"] in proximity:
-                    # An explicit temporal window in the query outranks generic
-                    # freshness: the user asked about a period, not about "new".
+                # B3: when the query named a period, that period is what the
+                # memory is being measured against, so it is passed as the
+                # memory's occurred range with created_at as the fallback.
+                # For a coarse date ("in March 2026", "last year") this is the
+                # reachable path for the coarse-date rule: score from the END of
+                # the period and cap at neutral, because a period the user named
+                # in passing has not earned a freshness bonus.  Without a parsed
+                # window the call is byte-identical to the previous behaviour.
+                if window:
+                    recency = _hs.recency_for_range(window[0], window[1], created, now)
+                    entry["recency_basis"] = "window"
+                else:
+                    recency = _hs.recency_for_range(created, None, None, now)
+                    entry["recency_basis"] = "age"
+                if entry["id"] in proximity and not coarse_window:
+                    # An explicit temporal *interval* in the query outranks
+                    # generic freshness: the user asked about a period, not
+                    # about "new".  A coarse window keeps the capped signal
+                    # above instead of the triangular kernel, which would hand
+                    # a mid-period memory a confidence the window cannot support.
                     recency = proximity[entry["id"]]
+                    entry["recency_basis"] = "proximity"
+                entry["recency_signal"] = round(recency, 4)
                 entry["score"] = round(_hs.combined_score(
                     base,
                     recency=recency,
@@ -1474,6 +1938,42 @@ class RekalEngine:
                 if entry["id"] not in fused_ids:
                     entry["score"] = round((entry.get("score") or 0.0) * 0.01, 6)
                     results.append(entry)
+
+            # B4: decide which candidates survive when the query named a period.
+            # Relevance ordering collapses onto whichever few days the store
+            # happens to be dense in, so "what happened last month" answered by
+            # score alone returns three memories from one afternoon.  Coverage
+            # selection drains time buckets round-robin instead, so the slice
+            # spans the period the user asked about.  Nothing is dropped -- the
+            # unselected candidates stay behind the head of the list -- and the
+            # whole step is skipped when the query carries no temporal intent,
+            # keeping it off the hot path.
+            if window and len(results) > limit:
+                proxies = [
+                    {
+                        "id": e["id"],
+                        "_date": _parse_ts(e.get("created_at")),
+                        "score": e.get("score") or 0.0,
+                    }
+                    for e in results
+                ]
+                picked = _hs.select_with_temporal_coverage(
+                    proxies, limit, window[0], window[1]
+                )
+                by_result_id = {e["id"]: e for e in results}
+                head = [by_result_id[p["id"]] for p in picked if p["id"] in by_result_id]
+                seen = {e["id"] for e in head}
+                results = head + [e for e in results if e["id"] not in seen]
+                meta["coverage"] = {
+                    "applied": True,
+                    "selected": len(head),
+                    "candidates": len(proxies),
+                }
+                # The head is now ordered for coverage, not by score, so the
+                # caller must not re-sort it back into a cluster.
+                meta["ordered_by_coverage"] = True
+            elif window:
+                meta["coverage"] = {"applied": False, "candidates": len(results)}
 
             return results, meta
         except Exception as exc:
@@ -1533,17 +2033,94 @@ class RekalEngine:
 
     # ── Conflicts ─────────────────────────────────────────────────────
 
-    def get_conflicts(self, project=None):
+    # Review outcomes a contradiction link can carry.  "not_a_conflict" is
+    # normalised to "dismissed" so the stored value stays a small closed set
+    # while the caller can use the phrasing that reads best.
+    _CONFLICT_RESOLUTIONS = {
+        "dismissed": "dismissed",
+        "not_a_conflict": "dismissed",
+        "not-a-conflict": "dismissed",
+        "superseded": "superseded",
+    }
+
+    def resolve_conflict(self, from_id, to_id, resolution="dismissed", note=None):
+        """Close a contradiction as reviewed, keeping link and memories.
+
+        Nothing is deleted: the pair stays linked, both memories stay
+        readable, and the outcome is recorded on the link so the review queue
+        stops asking the same question every session -- while the history of
+        having flagged it (and of what was decided) survives for audit.
+        """
+        status = self._CONFLICT_RESOLUTIONS.get(str(resolution or "").strip().lower())
+        if not status:
+            return {
+                "error": (
+                    f"Invalid resolution '{resolution}'. Valid: "
+                    + ", ".join(sorted(set(self._CONFLICT_RESOLUTIONS)))
+                )
+            }
+        row = self._execute(
+            "SELECT relation FROM memory_links WHERE from_id = ? AND to_id = ? "
+            "AND relation = 'contradicts'",
+            (from_id, to_id),
+        ).fetchone()
+        if not row:
+            return {"error": f"No contradiction link {from_id} -> {to_id}"}
+
+        ts = _now()
+        self._execute(
+            "UPDATE memory_links SET resolution = ?, resolved_at = ?, resolution_note = ? "
+            "WHERE from_id = ? AND to_id = ? AND relation = 'contradicts'",
+            (status, ts, note, from_id, to_id),
+        )
+        self.db.commit()
+        return {
+            "success": True,
+            "from_id": from_id,
+            "to_id": to_id,
+            "resolution": status,
+            "resolved_at": ts,
+            "note": note,
+        }
+
+    def reopen_conflict(self, from_id, to_id):
+        """Put a closed contradiction back in the review queue."""
+        row = self._execute(
+            "SELECT resolution FROM memory_links WHERE from_id = ? AND to_id = ? "
+            "AND relation = 'contradicts'",
+            (from_id, to_id),
+        ).fetchone()
+        if not row:
+            return {"error": f"No contradiction link {from_id} -> {to_id}"}
+        self._execute(
+            "UPDATE memory_links SET resolution = NULL, resolved_at = NULL, "
+            "resolution_note = NULL WHERE from_id = ? AND to_id = ? "
+            "AND relation = 'contradicts'",
+            (from_id, to_id),
+        )
+        self.db.commit()
+        return {"success": True, "from_id": from_id, "to_id": to_id, "resolution": None}
+
+    def get_conflicts(self, project=None, include_resolved=False):
+        """List contradiction links.
+
+        Open (unreviewed) conflicts only by default: the point of the review
+        state is that a resolved pair stops being reported as an outstanding
+        problem.  `include_resolved=True` returns the full history.
+        """
         query = """
             SELECT ml.from_id, m1.content AS from_content,
                    ml.to_id, m2.content AS to_content,
-                   ml.relation, ml.created_at
+                   ml.relation, ml.created_at,
+                   ml.resolution, ml.resolved_at, ml.resolution_note
             FROM memory_links ml
             JOIN memories m1 ON m1.id = ml.from_id
             JOIN memories m2 ON m2.id = ml.to_id
             WHERE ml.relation = 'contradicts'
         """
         params = []
+        if not include_resolved:
+            query += " AND ml.resolution IS NULL"
         if project:
             query += " AND (m1.project = ? OR m2.project = ?)"
             params.extend([project, project])
@@ -1557,6 +2134,11 @@ class RekalEngine:
                 "related_content": row["to_content"],
                 "relation": row["relation"],
                 "created_at": row["created_at"],
+                "resolution": row["resolution"] if "resolution" in row.keys() else None,
+                "resolved_at": row["resolved_at"] if "resolved_at" in row.keys() else None,
+                "resolution_note": (
+                    row["resolution_note"] if "resolution_note" in row.keys() else None
+                ),
             })
         return results
 
@@ -1575,6 +2157,10 @@ class RekalEngine:
         total_links = _count("SELECT COUNT(*) FROM memory_links")
         total_conflicts = _count(
             "SELECT COUNT(*) FROM memory_links WHERE relation = 'contradicts'"
+        )
+        open_conflicts = _count(
+            "SELECT COUNT(*) FROM memory_links WHERE relation = 'contradicts' "
+            "AND resolution IS NULL"
         )
         total_superseded = _count(
             "SELECT COUNT(*) FROM memory_links WHERE relation = 'supersedes'"
@@ -1608,9 +2194,12 @@ class RekalEngine:
             "total_memories": total,
             "total_links": total_links,
             "total_conflicts": total_conflicts,
+            "open_conflicts": open_conflicts,
             "total_superseded": total_superseded,
             "active_memories": total - total_superseded,
             "duplicate_content_groups": total_duplicates,
+            "entities": _count("SELECT COUNT(*) FROM entities"),
+            "entity_edges": _count("SELECT COUNT(*) FROM memory_entities"),
             "oldest_memory": oldest,
             "newest_memory": newest,
             "memories_by_type": by_type,
@@ -1729,7 +2318,8 @@ class RekalEngine:
     # ── Multi-hop Graph Traversal ─────────────────────────────────────
 
     def multi_hop(self, start_entity, target_entity=None, max_hops=3):
-        if not self.kg:
+        graph = self._graph()
+        if graph is None:
             return {"error": "Knowledge graph not available", "paths": []}
 
         max_hops = max(1, min(max_hops, 6))
@@ -1746,7 +2336,7 @@ class RekalEngine:
                 continue
 
             try:
-                facts = self.kg.query_entity(current, direction="both")
+                facts = graph.query_entity(current, direction="both")
             except Exception:
                 continue
 
@@ -1813,7 +2403,8 @@ class RekalEngine:
             }
 
         contradictions = []
-        if self.kg:
+        graph = self._graph()
+        if graph is not None:
             stmt_lower = statement.lower()
             is_negated = any(
                 neg in stmt_lower
@@ -1823,7 +2414,7 @@ class RekalEngine:
             )
             for ent in entities[:10]:
                 try:
-                    facts = self.kg.query_entity(ent, direction="both")
+                    facts = graph.query_entity(ent, direction="both")
                 except Exception:
                     continue
                 for fact in facts:
@@ -1864,11 +2455,12 @@ class RekalEngine:
         supporting = []
         confidence = 0.0
 
-        if self.kg:
+        graph = self._graph()
+        if graph is not None:
             claim_lower = claim.lower()
             for ent in entities[:10]:
                 try:
-                    facts = self.kg.query_entity(ent, direction="both")
+                    facts = graph.query_entity(ent, direction="both")
                 except Exception:
                     continue
                 for fact in facts:

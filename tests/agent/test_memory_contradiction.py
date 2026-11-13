@@ -4,7 +4,11 @@ Pure-function tests: no database, no network, no embedding backend.  Ported
 from the upstream ``tests/plugins/memory/test_rekal_hindsight.py`` checks.
 """
 
-from agent.memory.contradiction import detect_contradiction
+from agent.memory.contradiction import (
+    CONTRADICTION_MAX_CHARS,
+    classify_pair,
+    detect_contradiction,
+)
 
 
 def test_contradiction():
@@ -46,3 +50,155 @@ def test_contradiction():
         "Feature flags are disabled in production",
     )
     assert conf <= 0.95
+
+
+def test_long_documents_are_never_paired():
+    """A prompt dump or inventory shares vocabulary with unrelated notes.
+
+    Pairing multi-KB documents on trigram similarity plus a negation word is how
+    the store accumulated `contradicts` links that were pure noise, so anything
+    above the atomic-statement threshold is refused outright.
+    """
+    shared = "gateway session transport websocket layer design pattern "
+    long_note = (shared * 60) + "this is not the real fix"
+    assert len(long_note) > CONTRADICTION_MAX_CHARS
+    hit, conf = detect_contradiction(long_note, shared * 60)
+    assert not hit
+    assert conf == 0.0
+
+
+def test_short_statements_still_pair():
+    """The length gate must not blunt detection at atomic sizes."""
+    hit, _ = detect_contradiction(
+        "Caching is disabled for the session store",
+        "Caching is enabled for the session store",
+    )
+    assert hit
+
+
+def test_revision_with_changed_details_is_not_a_contradiction():
+    """Two status reports differing only in a timestamp are a revision.
+
+    This is the live false positive that motivated sentence localisation: the
+    original detector measured negation across the whole document, so a "can't"
+    in an unrelated sentence plus a shared vocabulary was enough to pair them.
+    """
+    earlier = (
+        "Re-armed. Fires 19:04 - now 19:02:42, so ~75 seconds. "
+        "Entry: 04 19 27 10 * script (line 57, pinned to today). "
+        "Backup: crontab.bak.20261027-190242. "
+        "The script removes its own line first so a failed restart can't loop. "
+        "Expect this chat to go quiet for about ten seconds while the unit cycles."
+    )
+    later = (
+        "Armed. Fires 20:45 - now 20:43:48, so ~70 seconds. "
+        "Entry: 45 20 27 10 * script (line 59, pinned to today). "
+        "Backup: crontab.bak.20261027-204348. "
+        "The script removes its own line first so a failed restart cannot loop. "
+        "Expect this chat to go quiet for about ten seconds while the unit cycles."
+    )
+    hit, conf = detect_contradiction(later, earlier)
+    assert not hit, conf
+
+
+def test_negation_must_sit_on_the_differing_claim():
+    """A negation elsewhere in the text is not evidence about this claim."""
+    a = (
+        "The routing hotfix is committed at fac3b310c and the tree is clean. "
+        "The push is still blocked, so I can't finish it from here. "
+        "Both commits are ready at the tip of master."
+    )
+    b = (
+        "The routing hotfix is committed at 996ed2a36 and the tree is clean. "
+        "The push is still blocked, so I can't finish it from here. "
+        "Both commits are ready at the tip of master."
+    )
+    hit, conf = detect_contradiction(a, b)
+    assert not hit, conf
+
+
+def test_negation_inside_the_differing_claim_is_still_caught():
+    """Localisation must not cost the real signal."""
+    hit, _ = detect_contradiction(
+        "The gateway restarts cleanly after the drain completes",
+        "The gateway does not restart cleanly after the drain completes",
+    )
+    assert hit
+
+    hit, _ = detect_contradiction(
+        "Session caching is enabled for the store",
+        "Session caching is disabled for the store",
+    )
+    assert hit
+
+
+def test_intensifiers_do_not_hide_a_contradiction():
+    """Recall recovery: added hedge words must not defeat detection."""
+    hit, conf = detect_contradiction(
+        "Caching is not enabled at all for the session store",
+        "Caching is enabled for the session store",
+    )
+    assert hit, conf
+
+    hit, conf = detect_contradiction(
+        "The gateway isn't enabled in production",
+        "The gateway is enabled in production",
+    )
+    assert hit, conf
+
+
+def test_a_changed_noun_is_still_not_a_contradiction():
+    """Precision guard: a filler allowance must not become a noun allowance."""
+    hit, conf = detect_contradiction(
+        "Caching is not enabled for the session store",
+        "Caching is not enabled for the analytics pipeline",
+    )
+    assert not hit, conf
+
+
+def test_state_lexicon_catches_off_versus_on():
+    """Adjective choice must not hide a flipped state."""
+    hit, conf = detect_contradiction("The cache is on for the session store",
+                                     "The cache is off for the session store")
+    assert hit, conf
+
+    hit, conf = detect_contradiction("The worker is inactive after the deploy",
+                                     "The worker is active after the deploy")
+    assert hit, conf
+
+
+def test_stemming_unifies_inflection_without_inventing_conflicts():
+    """caching/cache/caches are one word; agreement is not disagreement."""
+    verdict, _ = classify_pair("Caching is off for the session store",
+                               "The cache is disabled for the session store")
+    assert verdict == "unrelated", verdict
+
+    hit, _ = detect_contradiction("Caching is off for the session store",
+                                  "Caching is on for the session store")
+    assert hit
+
+
+def test_unprovable_paraphrase_becomes_a_candidate_not_a_link():
+    """The class lexical rules cannot prove is queued, never guessed or dropped."""
+    verdict, conf = classify_pair(
+        "Caching is off for the session store",
+        "The session store caches every request",
+    )
+    assert verdict == "candidate", verdict
+    assert 0.3 <= conf <= 0.6
+
+    # A candidate is not a contradiction: the boolean wrapper stays honest.
+    hit, _ = detect_contradiction(
+        "Caching is off for the session store",
+        "The session store caches every request",
+    )
+    assert hit is False
+
+
+def test_candidate_queue_ignores_the_timestamp_revision():
+    """The review queue must not fill with the noise we just eliminated."""
+    verdict, _ = classify_pair(
+        "Armed. Fires 20:45, entry 45 20 27 10, backup taken.",
+        "Re-armed. Fires 19:04, entry 04 19 27 10, backup taken.",
+    )
+    assert verdict == "unrelated", verdict

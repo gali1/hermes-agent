@@ -1110,6 +1110,14 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+    # Opt-in dynamic model selection (smart_model_routing.enabled). Runs once per turn, before
+    # any request is assembled, so a switch can never land mid-stream. Returns immediately
+    # when the setting is absent or false — the disabled path touches nothing.
+    try:
+        from agent.model_routing import maybe_apply_model_routing
+        maybe_apply_model_routing(agent, original_user_message)
+    except Exception:  # pragma: no cover - routing must never break a turn
+        logger.debug("model routing hook failed", exc_info=True)
     should_review_memory = _tick_memory_nudge(agent)
     _emit_reaction(agent, original_user_message)
 

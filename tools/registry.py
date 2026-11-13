@@ -438,6 +438,9 @@ class ToolRegistry:
         self._plugin_module_scopes: Dict[str, Set[Optional[str]]] = {}
         self._toolset_checks: Dict[str, Callable] = {}
         self._toolset_aliases: Dict[str, str] = {}
+        # Toolsets declared ambient by the plugin that owns them (see mark_ambient).
+        # Read by model_tools._select_tool_names; never populated from config.
+        self._ambient_toolsets: Set[str] = set()
         # MCP refresh mutates while other threads read: serialize writes, snapshot reads.
         self._lock = threading.RLock()
         # Bumped on every mutation; get_tool_definitions memoizes against it.
@@ -522,6 +525,49 @@ class ToolRegistry:
 
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
         return sorted(e.name for e in self._grouped(self._snapshot_entries()).get(toolset, []))
+
+    def mark_ambient(self, toolset: str) -> None:
+        """Declare *toolset* ambient: its tools join every toolset-restricted session.
+
+        "Ambient" means *reachable regardless of a session's ``enabled_toolsets``*.
+        A plugin marks a toolset here when it produces state in every session and
+        must be able to redeem that state in every session too — toolaria's rescue
+        hook rewrites oversized tool results ungated, so its ``rescuer_fetch`` must
+        not vanish from a cron/delegate session that scoped itself to a few toolsets.
+
+        This is NOT a config surface, by design. Nothing reads config.yaml into this
+        set: ambient membership only ever comes from an explicit in-process call by
+        the plugin that registered the tools. A cron job, delegate child or profile
+        therefore cannot widen its own toolset restriction by naming a toolset in
+        config — it can only use a capability a plugin already declared for everyone.
+        Ambient is additive and applied *before* ``disabled_toolsets`` is subtracted
+        in :func:`model_tools._select_tool_names`, so an operator's explicit disable
+        still wins, and per-tool ``check_fn``/permission gates are unaffected.
+
+        Idempotent. Unknown names are accepted because registration order is not
+        guaranteed; the name resolves to its tools lazily at selection time.
+        """
+        if not isinstance(toolset, str) or not toolset.strip():
+            raise ValueError("mark_ambient: toolset must be a non-empty string")
+        name = toolset.strip()
+        if name in {"all", "*"}:
+            raise ValueError("mark_ambient: wildcard scopes are not ambient; mark one toolset at a time")
+        with self._lock:
+            if name in self._ambient_toolsets:
+                return
+            self._ambient_toolsets.add(name)
+            # Bumped so a memoized get_tool_definitions() re-keys on the new membership.
+            self._generation += 1
+            logger.info("Toolset '%s' registered as ambient; its tools join every session", name)
+
+    def ambient_toolsets(self) -> Set[str]:
+        """Copy of the ambient toolset names (see :meth:`mark_ambient`)."""
+        with self._lock:
+            return set(self._ambient_toolsets)
+
+    def is_ambient_toolset(self, toolset: str) -> bool:
+        with self._lock:
+            return toolset in self._ambient_toolsets
 
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
         """Register an explicit alias for a canonical toolset name."""

@@ -422,6 +422,22 @@ def _scaffold_header(
 
 _SCAN_SKIP_PARTS = {'.git', '.github', '.hub', '.archive', '.locks'}
 
+# Frontmatter ``slash_command:`` opt-out values: a skill may decline its auto-generated slash
+# command (kept loadable via ``/skill <name>``) when its natural name belongs to a core command.
+_SLASH_COMMAND_OFF = frozenset({"false", "no", "off", "none", "0", "disabled"})
+
+
+def declines_slash_command(frontmatter: Dict[str, Any]) -> bool:
+    """True when ``frontmatter`` declares ``slash_command: false`` (or an off-alias).
+
+    Lets a skill such as ``plan`` — whose name is a core Hermes command — ship without a collision
+    warning on every scan, while staying addressable as ``/skill plan``.
+    """
+    value = frontmatter.get("slash_command")
+    if isinstance(value, bool):
+        return not value
+    return isinstance(value, str) and value.strip().lower() in _SLASH_COMMAND_OFF
+
 
 def skill_command_collision_note(name: str) -> Optional[str]:
     """User-facing note when *name*'s slash slug is a core command (name or alias), else None.
@@ -457,6 +473,10 @@ def _scan_skill_md(skill_md: Path, disabled: set, seen_names: set, commands: Dic
     seen_names.add(name)
     cmd_name = slugify_skill_name(name)
     if not cmd_name:
+        return
+    # Declared opt-out: no auto-registration (and no collision warning) — the skill stays
+    # reachable as /skill <name>.
+    if declines_slash_command(frontmatter):
         return
     # A collision with a core command (name or alias) skips auto-registration; the skill stays
     # loadable via /skill <name>. The same predicate feeds the /skills + palette notes.

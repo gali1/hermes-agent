@@ -19,6 +19,7 @@ from agent.memory.contradiction import (
     CONTRADICTION_MIN_SIMILARITY,
     NEGATION_MARKERS,
     POLARITY_PAIRS,
+    classify_pair,
     detect_contradiction,
 )
 from agent.memory.context import format_recall_block, select_with_budget
@@ -44,7 +45,9 @@ from agent.memory.mining import (
     SECRET_PATTERNS,
     TRANSIENT_MARKERS,
     classify_candidate,
+    is_request,
     is_secret,
+    looks_like_fallback,
     mine_turns,
     strip_private,
 )
@@ -93,6 +96,7 @@ from agent.memory.temporal import (
 __all__ = [
     "BOOST_LEVELS",
     "CONTRADICTION_MAX_SIMILARITY",
+    "classify_pair",
     "CONTRADICTION_MIN_SIMILARITY",
     "DEFAULT_RRF_K",
     "LEXICAL_ANCHOR_MIN_FTS",
@@ -142,7 +146,9 @@ __all__ = [
     "format_recall_block",
     "is_degenerate",
     "is_duplicate",
+    "is_request",
     "is_secret",
+    "looks_like_fallback",
     "link_activation",
     "mine_turns",
     "normalize_content",

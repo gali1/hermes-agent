@@ -764,3 +764,53 @@ def _record_setup_completed(config: dict) -> None:
     from hermes_cli.observability.shared_metrics_events import record_setup_completed
     model = config.get("model")
     record_setup_completed(surface="cli", provider=model.get("provider") if isinstance(model, dict) else None)
+
+
+def prompt_multi_choice(question: str, choices: list, preselected=(), description: str | None = None):
+    """Prompt for several choices from a list.
+
+    Mirrors :func:`prompt_choice`'s contract (empty input keeps the current selection, cancel
+    applies nothing) but accepts a set. Returns a sorted list of indices, or ``None`` when the
+    caller cancelled. Non-interactive callers get the preselection back unchanged, matching
+    ``prompt_yes_no``'s behaviour so a spawned dashboard action never blocks on stdin.
+    """
+    preselected_idx = sorted({i for i in (preselected or ()) if 0 <= i < len(choices)})
+    if is_noninteractive() or not choices:
+        return preselected_idx
+    if description:
+        _info(f"  {description}", None)
+    for i, choice in enumerate(choices):
+        mark = "x" if i in preselected_idx else " "
+        print(f"  [{mark}] {i + 1}. {choice}")
+    print(color("  Enter numbers separated by commas, 'all', 'none', or press Enter to keep.",
+                Colors.DIM))
+    while True:
+        try:
+            raw = input(color(f"{question}: ", Colors.YELLOW)).strip().lower()
+        except KeyboardInterrupt:
+            print()
+            return None
+        except EOFError:
+            print()
+            return preselected_idx
+        if not raw:
+            return preselected_idx
+        if raw in ("cancel", "c", "q", "quit"):
+            return None
+        if raw == "all":
+            return list(range(len(choices)))
+        if raw == "none":
+            return []
+        picked, bad = set(), []
+        for token in raw.replace(" ", ",").split(","):
+            if not token:
+                continue
+            if not token.isdigit() or not 1 <= int(token) <= len(choices):
+                bad.append(token)
+                continue
+            picked.add(int(token) - 1)
+        if bad:
+            print(color(f"  Not a valid choice: {', '.join(bad)} (expected 1-{len(choices)})",
+                        Colors.RED))
+            continue
+        return sorted(picked)

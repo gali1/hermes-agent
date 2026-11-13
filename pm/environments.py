@@ -455,6 +455,23 @@ def activate_dependencies(project_root: Path) -> None:
             return  # External/Nix interpreter owns its original sys.path.
     if not selected.is_dir():
         raise RuntimeError(f"dependency environment has no site-packages: {selected}")
+    # A generation built for another Python cannot be imported from this one: its compiled
+    # extensions are ABI-bound, so activating the tree puts an unimportable site-packages at
+    # the front of sys.path and every third-party import dies at boot — the observed failure
+    # is ``No module named 'pydantic_core._pydantic_core'`` when a cp314 generation is
+    # activated into a 3.12 interpreter. Keep the packages this interpreter booted with.
+    built = venv_python_version(environment)
+    running = (sys.version_info.major, sys.version_info.minor)
+    if built is not None and built != running:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "dependency environment %s was built for Python %d.%d but this process runs "
+            "%d.%d; keeping this interpreter's own packages instead of activating an "
+            "ABI-incompatible dependency tree",
+            environment, built[0], built[1], running[0], running[1],
+        )
+        return
     import site
 
     sys.path[:] = [entry for entry in sys.path

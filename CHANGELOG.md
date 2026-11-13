@@ -4,6 +4,68 @@ All notable changes to this project are documented here. Entries follow
 GitHub release-note style: feature, change, test, documentation and
 installation categories with a compare link per release.
 
+## 2026-11-12 — Two runtime warnings fixed at their cause: the teardown-race RPC rejection and the 12.1s dashboard loop stall
+
+Both warnings were false alarms *about* a real event, so neither is silenced:
+each is now reported truthfully, and the stall's cause is fixed.
+
+### 🐛 Fixed
+
+- **`session-scoped RPC rejected … client should resume the stored session`**
+  (`tui_gateway/server.py`, `tui_gateway/session_lifecycle.py`). The one
+  occurrence on this host (`16:48:24,928`, `method=process.list`,
+  `session_id='37e80163'`) was not a stuck client: the same client's
+  `session.new` closed that runtime 91ms earlier (`agent_close` at
+  `16:48:24,837`) and built `20261112_164824_32bca3` at `16:48:25,160`. The
+  desktop status stack polls `process.list` every 5s while a background row is
+  on screen, so the poll was simply in flight across its own teardown, and the
+  client's 4001 latch moved it on. The teardown claim now records the runtime
+  ids it reaps (bounded, 10s — over two poll intervals), and `_sess_nowait`
+  answers such a poll at INFO ("raced its own teardown") instead of WARNING.
+  The 4001 code and the actionable warning are unchanged for a runtime the
+  gateway does *not* remember reaping — that one really is a client parked on a
+  dead id.
+- **`event loop stalled 12.1s (GIL pressure suspected)`**
+  (`hermes_cli/web_server_dashboard.py`). Cause found and measured: memory-wiki's
+  `GET /api/plugins/memory-wiki/overview` is `async def` but never awaits, so
+  `build_memory_overview()` ran **on** the dashboard event loop — a full scan of
+  a 348MB `state.db` (measured 10.657s for `subject_limit=50, day_limit=30`;
+  5.809s for `/subjects`), with the time inside
+  `_extract_from_text` → `_TITLE_CASE_PHRASE_RE.findall` over every message.
+  The plugin mount point now re-registers plugin API routes that are coroutine
+  functions containing no await / async-for / async-with opcode as plain `def`
+  handlers, so Starlette runs them in its threadpool. A handler that really
+  awaits, or that takes a loop-owned `Request`/`Response`/`BackgroundTasks`,
+  is left exactly as it was. Applies to every plugin API route, so the same
+  shape in tool-slimmer's `async def` handlers is covered too.
+
+### 🔍 Diagnostics
+
+- The loop heartbeat (`hermes_cli/web_server.py`) now samples the loop thread's
+  stack from a daemon watcher while the loop is still stuck, and prints it in
+  the stall warning. Previously the drift was reported after the loop resumed,
+  when the blocking frame was gone, so the log could only say "GIL pressure
+  suspected". The captured stack is what identified memory-wiki.
+
+### 🧪 Tests
+
+- `tests/tui_gateway/test_reaped_runtime_rpc_race.py`: teardown race stays
+  quiet and still answers 4001, an unknown id still warns with the actionable
+  text, an expired reap entry warns again, and the reap map stays bounded.
+- `tests/hermes_cli/test_plugin_api_loop_offload.py`: the detector
+  (await / async-with / async-for / plain `def` / `Request`-taking are all
+  left alone), plus a control that measures the stall before the rewrite and
+  its absence after, on the same handler.
+
+### ✅ Verified on DESKTOP-DEV (Windows, dashboard :9119)
+
+- Repro of the real handler under uvicorn with the dashboard's own heartbeat:
+  as-mounted → request 11.2s, loop ticked 1×, `event loop stalled 10.3s` with
+  the blocking stack named; offload applied → same 11.5s handler, loop ticked
+  6×, **no stall warning**.
+- Deployed gateway code re-checked in-process: teardown race → 4001, no
+  WARNING, INFO line present; unknown id → WARNING preserved.
+
 ## 2026-10-15 — Rebased onto `main`: upstream catch-up, content compression, messaging restore (`2026-10-05-fastembed`)
 
 The branch is rebased onto `main` (`c060d225`) so it carries the full upstream

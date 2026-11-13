@@ -62,6 +62,8 @@
   "/memory-graph": null,
   "/moa": null,
   "/model": "hidden",
+  "/model-routing": "hidden",
+  "/model_routing": "hidden",
   "/new": null,
   "/palette": null,
   "/paste": "terminal",

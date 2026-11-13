@@ -100,6 +100,14 @@ export function usePlugins() {
     const injectedScripts: HTMLScriptElement[] = [];
 
     for (const manifest of manifests) {
+      // API-only plugin: a dashboard manifest with no UI bundle on disk. There is
+      // nothing to inject, and attempting it produced a 404 on a path that never
+      // existed plus a page-level "Could not load this plugin's script" error.
+      if (manifest.has_ui === false) {
+        setPluginLoadError(manifest.name, "NO_UI");
+        continue;
+      }
+
       // Inject CSS if specified.
       if (manifest.css) {
         const cssUrl = `${HERMES_BASE_PATH}/dashboard-plugins/${manifest.name}/${manifest.css}`;

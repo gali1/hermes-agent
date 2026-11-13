@@ -323,6 +323,13 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
                 and _is_dispatcher_owned_worker() and "kanban" not in enabled):
             enabled.append("kanban")
         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
+        # Ambient toolsets (explicit plugin registration only — see
+        # ToolRegistry.mark_ambient) must survive a session's restriction: a plugin
+        # that rewrites tool results in EVERY session cannot have its redemption
+        # tool filtered out of cron/delegate sessions. Unioned BEFORE the disabled
+        # subtraction below, so an operator's disabled_toolsets still wins.
+        for ambient in sorted(registry.ambient_toolsets()):
+            tools.update(resolve_toolset(ambient))
     else:
         from toolsets import TOOLSET_SESSION_PLATFORMS, get_all_toolsets
         for ts_name in get_all_toolsets():
@@ -723,7 +730,8 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
         current_defs = []
     args = function_args or {}
     if function_name == ts.TOOL_SEARCH_NAME:
-        return ts.dispatch_tool_search(args, current_tool_defs=current_defs), None
+        return ts.dispatch_tool_search(
+            args, current_tool_defs=current_defs, llm_select=ts.build_llm_selector()), None
     if function_name == ts.TOOL_DESCRIBE_NAME:
         return ts.dispatch_tool_describe(args, current_tool_defs=current_defs), None
     underlying_name, underlying_args, err = ts.resolve_underlying_call(args)

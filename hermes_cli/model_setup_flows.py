@@ -1000,6 +1000,47 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
         except Exception as exc:  # pragma: no cover - setup must never die here
             print(f"  Smart model routing step skipped: {exc}")
 
+    # Routing is offered only for OpenCode and only after its model is chosen; the default
+    # answer keeps whatever is already configured, so a re-run never resets it.
+    if is_opencode:
+        _prompt_routing_after_model(provider_id)
+
+
+def _prompt_routing_after_model(provider_id: str) -> None:
+    """Offer smart-model-routing setup after the OpenCode model step.
+
+    Never runs without a human: CI, the dashboard's spawned actions and piped stdin all skip it,
+    leaving behaviour exactly as it was. Choosing "keep" writes nothing.
+    """
+    try:
+        import sys
+
+        from hermes_cli.setup import is_noninteractive, prompt_choice
+
+        # No human, no prompt: CI, piped stdin and the dashboard's spawned actions all skip.
+        if is_noninteractive() or not sys.stdin.isatty():
+            return
+        from hermes_cli.config import get_config_path, read_user_config_raw
+
+        try:
+            block = (read_user_config_raw(get_config_path()) or {}).get("smart_model_routing")
+        except Exception:
+            block = None
+        existing = isinstance(block, dict) and bool(block)
+        label = ("Smart model routing is configured — change it?" if existing
+                 else "Smart model routing (optional) — route across models per request?")
+        choice = prompt_choice(label, ["Keep current setting", "Configure routing"], default=0)
+        if choice != 1:
+            return
+        from hermes_cli.subcommands.model import _routing_interactive
+
+        _routing_interactive()
+    except Exception:
+        # Setup must never fail because of the optional routing step.
+        import logging
+
+        logging.getLogger(__name__).debug("routing prompt skipped", exc_info=True)
+
 
 def _anthropic_authenticate() -> bool:
     """Interactive Anthropic auth (OAuth subscription or API key). False = flow must stop."""

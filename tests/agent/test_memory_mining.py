@@ -1,11 +1,13 @@
 """Unit tests for turn mining, secret rejection, and classification."""
 
 from agent.memory.mining import (
+    MAX_CANDIDATE_CHARS,
     PRIVATE_BLOCK_RE,
     SECRET_PATTERNS,
     TRANSIENT_MARKERS,
     classify_candidate,
     is_secret,
+    looks_injected,
     mine_turns,
     strip_private,
 )
@@ -110,3 +112,32 @@ def test_mine_turns_limits_and_empty():
     assert mine_turns([], limit=3) == []
     assert mine_turns(None) == []
     assert mine_turns(messages, limit=0) == []
+
+
+def test_secret_detection_covers_prefixed_provider_keys():
+    # Synthetic values shaped like the real families; never paste live keys here.
+    assert is_secret("use oc_sk_000000000000_aaaaaaaaaaaa_BBBBBBBBBBBBBBBB")
+    assert is_secret("sk-proj-000000000000000000000000000000000000")
+    assert is_secret("sk-ant-api03-0000000000000000000000000000000000")
+    assert is_secret("sk_live_0000000000000000")
+    assert is_secret("AKIAIOSFODNN7EXAMPLE")
+    assert is_secret("glpat-00000000000000000000")
+    assert is_secret("xoxb-0000000000-000000000000")
+    # A real leak arrived in prose, not as an assignment.
+    assert is_secret("update the opencode key with 'oc_sk_000000000000_aaaaaaaaaaaa_BBBBBBBBBBBBBBBB'")
+    assert not is_secret("the quick brown fox jumps over the lazy dog")
+
+
+def test_looks_injected_rejects_prompt_text():
+    assert looks_injected("[IMPORTANT: You are running as a scheduled cron job. DELIVERY: ...]")
+    assert looks_injected("You are The Boss, chief of staff for Agent Labs. You coordinate the work.")
+    assert looks_injected("Paperclip Agent Integration: Consolidated Prompt Location of projects")
+    assert looks_injected("stale </memory-context> tail")
+    assert not looks_injected("The gateway owns the websocket transport layer")
+
+
+def test_classify_candidate_rejects_injected_and_oversized():
+    assert classify_candidate("[IMPORTANT: You are running as a scheduled cron job. DELIVERY: ...]") is None
+    assert classify_candidate("The design uses " + "x" * (MAX_CANDIDATE_CHARS + 1)) is None
+    # A long-but-real note still classifies.
+    assert classify_candidate("The design uses " + "x" * (MAX_CANDIDATE_CHARS - 40)) is not None

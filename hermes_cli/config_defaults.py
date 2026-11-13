@@ -1368,6 +1368,15 @@ DEFAULT_CONFIG = {
             "auto_capture": True,
             "max_recall": 6,
             "recall_budget_chars": 2400,
+            # Relevance floor for injected recall (0.0 = keep every hit).  RRF
+            # scores are scale-free (~0.003 filler, ~0.02 strong hits), so this
+            # only makes sense after calibrating on the local store; see
+            # `topical_only` for the scale-free gate that is on by default.
+            "min_score": 0.0,
+            # Inject only memories that matched through FTS, the vector arm, or
+            # graph expansion.  Without it, recency/access boosts let an
+            # unrelated row outrank every real match and pad the block.
+            "topical_only": True,
             # Optional dense-retrieval arm beside FTS5 (`-fastembed` branch).
             # `none` keeps retrieval purely lexical; `fastembed` uses a local
             # ONNX model (no PyTorch, no network at query time); `remote` posts
@@ -1382,6 +1391,46 @@ DEFAULT_CONFIG = {
                 "api_key_env": "OPENAI_API_KEY",
                 "model": "text-embedding-3-small",
                 "timeout": 30,
+            },
+            # Junk purge: re-run the capture filters over what is already
+            # stored and archive the rows they would now refuse (requests,
+            # assistant status lines, degenerate text). Capture-side filtering
+            # only protects new turns; an already-stored request keeps matching
+            # every query through FTS prefix expansion. Pure Python, no model
+            # call, archiving with a cold export first.
+            "junk_purge_enabled": True,
+            "junk_purge_limit": 500,
+            # Retention: archive (never delete) memories that are low-value and
+            # unused.  Nothing is destroyed — an archived row keeps its content
+            # and returns with status='active' — so this bounds growth without
+            # bounding what the store can still answer.
+            "retention_enabled": True,
+            "retention_days": 45,
+            "retention_min_importance": 0.5,
+            "retention_max_access": 1,
+            "retention_interval_hours": 24,
+            # Assistant narration is the bulk of the growth and the least likely
+            # to be wanted later, so never-used narration retires on a shorter
+            # fuse than user-stated facts. 0 disables the second window.
+            "retention_narration_days": 14,
+            # Hard ceiling on active rows. Age windows alone cannot bound
+            # growth for a store that captures every turn.
+            "retention_max_active": 500,
+            # Retention archives; it never leaves the file. Snapshot the file
+            # itself so a corrupt database or a lost disk is survivable.
+            "backup_enabled": True,
+            "backup_keep": 7,
+            "backup_interval_hours": 24,
+            # Capture gate: what auto-capture is allowed to store. Regex only,
+            # no model calls. Held-back rows are quarantined (never recalled,
+            # restorable via the memory tool's 'restore'), not deleted.
+            "capture": {
+                "quarantine": True,            # keep tool dumps/echoes/oversized blobs out of recall, recoverably
+                "assistant": "filtered",       # filtered | off  (off = mine user turns only)
+                "drop_patterns": [],           # extra regexes to reject (case-insensitive)
+                "keep_patterns": [],           # regexes that always pass heuristic filters (never secrets)
+                "audit_interval_hours": 168,   # background re-check of stored rows; 0 disables
+                "recall_guard": True,          # hide legacy junk from recall before the audit reaches it
             },
         },
     },

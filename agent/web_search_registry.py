@@ -81,6 +81,26 @@ _KEYLESS_PREFERENCE = ("exa", "parallel", "firecrawl", "keenable")
 _FALLBACK_PREFERENCE = ("google-cse",)
 
 
+def _lookup(snapshot: dict, name: Optional[str]) -> Optional[WebSearchProvider]:
+    """Look *name* up in *snapshot*, tolerating the hyphen/underscore spelling gap.
+
+    A bundled provider's registered name and its plugin key differ only by separator
+    (``google-cse`` vs ``google_cse``), so a selection written with either spelling keeps
+    resolving instead of silently dropping to autodetect. Same normalization rule as
+    :func:`_disabled_web_plugin_for`, which has to match plugin keys the same way.
+    """
+    if not name:
+        return None
+    provider = snapshot.get(name)
+    if provider is not None:
+        return provider
+    for alt in (name.replace("-", "_"), name.replace("_", "-")):
+        provider = snapshot.get(alt)
+        if provider is not None:
+            return provider
+    return None
+
+
 def _keyless_preference() -> tuple:
     """Keyless walk order, starting at the ring cursor in
     :mod:`plugins.web.keyless_mcp` so resolution and dispatch agree on which
@@ -128,7 +148,7 @@ def _resolve(configured: Optional[str], *, capability: str) -> Optional[WebSearc
         return is_available_safe(p, logger, "provider %s.is_available() raised %s")
 
     if configured:
-        provider = snapshot.get(configured)
+        provider = _lookup(snapshot, configured)
         if provider is not None and _capable(provider):
             _log_resolution(capability, provider, "explicit config")
             return provider

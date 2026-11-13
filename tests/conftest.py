@@ -429,6 +429,27 @@ def _reset_foreground_exit_fence():
 
 
 @pytest.fixture(autouse=True)
+def _reset_write_origin():
+    """Hold the write-origin ContextVar at "foreground" between tests.
+
+    ``turn_context`` calls ``set_current_write_origin(...)`` and discards the token it
+    returns; ``reset_current_write_origin`` exists but is never called. The origin is a
+    ContextVar, so production is unaffected — every turn re-binds it before any memory
+    write. In one pytest process it is *not* isolated: a test that runs a review fork
+    in-process (``test_compression_concurrent_fork``) leaves the value at
+    "background_review", and every later test then looks unattended. The memory tool's
+    background-delete gate consequently *stages* ``replace``/``remove`` instead of
+    applying them, which surfaces as unrelated "success but file unchanged" failures and
+    masks real ones.
+    """
+    from tools.skill_provenance import set_current_write_origin
+
+    set_current_write_origin("foreground")
+    yield
+    set_current_write_origin("foreground")
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_kanban_memory_guard(request, monkeypatch):
     """Pin the kanban dispatcher's memory guard to "no data" for every test.
 

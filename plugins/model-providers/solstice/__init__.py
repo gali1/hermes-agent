@@ -16,7 +16,11 @@ from providers import register_provider
 from providers.base import ProviderProfile
 
 from .auth import broker_token_request, discover_client
-from .transport import INFERENCE_BASE_URL, SolsticeClient
+
+# ``httpx``-free on purpose: registration must not import the native adapter (which pulls ``httpx``),
+# because discovery also runs where the dependency environment is not selected yet. The client is
+# imported lazily in ``create_client`` below, where the runtime dependencies are active.
+from .constants import INFERENCE_BASE_URL
 
 # Verified on the per-user-quota endpoint, which has no model listing a user token may read (its
 # /models answers 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT). Quota is per model, so lite stays last as the
@@ -43,6 +47,10 @@ def _auth_handler(action: str, args: Any) -> bool:
 
 class SolsticeProfile(ProviderProfile):
     def create_client(self, **client_kwargs: Any) -> Any:
+        # Imported here, not at module scope: this is the first point that needs the native adapter
+        # (and therefore ``httpx``), and by now the dependency environment is selected.
+        from .transport import SolsticeClient
+
         allowed = {"api_key", "base_url", "default_headers", "timeout", "http_client"}
         return SolsticeClient(**{k: v for k, v in client_kwargs.items() if k in allowed})
 

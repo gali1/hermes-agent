@@ -886,3 +886,434 @@ class TestDeferredCallSchemaProbe:
         }, calls)
 
         assert validate_deferred_call_args(name, {"payload": {"anything": True}}) is None
+
+
+# ---------------------------------------------------------------------------
+# Recorded-outcome reliability weighting
+# ---------------------------------------------------------------------------
+
+
+def _reliability_catalog():
+    """Two equally queryable github tools plus an unrelated one, built without the registry."""
+    from tools.tool_search_catalog import build_catalog
+    return build_catalog([
+        _td("github_create_issue", "Open a new issue in a GitHub repository",
+            {"title": {"type": "string"}, "body": {"type": "string"}}),
+        _td("github_search_repos", "Search GitHub for matching repositories",
+            {"query": {"type": "string"}}),
+        _td("slack_send_message", "Post a message into a Slack channel",
+            {"channel": {"type": "string"}, "text": {"type": "string"}}),
+    ])
+
+
+def _write_messages_db(path, rows, now: float = 1_700_000_000.0):
+    """A minimal ``messages`` table (the real one's shape for these columns) plus *rows*.
+
+    ``rows`` are ``(tool_name, content, age_seconds)``, inserted oldest first so the rowid order
+    the loader reads newest-first matches their timestamps.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,"
+            " role TEXT, content TEXT, tool_name TEXT, timestamp REAL)")
+        conn.executemany(
+            "INSERT INTO messages (session_id, role, content, tool_name, timestamp)"
+            " VALUES ('s1', 'tool', ?, ?, ?)",
+            [(content, name, now - age) for name, content, age in rows])
+        conn.commit()
+    finally:
+        conn.close()
+    return now
+
+
+_OK = '{"output": "done", "exit_code": 0, "error": null}'
+_EXIT_1 = '{"output": "", "exit_code": 1, "error": null}'
+
+
+class TestReliabilityWeighting:
+    """Recorded outcomes may re-order the hits lexical search admitted, never hide one.
+
+    The multiplier is the narrow form of AnyTool's ``ToolQualityManager.adjust_ranking``: it is
+    applied after the admission gate, clamped to ``[0.2, 1.0]``, and neutral without evidence.
+    """
+
+    def test_no_history_ranks_exactly_as_before(self):
+        from tools.tool_search_catalog import search_catalog
+
+        catalog = _reliability_catalog()
+        for query in ("create a github issue", "github repositories", "post a slack message"):
+            baseline = [e.name for e in search_catalog(catalog, query, limit=5)]
+            assert baseline, f"{query!r} must admit something for this comparison to mean anything"
+            assert [e.name for e in search_catalog(catalog, query, limit=5, reliability=None)] == baseline
+            assert [e.name for e in search_catalog(catalog, query, limit=5, reliability={})] == baseline
+            neutral = {e.name: 1.0 for e in catalog}
+            assert [e.name for e in search_catalog(catalog, query, limit=5, reliability=neutral)] == baseline
+
+    def test_history_below_the_evidence_threshold_changes_nothing(self, tmp_path):
+        from tools.tool_search_catalog import (
+            MIN_CALLS_FOR_RELIABILITY, load_tool_reliability, search_catalog)
+
+        db = tmp_path / "state.db"
+        now = _write_messages_db(db, [("github_create_issue", _EXIT_1, 30),
+                                      ("github_create_issue", _EXIT_1, 20)])
+        reliability = load_tool_reliability(db, now=now)
+        assert reliability == {"github_create_issue": 1.0}  # 2 calls < MIN_CALLS_FOR_RELIABILITY
+
+        catalog = _reliability_catalog()
+        query = "github repositories"
+        baseline = [e.name for e in search_catalog(catalog, query, limit=5)]
+        assert [e.name for e in search_catalog(catalog, query, limit=5, reliability=reliability)] == baseline
+        assert MIN_CALLS_FOR_RELIABILITY > 2
+
+    def test_poor_history_demotes_a_tool_but_never_drops_it(self):
+        from tools.tool_search_catalog import search_catalog
+
+        catalog = _reliability_catalog()
+        query = "github repositories"
+        baseline = [e.name for e in search_catalog(catalog, query, limit=10)]
+        assert baseline == ["github_search_repos", "github_create_issue"]
+
+        weighted = [e.name for e in search_catalog(
+            catalog, query, limit=10, reliability={"github_search_repos": 0.2})]
+        assert sorted(weighted) == sorted(baseline)  # every admitted tool still offered
+        assert weighted == ["github_create_issue", "github_search_repos"]  # just re-ordered
+
+    def test_a_zero_multiplier_from_the_caller_cannot_hide_a_tool(self):
+        from tools.tool_search_catalog import search_catalog
+
+        catalog = _reliability_catalog()
+        query = "github repositories"
+        baseline = [e.name for e in search_catalog(catalog, query, limit=10)]
+        for bad in (0.0, -3.0, float("-inf"), "junk", None):
+            names = [e.name for e in search_catalog(
+                catalog, query, limit=10, reliability={"github_search_repos": bad})]
+            assert sorted(names) == sorted(baseline), f"{bad!r} must not remove a hit"
+
+    def test_exact_name_hit_keeps_first_place(self):
+        from tools.tool_search_catalog import search_catalog
+
+        catalog = _reliability_catalog()
+        hits = search_catalog(catalog, "github_create_issue", limit=5,
+                              reliability={"github_create_issue": 0.2})
+        assert hits[0].name == "github_create_issue"
+
+    @pytest.mark.parametrize("successes,calls,streak", [
+        (0, 3, 0), (0, 50, 50), (1, 100, 100), (2, 40, 3), (1, 3, 2), (3, 10, 5),
+    ])
+    def test_multiplier_stays_inside_the_clamp(self, successes, calls, streak):
+        from tools.tool_search_catalog import RELIABILITY_FLOOR, tool_reliability_multiplier
+
+        assert RELIABILITY_FLOOR <= tool_reliability_multiplier(successes, calls, streak) <= 1.0
+
+    def test_a_tool_that_never_worked_bottoms_out_at_the_floor(self):
+        from tools.tool_search_catalog import RELIABILITY_FLOOR, tool_reliability_multiplier
+
+        assert tool_reliability_multiplier(0, 100, consecutive_failures=50) == RELIABILITY_FLOOR
+        # 3 straight failures are penalised, but never past the floor the clamp enforces.
+        assert tool_reliability_multiplier(0, 3, 3) >= RELIABILITY_FLOOR
+
+    def test_a_healthy_tool_is_never_penalised(self):
+        from tools.tool_search_catalog import tool_reliability_multiplier
+
+        assert tool_reliability_multiplier(2, 5) == 1.0
+        assert tool_reliability_multiplier(3, 3, 0) == 1.0
+
+
+class TestLoadToolReliability:
+    """The loader reads recorded outcomes once, from a bounded rowid window, and never raises."""
+
+    def test_failures_lower_the_multiplier(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        now = _write_messages_db(db, [
+            ("flaky_tool", _EXIT_1, 50), ("flaky_tool", _EXIT_1, 40),
+            ("flaky_tool", _EXIT_1, 30), ("flaky_tool", _EXIT_1, 20),
+            ("flaky_tool", _OK, 10),  # newest call worked: no consecutive-failure penalty
+        ])
+        reliability = load_tool_reliability(db, now=now)
+        assert reliability["flaky_tool"] == pytest.approx(0.65)  # 1/5 success rate
+
+    def test_a_consecutive_failure_run_penalises_further(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        rows = [("t", _OK, 50), ("t", _EXIT_1, 40), ("t", _EXIT_1, 30),
+                ("t", _EXIT_1, 20), ("t", _EXIT_1, 10)]
+        now = _write_messages_db(db, rows)
+        reliability = load_tool_reliability(db, now=now)
+        assert reliability["t"] < 0.65  # same 1/5 rate, but the last 4 calls all failed
+
+    def test_tools_without_history_are_absent(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        now = _write_messages_db(db, [("known_tool", _OK, 10)])
+        assert load_tool_reliability(db, now=now) == {"known_tool": 1.0}
+
+    def test_outcomes_outside_the_window_are_ignored(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        old = 60 * 86400
+        now = _write_messages_db(db, [("stale_tool", _EXIT_1, old + 30),
+                                      ("stale_tool", _EXIT_1, old + 20),
+                                      ("stale_tool", _EXIT_1, old + 10)])
+        assert load_tool_reliability(db, now=now) == {}
+
+    def test_missing_database_is_empty_history(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        assert load_tool_reliability(tmp_path / "absent.db") == {}
+
+    def test_database_without_a_messages_table_is_empty_history(self, tmp_path):
+        import sqlite3
+
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("CREATE TABLE sessions (id TEXT)")
+            conn.commit()
+        finally:
+            conn.close()
+        assert load_tool_reliability(db) == {}
+
+    def test_exit_code_envelope_decides_success(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        now = _write_messages_db(db, [
+            ("broken_tool", _EXIT_1, 30), ("broken_tool", _EXIT_1, 20),
+            ("broken_tool", _EXIT_1, 10),
+            ("working_tool", _OK, 30), ("working_tool", _OK, 20), ("working_tool", _OK, 10),
+        ])
+        reliability = load_tool_reliability(db, now=now)
+        assert reliability["working_tool"] == 1.0
+        assert reliability["broken_tool"] < 0.5
+
+    def test_prose_error_results_count_as_failures(self, tmp_path):
+        from tools.tool_search_catalog import load_tool_reliability
+
+        db = tmp_path / "state.db"
+        now = _write_messages_db(db, [("mcp_tool", "Error: connection refused", 30),
+                                      ("mcp_tool", "Error: connection refused", 20),
+                                      ("mcp_tool", "Error: connection refused", 10)])
+        assert load_tool_reliability(db, now=now)["mcp_tool"] < 1.0
+
+
+import tools.tool_search as tool_search  # noqa: E402
+
+
+class TestZeroMatchLlmPass:
+    """Opt-in recovery when lexical search returns nothing (AnyTool gap analysis, item 2).
+
+    The pass must be inert unless asked for, must never surface a name the corpus does not
+    contain, and must never turn a failed recovery into a failed search.
+    """
+
+    # Real names from the curated defer set: dispatch builds the catalog from the on-disk
+    # config, so invented names would produce an empty catalog and prove nothing.
+    DEFS = ("cronjob_manage", "image_generate")
+
+    def _defs(self):
+        return [
+            _td("cronjob_manage", "Schedule and manage recurring background jobs"),
+            _td("image_generate", "Generate an image from a text prompt"),
+        ]
+
+    def _cfg(self, **kw):
+        return tool_search.ToolSearchConfig(
+            enabled="on", threshold_pct=10, search_default_limit=5, max_search_limit=20, **kw)
+
+    def test_inert_by_default(self):
+        calls = []
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(),
+            llm_select=lambda q, l: calls.append(q) or ["image_generate"]))
+        assert calls == []
+        assert out["results"][0]["matches"] == []
+
+    def test_recovers_on_zero_match_when_enabled(self):
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True),
+            llm_select=lambda q, l: ["image_generate"]))
+        group = out["results"][0]
+        assert group["matches"] == ["image_generate"]
+        assert group["match_mode"] == "llm_name_pass"
+
+    def test_hallucinated_name_is_filtered(self):
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True),
+            llm_select=lambda q, l: ["totally_invented_tool"]))
+        assert out["results"][0]["matches"] == []
+
+    def test_selector_failure_does_not_break_search(self):
+        def boom(q, l):
+            raise RuntimeError("model down")
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True), llm_select=boom))
+        assert out["results"][0]["matches"] == []
+
+    def test_not_used_when_lexical_search_succeeds(self):
+        calls = []
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["schedule a recurring job"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True),
+            llm_select=lambda q, l: calls.append(q) or []))
+        assert calls == []
+        assert out["results"][0]["matches"]
+
+    def test_flag_parsed_from_raw_config(self):
+        cfg = tool_search.ToolSearchConfig.from_raw({"zero_match_llm": True})
+        assert cfg.zero_match_llm is True
+        assert tool_search.ToolSearchConfig.from_raw({}).zero_match_llm is False
+
+
+class TestZeroMatchSelectorWiring:
+    """Integration: the real selector, backed by the auxiliary client, actually gets invoked."""
+
+    DEFS = ("cronjob_manage", "image_generate")
+
+    def _defs(self):
+        return [
+            _td("cronjob_manage", "Schedule and manage recurring background jobs"),
+            _td("image_generate", "Generate an image from a text prompt"),
+        ]
+
+    def _cfg(self, **kw):
+        return tool_search.ToolSearchConfig(
+            enabled="on", threshold_pct=10, search_default_limit=5, max_search_limit=20, **kw)
+
+    def test_selector_calls_aux_client_and_recovers(self, monkeypatch):
+        calls = []
+
+        def fake_call_llm(**kw):
+            calls.append(kw)
+            return {"choices": [{"message": {"content": '["image_generate"]'}}]}
+
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm", fake_call_llm, raising=True)
+
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True),
+            llm_select=tool_search.build_llm_selector()))
+        assert out["results"][0]["matches"] == ["image_generate"]
+        assert len(calls) == 1
+        assert calls[0]["temperature"] == 0.0
+        assert calls[0]["max_tokens"] == 200          # bounded
+        assert "zzzqqq unmatched" in calls[0]["messages"][0]["content"]
+
+    def test_lexical_success_makes_no_model_call(self, monkeypatch):
+        calls = []
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm",
+                            lambda **kw: calls.append(kw) or {"choices": []}, raising=True)
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["schedule a recurring job"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True),
+            llm_select=tool_search.build_llm_selector()))
+        assert out["results"][0]["matches"]
+        assert calls == []                            # no added cost on the normal path
+
+    def test_flag_off_makes_no_model_call(self, monkeypatch):
+        calls = []
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm",
+                            lambda **kw: calls.append(kw) or {"choices": []}, raising=True)
+        tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(), llm_select=tool_search.build_llm_selector())
+        assert calls == []
+
+    def test_aux_failure_is_isolated(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        def boom(**kw):
+            raise RuntimeError("provider down")
+        monkeypatch.setattr(aux, "call_llm", boom, raising=True)
+        out = json.loads(tool_search.dispatch_tool_search(
+            {"queries": ["zzzqqq unmatched"]}, current_tool_defs=self._defs(),
+            config=self._cfg(zero_match_llm=True),
+            llm_select=tool_search.build_llm_selector()))
+        assert out["results"][0]["matches"] == []
+
+    def test_object_shaped_response_parsed(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        class _Msg:
+            content = '["image_generate"]'
+
+        class _Choice:
+            message = _Msg()
+
+        class _Resp:
+            choices = [_Choice()]
+
+        monkeypatch.setattr(aux, "call_llm", lambda **kw: _Resp(), raising=True)
+        assert tool_search.build_llm_selector()("q", "listing") == ["image_generate"]
+
+    def test_non_json_reply_falls_back_to_identifiers(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        monkeypatch.setattr(aux, "call_llm",
+                            lambda **kw: "I suggest image_generate please", raising=True)
+        assert "image_generate" in tool_search.build_llm_selector()("q", "listing")
+
+
+class TestOptionalStemmer:
+    """snowballstemmer is marker-gated (py3.12+ installs may lack it). Importing the
+    catalog must survive its absence — an unconditional import broke the whole
+    deferred-tool bridge at COLLECTION time before this guard existed."""
+
+    DEFS = (
+        _td("github_create_issue", "Open a new issue in a GitHub repository",
+            {"title": {"type": "string"}, "body": {"type": "string"}}),
+        _td("slack_send_message", "Post a message into a Slack channel",
+            {"channel": {"type": "string"}, "text": {"type": "string"}}),
+    )
+
+    def test_module_imports_when_stemmer_missing(self):
+        import subprocess
+        import textwrap
+        script = textwrap.dedent(
+            """
+            import sys
+            class _BlockSnowball:
+                def find_spec(self, name, path=None, target=None):
+                    if name.split(".")[0] == "snowballstemmer":
+                        raise ImportError("blocked: " + name)
+                    return None
+            sys.meta_path.insert(0, _BlockSnowball())
+            sys.path.insert(0, %r)
+            import tools.tool_search as ts
+            from tools import tool_search_catalog as cat
+            assert cat.snowballstemmer is None
+            assert cat._stem("Issues") == "Issues"  # raw token passthrough
+            print("bridge-ok", ts.TOOL_SEARCH_NAME)
+            """
+        ) % _REPO_ROOT
+        out = subprocess.run([sys.executable, "-c", script],
+                             capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stderr
+        assert "bridge-ok tool_search" in out.stdout
+
+    def test_search_returns_hits_without_stemmer(self, monkeypatch):
+        from tools import tool_search_catalog as cat
+        from tools.tool_search import search_catalog
+        monkeypatch.setattr(cat, "snowballstemmer", None)
+        cat._stem.cache_clear()
+        try:
+            hits = search_catalog(cat.build_catalog(list(self.DEFS)),
+                                  "create a github issue", limit=3)
+            assert hits and hits[0].name == "github_create_issue"
+        finally:
+            cat._stem.cache_clear()  # drop raw-token entries from the shared cache
