@@ -215,15 +215,16 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
                 new_text: str = None, operations: Optional[List[Dict[str, Any]]] = None,
                 store: Optional[MemoryStore] = None, backend: Any = None, query: str = None,
                 limit: int = None, memory_type: str = None, graph_expand: bool = None,
-                temporal: bool = None, memory_id: str = None) -> str:
+                temporal: bool = None, memory_id: str = None, apply: bool = None) -> str:
     """Tool entry point; returns a JSON string. Single op (action + content/old_text)
     or batch (``operations``, atomic against the final budget). ``new_text``
     aliases ``content`` -- for 'replace' both mean the COMPLETE new entry (the
     whole matched entry is overwritten; old_text only locates it).
 
     Enhanced actions (search / recall / conflicts / timeline / topics /
-    health / reinforce) operate on the additive structured store through
-    ``backend`` and return an actionable error when it is not enabled.
+    health / reinforce / audit / restore / quarantine) operate on the additive
+    structured store through ``backend`` and return an actionable error when it
+    is not enabled.
 
     Returns JSON string with results.
     """
@@ -237,6 +238,7 @@ def memory_tool(action: str = None, target: str = "memory", content: str = None,
             graph_expand=graph_expand,
             temporal=temporal,
             memory_id=memory_id,
+            apply=apply,
         )
 
     if store is None:
@@ -339,16 +341,22 @@ def enhanced_memory_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
     return True
 
 
-_ENHANCED_ACTIONS = {"search", "recall", "conflicts", "timeline", "topics", "health", "reinforce"}
+_ENHANCED_ACTIONS = {"search", "recall", "conflicts", "timeline", "topics", "health", "reinforce",
+                     "audit", "restore", "quarantine"}
 
 # Parameters only the enhanced actions read; withheld from the schema with them.
-_ENHANCED_ONLY_PARAMS = ("query", "limit", "memory_type", "graph_expand", "temporal", "memory_id")
+_ENHANCED_ONLY_PARAMS = ("query", "limit", "memory_type", "graph_expand", "temporal", "memory_id",
+                         "apply")
 
 _ENHANCED_ADVERTISEMENT = (
     "ENHANCED (when memory.enhanced is enabled): 'search' and 'recall' query the local "
     "structured memory store ('recall' adds rank fusion, graph expansion and temporal "
     "windows); 'conflicts' lists contradicting memories; 'timeline' and 'topics' browse; "
-    "'health' reports store status; 'reinforce' bumps a memory's evidence count."
+    "'health' reports store status; 'reinforce' bumps a memory's evidence count. "
+    "Cleanup: 'audit' re-checks auto-captured memories against the capture filters and "
+    "reports noise by reason (shadow; pass apply=true to quarantine them, which hides them "
+    "from recall without deleting); 'quarantine' lists held-back memories; 'restore' "
+    "(memory_id) returns one to recall. Use these instead of editing memories.db directly."
 )
 
 
@@ -362,6 +370,7 @@ def _enhanced_memory_action(
     graph_expand: bool = None,
     temporal: bool = None,
     memory_id: str = None,
+    apply: bool = None,
 ) -> str:
     """Dispatch the enhanced-memory read/diagnostic actions.
 
@@ -444,6 +453,27 @@ def _enhanced_memory_action(
             return tool_error("memory_id is required for 'reinforce' action.", success=False)
         return json.dumps(backend.reinforce(memory_id), ensure_ascii=False)
 
+    if action == "audit":
+        apply_flag = apply is True or str(apply).strip().lower() in {"true", "1", "yes"}
+        if apply_flag:
+            from tools.skill_provenance import is_unattended_review
+
+            if is_unattended_review():
+                # Unattended review forks may report noise, never act on it.
+                apply_flag = False
+        return json.dumps(backend.audit(apply=apply_flag, limit=min(limit_value, 20)),
+                          ensure_ascii=False)
+
+    if action == "quarantine":
+        items = backend.quarantined(limit=limit_value)
+        return json.dumps({"results": items, "count": len(items)}, ensure_ascii=False)
+
+    if action == "restore":
+        memory_id = (memory_id or "").strip()
+        if not memory_id:
+            return tool_error("memory_id is required for 'restore' action.", success=False)
+        return json.dumps(backend.restore(memory_id), ensure_ascii=False)
+
     return tool_error(f"Unknown action '{action}'.", success=False)
 
 
@@ -525,7 +555,7 @@ MEMORY_SCHEMA = {
                 "enum": [
                     "add", "replace", "remove",
                     "search", "recall", "conflicts", "timeline", "topics",
-                    "health", "reinforce",
+                    "health", "reinforce", "audit", "restore", "quarantine",
                 ],
                 "description": "The action to perform (single-op shape). Omit when using 'operations'."
             },
@@ -568,7 +598,11 @@ MEMORY_SCHEMA = {
             },
             "memory_id": {
                 "type": "string",
-                "description": "Memory id for the enhanced 'reinforce' action."
+                "description": "Memory id for the enhanced 'reinforce' and 'restore' actions."
+            },
+            "apply": {
+                "type": "boolean",
+                "description": "Enhanced 'audit': quarantine the flagged memories (reversible with 'restore'). Omit for a report only."
             },
             "operations": {
                 "type": "array",
@@ -649,7 +683,8 @@ registry.register(
         memory_type=args.get("memory_type"),
         graph_expand=args.get("graph_expand"),
         temporal=args.get("temporal"),
-        memory_id=args.get("memory_id")),
+        memory_id=args.get("memory_id"),
+        apply=args.get("apply")),
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides)

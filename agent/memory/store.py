@@ -741,16 +741,36 @@ class MemoryStore:
               session_id="", user_id="", tags=None, importance=0.5,
               source=None, metadata=None, allow_duplicate=False,
               occurred_start=None, occurred_end=None, confidence=None,
-              fuzzy_dedup: bool = True) -> Dict[str, Any]:
+              fuzzy_dedup: bool = True, status: str = "active") -> Dict[str, Any]:
+        """Insert a memory.  ``status`` other than ``active`` (e.g. ``quarantined``)
+        stores a row that recall never reads: it is deduplicated against rows of
+        any status, never reinforces an active row, and skips contradiction
+        detection, so a held-back row cannot create links or evidence."""
         try:
             content = (content or "").strip()
             if is_degenerate(content):
                 return {"success": False, "error": "content is required and must not be degenerate."}
+            status = str(status or "active")
             chash = _content_hash(content)
             occurred_start_ts = _iso_ts(occurred_start)
             occurred_end_ts = _iso_ts(occurred_end) or occurred_start_ts
             confidence_value = _clamp_confidence(confidence)
             with self._write_lock:
+                if status != "active":
+                    existing = self._execute(
+                        "SELECT id, status FROM memories WHERE content_hash = ? LIMIT 1",
+                        (chash,),
+                    ).fetchone()
+                    if existing:
+                        return {
+                            "success": True,
+                            "memory_id": existing["id"],
+                            "duplicate": True,
+                            "status": existing["status"],
+                            "message": "Content already stored; held-back copy not added.",
+                        }
+                    allow_duplicate = True
+                    fuzzy_dedup = False
                 if not allow_duplicate:
                     existing = self._execute(
                         "SELECT id FROM memories WHERE content_hash = ? AND status = 'active' LIMIT 1",
@@ -802,8 +822,8 @@ class MemoryStore:
                        (id, content, content_hash, memory_type, project, scope,
                         session_id, user_id, tags, importance, source, metadata,
                         proof_count, confidence, occurred_start, occurred_end,
-                        created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        created_at, updated_at, status)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         memory_id, content, chash, str(memory_type or "fact"),
                         project, str(scope or "global"), str(session_id or ""),
@@ -812,10 +832,14 @@ class MemoryStore:
                         imp, _json_or_none(source),
                         json.dumps(metadata or {}, ensure_ascii=False),
                         1, confidence_value, occurred_start_ts, occurred_end_ts, ts, ts,
+                        status,
                     ),
                 )
                 self._commit()
-                conflicts = self._detect_conflicts_locked(memory_id, content, project)
+                conflicts = (
+                    self._detect_conflicts_locked(memory_id, content, project)
+                    if status == "active" else []
+                )
 
             result = {
                 "success": True,
@@ -825,6 +849,7 @@ class MemoryStore:
                 "scope": str(scope or "global"),
                 "importance": imp,
                 "confidence": confidence_value,
+                "status": status,
             }
             if occurred_start_ts:
                 result["occurred_start"] = occurred_start_ts
@@ -916,14 +941,18 @@ class MemoryStore:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    def has_content(self, content: str) -> bool:
-        """Return True when an active memory already holds this exact content."""
+    def has_content(self, content: str, *, include_inactive: bool = False) -> bool:
+        """Return True when an active memory already holds this exact content.
+
+        ``include_inactive`` also counts archived, superseded and quarantined
+        rows, so re-mining a transcript cannot re-store what was held back.
+        """
         try:
             chash = _content_hash((content or "").strip())
-            row = self._execute(
-                "SELECT 1 FROM memories WHERE content_hash = ? AND status = 'active' LIMIT 1",
-                (chash,),
-            ).fetchone()
+            sql = "SELECT 1 FROM memories WHERE content_hash = ?"
+            if not include_inactive:
+                sql += " AND status = 'active'"
+            row = self._execute(sql + " LIMIT 1", (chash,)).fetchone()
             return row is not None
         except Exception:
             logger.debug("has_content check failed", exc_info=True)
@@ -949,6 +978,133 @@ class MemoryStore:
         except Exception:
             logger.debug("content_status check failed", exc_info=True)
             return None
+
+    # -- Capture gate support -------------------------------------------------
+
+    _CAPTURE_STATE_PROJECT = "__capture__"
+
+    def capture_rows(self, *, statuses=("active",), source_types=("conversation",),
+                     limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Rows the capture gate may re-judge: auto-captured conversation rows by
+        default.  Rows written deliberately (memory tool, agent ``remember``,
+        curated mirror) are never returned unless ``source_types`` is None."""
+        try:
+            placeholders = ",".join("?" for _ in statuses)
+            sql = (
+                "SELECT id, content, memory_type, status, source, metadata, created_at "
+                f"FROM memories WHERE status IN ({placeholders})"
+            )
+            params: list = list(statuses)
+            if source_types:
+                type_marks = ",".join("?" for _ in source_types)
+                sql += (
+                    " AND json_valid(COALESCE(source, '{}')) "
+                    f"AND json_extract(COALESCE(source, '{{}}'), '$.type') IN ({type_marks})"
+                )
+                params.extend(source_types)
+            sql += " ORDER BY created_at ASC"
+            if limit:
+                sql += " LIMIT ?"
+                params.append(int(limit))
+            return [self._row_to_dict(row) for row in self._execute(sql, tuple(params))]
+        except Exception:
+            logger.debug("capture_rows query failed", exc_info=True)
+            return []
+
+    def set_capture_status(self, decisions: Dict[str, Dict[str, Any]], *,
+                           status: str, expect_status: Optional[str] = None) -> int:
+        """Move rows to ``status`` in ONE transaction, recording why in
+        ``metadata.capture`` (reason, previous status, filter version, actor, time).
+
+        ``decisions`` maps memory id -> capture info to merge.  ``expect_status``
+        guards against racing a concurrent change: a row whose status moved in
+        the meantime is skipped.  Leaving ``active`` also drops the row's
+        embedding, so no retrieval arm can surface it.  Returns rows changed.
+        """
+        if not decisions:
+            return 0
+        changed = 0
+        ts = _now()
+        with self._write_lock:
+            try:
+                # Flush anything pending so the implicit transaction opened by the
+                # first UPDATE below holds exactly this batch.
+                self.db.commit()
+                for memory_id, info in decisions.items():
+                    row = self._execute(
+                        "SELECT status, metadata FROM memories WHERE id = ?", (memory_id,)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    if expect_status is not None and row["status"] != expect_status:
+                        continue
+                    if row["status"] == status:
+                        continue
+                    try:
+                        metadata = json.loads(row["metadata"] or "{}")
+                        if not isinstance(metadata, dict):
+                            metadata = {}
+                    except (TypeError, ValueError):
+                        metadata = {}
+                    capture = dict(metadata.get("capture") or {})
+                    capture.update(info or {})
+                    capture["previous_status"] = row["status"]
+                    capture["changed_at"] = ts
+                    metadata["capture"] = capture
+                    self._execute(
+                        "UPDATE memories SET status = ?, metadata = ?, updated_at = ? WHERE id = ?",
+                        (status, json.dumps(metadata, ensure_ascii=False), ts, memory_id),
+                    )
+                    if status != "active":
+                        self._execute(
+                            "DELETE FROM memory_embeddings WHERE memory_id = ?", (memory_id,)
+                        )
+                    changed += 1
+                self.db.commit()
+            except Exception:
+                try:
+                    self.db.rollback()
+                except Exception:
+                    logger.debug("capture status rollback failed", exc_info=True)
+                logger.warning("capture status change rolled back", exc_info=True)
+                return 0
+        return changed
+
+    def capture_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Read a capture-gate bookkeeping value (e.g. last audit time)."""
+        try:
+            row = self._execute(
+                "SELECT value FROM memory_config WHERE project = ? AND key = ?",
+                (self._CAPTURE_STATE_PROJECT, str(key)),
+            ).fetchone()
+            return row["value"] if row else default
+        except Exception:
+            return default
+
+    def set_capture_state(self, key: str, value: Any) -> None:
+        """Write a capture-gate bookkeeping value.  Never raises."""
+        try:
+            with self._write_lock:
+                self._execute(
+                    "INSERT INTO memory_config (project, key, value) VALUES (?, ?, ?) "
+                    "ON CONFLICT (project, key) DO UPDATE SET value = excluded.value",
+                    (self._CAPTURE_STATE_PROJECT, str(key), str(value)),
+                )
+                self._commit()
+        except Exception:
+            logger.debug("capture state write failed", exc_info=True)
+
+    def status_counts(self) -> Dict[str, int]:
+        """Row count per status (active, archived, superseded, quarantined, …)."""
+        try:
+            return {
+                row["status"]: int(row["n"])
+                for row in self._execute(
+                    "SELECT status, COUNT(*) AS n FROM memories GROUP BY status"
+                )
+            }
+        except Exception:
+            return {}
 
     def _detect_conflicts_locked(self, memory_id: str, content: str,
                                  project: Optional[str]) -> List[Dict[str, Any]]:
@@ -2000,7 +2156,8 @@ class MemoryStore:
                     placeholders = ",".join("?" for _ in hit_ids)
                     try:
                         for row in self._execute(
-                            f"SELECT id FROM memories WHERE id IN ({placeholders})",
+                            f"SELECT id FROM memories WHERE id IN ({placeholders}) "
+                            "AND status = 'active'",
                             tuple(hit_ids),
                         ):
                             vector_ids.add(row["id"])
@@ -2060,6 +2217,10 @@ class MemoryStore:
         for memory_id in candidate_ids:
             mem = self._fetch_memory(memory_id)
             if not mem:
+                continue
+            # Every arm must agree on visibility: a vector hit for an archived,
+            # superseded or quarantined row would otherwise reach recall.
+            if (mem.get("status") or "active") != "active":
                 continue
             if project and mem.get("project") != project:
                 continue
@@ -2279,6 +2440,8 @@ class MemoryStore:
                         continue
                     mem = self._fetch_memory(memory_id)
                     if not mem:
+                        continue
+                    if (mem.get("status") or "active") != "active":
                         continue
                     if project and mem.get("project") != project:
                         continue
@@ -2875,6 +3038,7 @@ class MemoryStore:
                 "newest_memory": newest,
                 "memories_by_type": by_type,
                 "memories_by_project": by_project,
+                "memories_by_status": self.status_counts(),
                 "fts_ok": fts_ok,
                 "embeddings_indexed": self.embedding_count(),
                 "embeddings_missing": self.missing_embedding_count(None),

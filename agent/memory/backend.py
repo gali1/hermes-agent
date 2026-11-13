@@ -18,11 +18,23 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
+from collections import Counter
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory.context import format_recall_block
-from agent.memory.mining import is_secret, mine_turns
+from agent.memory.mining import (
+    CAPTURE_FILTER_VERSION,
+    HIGH_PRECISION_REASONS,
+    assess_candidate,
+    configure_capture,
+    drop_stats,
+    is_secret,
+    mine_turns,
+    recent_drops,
+)
 from agent.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -49,7 +61,31 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
     "backup_enabled": True,
     "backup_keep": 7,
     "backup_interval_hours": 24,
+    # Capture gate (``memory.enhanced.capture``).  Every key is optional.
+    "capture": {
+        # Store held-back rows (tool dumps, tool echoes, oversized blobs) with
+        # status='quarantined' instead of discarding them: never recalled,
+        # reviewable with the memory tool's 'audit' action, restorable.
+        "quarantine": True,
+        # Assistant turns: "filtered" (default) mines them through the gate;
+        # "off" mines user turns only.
+        "assistant": "filtered",
+        # Operator regexes (case-insensitive).  keep_patterns beat every
+        # heuristic drop, never a safety drop (secrets, injected prompts).
+        "drop_patterns": [],
+        "keep_patterns": [],
+        # Re-judge already-stored conversation rows in the background.  Only
+        # HIGH_PRECISION reasons are acted on unattended, and only by
+        # quarantining (reversible).  0 disables the scheduled audit.
+        "audit_interval_hours": 168,
+        # Hide rows that fail a high-precision check from recall even before
+        # an audit has quarantined them (legacy rows, older filter versions).
+        "recall_guard": True,
+    },
 }
+
+_QUARANTINED = "quarantined"
+_AUDIT_STATE_KEY = "last_audit_at"
 
 # Importance is the retention signal, not a relevance guess: a fact the user
 # asserted has to outlive a reply the assistant merely narrated.
@@ -135,6 +171,56 @@ def _as_float(value: Any, default: float, minimum: float, maximum: float) -> flo
         return default
 
 
+def _row_role(row: Dict[str, Any]) -> Optional[str]:
+    """Author of a stored row when it was recorded (v2 rows), else None."""
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    capture = metadata.get("capture") if isinstance(metadata.get("capture"), dict) else {}
+    role = capture.get("role")
+    if role in ("user", "assistant"):
+        return role
+    source = row.get("source") if isinstance(row.get("source"), dict) else {}
+    role = source.get("role")
+    return role if role in ("user", "assistant") else None
+
+
+def _is_auto_captured(row: Dict[str, Any]) -> bool:
+    """True only for rows the miner wrote; deliberate writes are never guarded.
+
+    Search results relabel ``source`` as the retrieval arm ("engine", "vector")
+    and carry the record's provenance as ``source_type``; stored rows carry it
+    as ``source.type``.  Unknown provenance is treated as deliberate.
+    """
+    if "source_type" in row:
+        return row.get("source_type") == "conversation"
+    source = row.get("source")
+    return isinstance(source, dict) and source.get("type") == "conversation"
+
+
+def _current_turn_tool_texts(messages: Optional[List[Dict[str, Any]]]) -> List[str]:
+    """Tool results produced after the last user message: this turn's evidence."""
+    if not messages:
+        return []
+    start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and message.get("role") == "user":
+            start = index + 1
+            break
+    texts: List[str] = []
+    for message in messages[start:]:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            texts.extend(
+                part.get("text") for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+    return texts
+
+
 class EnhancedMemoryBackend:
     """Facade over the structured store, gated by config and failure-safe."""
 
@@ -150,6 +236,13 @@ class EnhancedMemoryBackend:
         self._capture_enabled = True
         self._vector_backend: Optional[Callable[..., Any]] = None
         self._embedding_indexer = None
+        capture = dict(_DEFAULT_CONFIG["capture"])
+        if isinstance(merged.get("capture"), dict):
+            capture.update({k: v for k, v in merged["capture"].items() if v is not None})
+        self._capture = capture
+        self._capture_counts: Counter = Counter()
+        self._audit_thread: Optional[threading.Thread] = None
+        self._audit_lock = threading.Lock()
 
     # -- State -------------------------------------------------------------
 
@@ -209,6 +302,16 @@ class EnhancedMemoryBackend:
             return
 
         try:
+            configure_capture(
+                self._capture.get("drop_patterns") or [],
+                self._capture.get("keep_patterns") or [],
+            )
+        except Exception:
+            logger.warning("memory capture patterns not applied", exc_info=True)
+        if self._capture_enabled:
+            self._schedule_audit()
+
+        try:
             from agent.memory.embeddings import EmbeddingUnavailable, build_vector_support
         except Exception:
             logger.warning(
@@ -235,6 +338,9 @@ class EnhancedMemoryBackend:
             self._session_id = session_id
 
     def shutdown(self) -> None:
+        audit_thread = self._audit_thread
+        if audit_thread is not None and audit_thread.is_alive():
+            audit_thread.join(timeout=2.0)
         if self._embedding_indexer is not None:
             try:
                 self._embedding_indexer.stop()
@@ -273,6 +379,8 @@ class EnhancedMemoryBackend:
                 topical_only=_as_bool(self._config.get("topical_only"), True),
             )
             results = envelope.get("results", []) if isinstance(envelope, dict) else []
+            if _as_bool(self._capture.get("recall_guard"), True):
+                results = [item for item in results if not self._guarded(item)]
             return format_recall_block(
                 results,
                 max_items=max_recall,
@@ -292,13 +400,15 @@ class EnhancedMemoryBackend:
             # Mine only the completed turn.  MemoryManager.sync_all passes the
             # full conversation as ``messages``; re-mining it every turn would
             # re-observe (and reinforce) every earlier fact on each turn.
-            turns = [
-                {"role": "user", "content": user_content},
-                {"role": "assistant", "content": assistant_content},
-            ]
-            self._store_candidates(mine_turns(turns, limit=_as_int(
-                self._config.get("mining_limit"), 10, 1, 50
-            )), session_id=session_id)
+            turns = [{"role": "user", "content": user_content}]
+            if str(self._capture.get("assistant") or "filtered").lower() != "off":
+                turns.append({"role": "assistant", "content": assistant_content})
+            self._store_candidates(mine_turns(
+                turns,
+                limit=_as_int(self._config.get("mining_limit"), 10, 1, 50),
+                tool_texts=_current_turn_tool_texts(messages),
+                include_quarantined=self._quarantine_enabled(),
+            ), session_id=session_id)
         except Exception:
             logger.debug("enhanced memory turn observation failed (non-fatal)", exc_info=True)
 
@@ -308,9 +418,11 @@ class EnhancedMemoryBackend:
         try:
             # The per-turn sync already mined this session's turns; skip
             # existing content so session-end mining cannot inflate evidence.
-            self._store_candidates(mine_turns(messages, limit=_as_int(
-                self._config.get("mining_limit"), 10, 1, 50
-            )), session_id=self._session_id, skip_existing=True)
+            self._store_candidates(mine_turns(
+                self._mineable(messages),
+                limit=_as_int(self._config.get("mining_limit"), 10, 1, 50),
+                include_quarantined=self._quarantine_enabled(),
+            ), session_id=self._session_id, skip_existing=True)
         except Exception:
             logger.debug("enhanced memory session-end mining failed (non-fatal)", exc_info=True)
         # Junk purge runs every session end, not on the retention interval: it
@@ -513,9 +625,11 @@ class EnhancedMemoryBackend:
         if not self.available or not self._capture_enabled:
             return ""
         try:
-            self._store_candidates(mine_turns(messages, limit=_as_int(
-                self._config.get("mining_limit"), 10, 1, 50
-            )), session_id=self._session_id, skip_existing=True)
+            self._store_candidates(mine_turns(
+                self._mineable(messages),
+                limit=_as_int(self._config.get("mining_limit"), 10, 1, 50),
+                include_quarantined=self._quarantine_enabled(),
+            ), session_id=self._session_id, skip_existing=True)
         except Exception:
             logger.debug("enhanced memory pre-compress mining failed (non-fatal)", exc_info=True)
         return ""
@@ -535,16 +649,28 @@ class EnhancedMemoryBackend:
 
     def _store_candidates(self, candidates: List[Dict[str, Any]], *,
                           session_id: str = "", skip_existing: bool = False) -> int:
+        """Persist mined candidates with their provenance.
+
+        Every row records who wrote the turn and which filter version admitted
+        it (``metadata.capture``), so later audits can re-judge exactly the rows
+        an older gate let through and assistant-only rules have their input.
+        Quarantined candidates are stored inactive and never embedded.
+        """
         stored = 0
         store = self._store
         stored_ids: List[str] = []
+        sid = session_id or self._session_id
         for candidate in candidates or []:
             content = (candidate.get("content") or "").strip()
             if not content or is_secret(content):
                 continue
             if store is None:
                 return stored
-            if skip_existing and store.has_content(content):
+            # A held-back or already-archived row must not come back as a fresh
+            # active row when the same turn is mined again: include_inactive
+            # covers quarantined rows, and the archived guard covers the
+            # skip_existing=False path (observe_turn, pre-compress).
+            if skip_existing and store.has_content(content, include_inactive=True):
                 continue
             # Archiving is a decision, not an accident. Session-end mining
             # replays the whole conversation, so without this check the purge
@@ -553,7 +679,13 @@ class EnhancedMemoryBackend:
             # goes through the tool and is unaffected.
             if store.content_status(content) == "archived":
                 continue
+            reason = candidate.get("quarantine")
             role = str(candidate.get("role") or "").strip().lower()
+            role = role if role in _ROLE_IMPORTANCE else None
+            # Provenance: who wrote the turn and which gate version admitted it.
+            capture = {"role": role, "filter_version": CAPTURE_FILTER_VERSION}
+            if reason:
+                capture.update({"reason": reason, "actor": "capture"})
             # Importance is the retention signal, not a relevance guess. The
             # default retire pass only touches `importance < 0.5`, so a fact the
             # user asserted survives decay while assistant narration becomes
@@ -564,18 +696,206 @@ class EnhancedMemoryBackend:
                 content,
                 memory_type=candidate.get("memory_type") or "fact",
                 scope="global",
-                session_id=session_id or self._session_id,
+                session_id=sid,
                 importance=importance,
                 tags=tags,
-                source={"type": "conversation", "session_id": session_id or self._session_id},
+                source={"type": "conversation", "session_id": sid, "role": role},
+                metadata={"capture": capture},
+                status=_QUARANTINED if reason else "active",
             )
-            if result.get("success"):
-                stored += 1
-                memory_id = result.get("memory_id")
-                if memory_id:
-                    stored_ids.append(memory_id)
+            if not result.get("success"):
+                continue
+            if reason:
+                self._capture_counts["quarantined"] += 1
+                continue
+            stored += 1
+            self._capture_counts["stored"] += 1
+            memory_id = result.get("memory_id")
+            if memory_id:
+                stored_ids.append(memory_id)
         self._enqueue_embeddings(stored_ids)
         return stored
+
+    # -- Capture gate ------------------------------------------------------
+
+    def _quarantine_enabled(self) -> bool:
+        return _as_bool(self._capture.get("quarantine"), True)
+
+    def _mineable(self, messages: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Whole-transcript mining honours the assistant capture mode too."""
+        if str(self._capture.get("assistant") or "filtered").lower() != "off":
+            return list(messages or [])
+        return [m for m in messages or [] if not (isinstance(m, dict) and m.get("role") == "assistant")]
+
+    def _guarded(self, item: Dict[str, Any]) -> bool:
+        """True when a recalled row fails a high-precision capture check.
+
+        Applies to auto-captured rows only: what the user or agent stored on
+        purpose is never second-guessed at recall time.
+        """
+        try:
+            if not isinstance(item, dict) or not _is_auto_captured(item):
+                return False
+            verdict = assess_candidate(item.get("content") or "", role=_row_role(item), record=False)
+            if verdict["verdict"] != "keep" and verdict["reason"] in HIGH_PRECISION_REASONS:
+                self._capture_counts["recall_guarded"] += 1
+                return True
+        except Exception:
+            logger.debug("recall guard check failed (row kept)", exc_info=True)
+        return False
+
+    def audit(self, *, apply: bool = False, reasons: Optional[List[str]] = None,
+              limit: int = 50, actor: str = "audit") -> Dict[str, Any]:
+        """Re-judge stored auto-captured rows with the current gate.
+
+        Shadow by default: reports what would change, by reason, with previews.
+        ``apply`` quarantines the flagged rows in one transaction (reversible
+        with :meth:`restore`).  ``reasons`` narrows which reasons are acted on;
+        unattended runs pass HIGH_PRECISION_REASONS.  Never deletes, never
+        touches rows written deliberately through the memory tool.
+        """
+        if self._store is None:
+            return {"success": False, "error": "enhanced memory is not available"}
+        if not self._audit_lock.acquire(blocking=False):
+            return {"success": False, "error": "an audit is already running"}
+        try:
+            started = time.monotonic()
+            wanted = {str(r) for r in reasons} if reasons else None
+            rows = self._store.capture_rows()
+            flagged: Dict[str, Dict[str, Any]] = {}
+            by_reason: Counter = Counter()
+            samples: Dict[str, List[Dict[str, Any]]] = {}
+            for row in rows:
+                verdict = assess_candidate(row.get("content") or "", role=_row_role(row), record=False)
+                if verdict["verdict"] == "keep":
+                    continue
+                reason = verdict["reason"]
+                by_reason[reason] += 1
+                bucket = samples.setdefault(reason, [])
+                if len(bucket) < max(1, int(limit)):
+                    bucket.append({
+                        "id": row.get("id"),
+                        "created_at": row.get("created_at"),
+                        "preview": (row.get("content") or "")[:160],
+                    })
+                if wanted is None or reason in wanted:
+                    flagged[row["id"]] = {
+                        "reason": reason,
+                        "filter_version": CAPTURE_FILTER_VERSION,
+                        "actor": actor,
+                    }
+            changed = 0
+            if apply and flagged:
+                changed = self._store.set_capture_status(
+                    flagged, status=_QUARANTINED, expect_status="active"
+                )
+                self._capture_counts["audit_quarantined"] += changed
+            if apply:
+                self._store.set_capture_state(
+                    _AUDIT_STATE_KEY, datetime.now(timezone.utc).isoformat(timespec="seconds")
+                )
+            return {
+                "success": True,
+                "mode": "apply" if apply else "shadow",
+                "filter_version": CAPTURE_FILTER_VERSION,
+                "scanned": len(rows),
+                "flagged": sum(by_reason.values()),
+                "acted_on": len(flagged),
+                "quarantined": changed,
+                "by_reason": dict(by_reason.most_common()),
+                "samples": samples,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "note": "Shadow run: nothing changed. Re-run with apply to quarantine."
+                        if not apply else "Quarantined rows are kept and restorable by id.",
+            }
+        except Exception as exc:
+            logger.warning("memory capture audit failed", exc_info=True)
+            return {"success": False, "error": str(exc)}
+        finally:
+            self._audit_lock.release()
+
+    def restore(self, memory_id: str) -> Dict[str, Any]:
+        """Return a quarantined row to recall (undo of a capture/audit decision)."""
+        if self._store is None:
+            return {"success": False, "error": "enhanced memory is not available"}
+        memory_id = (memory_id or "").strip()
+        if not memory_id:
+            return {"success": False, "error": "memory_id is required"}
+        changed = self._store.set_capture_status(
+            {memory_id: {"restored": True, "actor": "restore"}},
+            status="active", expect_status=_QUARANTINED,
+        )
+        if not changed:
+            return {"success": False, "error": f"{memory_id} is not a quarantined memory"}
+        self._enqueue_embeddings([memory_id])
+        return {"success": True, "memory_id": memory_id, "status": "active"}
+
+    def quarantined(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Most recent held-back rows, for review before restore."""
+        if self._store is None:
+            return []
+        rows = self._store.capture_rows(statuses=(_QUARANTINED,), source_types=None)
+        rows = rows[-max(1, int(limit)):]
+        return [
+            {
+                "id": row.get("id"),
+                "created_at": row.get("created_at"),
+                "reason": ((row.get("metadata") or {}).get("capture") or {}).get("reason"),
+                "preview": (row.get("content") or "")[:160],
+            }
+            for row in reversed(rows)
+        ]
+
+    def _audit_due(self) -> bool:
+        hours = _as_int(self._capture.get("audit_interval_hours"), 168, 0, 24 * 365)
+        if hours <= 0 or self._store is None:
+            return False
+        last = self._store.capture_state(_AUDIT_STATE_KEY)
+        if not last:
+            return True
+        try:
+            moment = datetime.fromisoformat(str(last))
+        except ValueError:
+            return True
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - moment).total_seconds() >= hours * 3600
+
+    def _schedule_audit(self) -> None:
+        """Run the unattended audit in a daemon thread when it is due.
+
+        High-precision reasons only, quarantine only — the same bounded action
+        a human would approve without reading every row.
+        """
+        try:
+            if not self._audit_due():
+                return
+            thread = threading.Thread(
+                target=self.audit,
+                kwargs={"apply": True, "reasons": sorted(HIGH_PRECISION_REASONS),
+                        "limit": 5, "actor": "scheduled-audit"},
+                name="memory-capture-audit",
+                daemon=True,
+            )
+            self._audit_thread = thread
+            thread.start()
+        except Exception:
+            logger.debug("memory capture audit not scheduled", exc_info=True)
+
+    def capture_report(self) -> Dict[str, Any]:
+        """Gate telemetry for health: this process's decisions plus the store's."""
+        report: Dict[str, Any] = {
+            "filter_version": CAPTURE_FILTER_VERSION,
+            "quarantine": self._quarantine_enabled(),
+            "assistant": str(self._capture.get("assistant") or "filtered"),
+            "decisions": dict(self._capture_counts),
+            "drops_by_reason": drop_stats(),
+            "recent_drops": recent_drops(5),
+        }
+        if self._store is not None:
+            report["quarantined_rows"] = self._store.status_counts().get(_QUARANTINED, 0)
+            report["last_audit_at"] = self._store.capture_state(_AUDIT_STATE_KEY)
+        return report
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -614,6 +934,7 @@ class EnhancedMemoryBackend:
                 }
             else:
                 health["embedding"] = {"provider": "none"}
+            health["capture"] = self.capture_report()
             return health
         except Exception as exc:
             return {"enabled": self._enabled, "available": False, "error": str(exc)}

@@ -44,7 +44,7 @@ def test_memory_schema_is_well_formed():
     assert params["properties"]["action"]["enum"] == [
         "add", "replace", "remove",
         "search", "recall", "conflicts", "timeline", "topics",
-        "health", "reinforce",
+        "health", "reinforce", "audit", "restore", "quarantine",
     ]
     assert params["properties"]["target"]["enum"] == ["memory", "user"]
     # Batch shape is exposed and its items reuse the same actions.

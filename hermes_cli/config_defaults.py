@@ -1421,6 +1421,17 @@ DEFAULT_CONFIG = {
             "backup_enabled": True,
             "backup_keep": 7,
             "backup_interval_hours": 24,
+            # Capture gate: what auto-capture is allowed to store. Regex only,
+            # no model calls. Held-back rows are quarantined (never recalled,
+            # restorable via the memory tool's 'restore'), not deleted.
+            "capture": {
+                "quarantine": True,            # keep tool dumps/echoes/oversized blobs out of recall, recoverably
+                "assistant": "filtered",       # filtered | off  (off = mine user turns only)
+                "drop_patterns": [],           # extra regexes to reject (case-insensitive)
+                "keep_patterns": [],           # regexes that always pass heuristic filters (never secrets)
+                "audit_interval_hours": 168,   # background re-check of stored rows; 0 disables
+                "recall_guard": True,          # hide legacy junk from recall before the audit reaches it
+            },
         },
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
