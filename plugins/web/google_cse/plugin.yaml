@@ -1,6 +1,6 @@
 name: web-google-cse
 version: 1.0.0
-description: "Google Programmable Search (Custom Search JSON API) — keyed search fallback, tried after the legacy vendor walk and before the keyless free tier. Requires GOOGLE_CSE_API_KEY and GOOGLE_CSE_ID (GOOGLE_API_KEY / GOOGLE_CSE_CX accepted as aliases); 100 queries/day free. Search only."
+description: "Google Programmable Search (Custom Search JSON API) — keyed search fallback, tried after the legacy vendor walk and before the keyless free tier. Requires GOOGLE_CSE_API_KEY and GOOGLE_CSE_ID (GOOGLE_CSE_CX accepted as an alias for the engine id); 100 queries/day free. Search only."
 author: NousResearch
 kind: backend
 provides_web_providers:

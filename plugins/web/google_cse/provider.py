@@ -1,8 +1,9 @@
 """Google Programmable Search (Custom Search JSON API) — search only, keyed fallback tier.
 
 Env: ``GOOGLE_CSE_API_KEY`` (API key) **and** ``GOOGLE_CSE_ID`` (the engine's ``cx`` id).
-``GOOGLE_API_KEY`` and ``GOOGLE_CSE_CX`` are accepted as aliases, so an install configured
-before the rename keeps working; the canonical pair wins when both spellings are set.
+``GOOGLE_CSE_CX`` is accepted as an alias for the engine id, so an install configured before
+the rename keeps working; the canonical pair wins when both spellings are set. ``GOOGLE_API_KEY``
+is deliberately not honoured — it usually holds a Gemini/Vertex key that cannot call this API.
 Config: ``web.search_backend`` / ``web.backend: "google-cse"`` to pin it directly.
 
 Tier: registered in :data:`agent.web_search_registry._FALLBACK_PREFERENCE`, i.e. tried
@@ -53,9 +54,13 @@ class GoogleCSEWebSearchProvider(BaseWebSearchProvider):
     DISPLAY_NAME = "Google Custom Search"
     KEY_ENV = "GOOGLE_CSE_API_KEY"
     CX_ENV = "GOOGLE_CSE_ID"
-    # Legacy spellings, accepted after the canonical names. Order matters: the canonical
-    # variable wins when both are set, so one box can migrate without editing the other.
-    KEY_ENV_ALIASES: Tuple[str, ...] = ("GOOGLE_API_KEY",)
+    # Legacy spelling of the engine id, accepted after the canonical name. Order matters: the
+    # canonical variable wins when both are set, so one box can migrate without editing the other.
+    # Only a same-product alias belongs here. ``GOOGLE_API_KEY`` is deliberately NOT accepted:
+    # that name normally holds a Gemini/Vertex key with no Custom Search access, so honouring it
+    # would report this provider as available on a box that cannot use it, and a caller could no
+    # longer distinguish "backend absent" from "backend present but unauthorised".
+    KEY_ENV_ALIASES: Tuple[str, ...] = ()
     CX_ENV_ALIASES: Tuple[str, ...] = ("GOOGLE_CSE_CX",)
     EXTRACT = False
     KEYLESS = False
@@ -135,7 +140,7 @@ class GoogleCSEWebSearchProvider(BaseWebSearchProvider):
         schema = setup_schema(
             self.DISPLAY_NAME, "free",
             "Keyed fallback — needs GOOGLE_CSE_API_KEY and GOOGLE_CSE_ID (100 queries/day free); "
-            "GOOGLE_API_KEY / GOOGLE_CSE_CX are accepted aliases. Search only.",
+            "GOOGLE_CSE_CX is accepted as an alias for the engine id. Search only.",
             self.KEY_ENV, "Google API key (Custom Search JSON API)",
             "https://developers.google.com/custom-search/v1/overview",
         )
