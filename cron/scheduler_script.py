@@ -397,6 +397,71 @@ def _resolve_cron_interpreter(interpreter: str) -> tuple[Optional[str], Optional
     return str(resolved), None
 
 
+def _is_wsl_stub(path: str) -> bool:
+    """True when *path* is the Windows WSL launcher rather than a real bash.
+
+    ``C:\\Windows\\System32`` precedes Git Bash on PATH, so ``shutil.which("bash")``
+    returns the stub. Running a script through it fails with the useless
+    "The file cannot be accessed by the system." when no distro is installed, which
+    is exactly what a real Windows host without WSL reports every cron tick.
+    """
+    try:
+        p = Path(path).resolve()
+    except OSError:
+        return False
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    try:
+        return p.parent.samefile(Path(sysroot, "System32")) and p.name.lower() == "bash.exe"
+    except OSError:
+        return str(p.parent).lower().endswith("system32") and p.name.lower() == "bash.exe"
+
+
+def _git_bash_candidates() -> list[str]:
+    """Git Bash installs, most-specific first. Empty when Git for Windows is absent."""
+    bases = (
+        os.environ.get("ProgramW6432"),
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramFiles(x86)"),
+    )
+    local = os.environ.get("LOCALAPPDATA")
+    found: list[str] = []
+    for base in bases:
+        if not base:
+            continue
+        try:
+            cand = Path(base, "Git", "bin", "bash.exe")
+            if cand.is_file():
+                found.append(str(cand))
+        except OSError:
+            continue
+    if local:
+        try:
+            cand = Path(local, "Programs", "Git", "bin", "bash.exe")
+            if cand.is_file():
+                found.append(str(cand))
+        except OSError:
+            pass
+    return found
+
+
+def _resolve_bash() -> Optional[str]:
+    """A real bash for ``.sh`` cron scripts, or None.
+
+    Windows: Git Bash is preferred over PATH because PATH resolves to the WSL stub.
+    The stub itself is never returned — failing with "bash not found" is a far better
+    signal than a Windows error message with no context.
+    """
+    if sys.platform == "win32":
+        for cand in _git_bash_candidates():
+            if not _is_wsl_stub(cand):
+                return cand
+        found = shutil.which("bash")
+        if found and not _is_wsl_stub(found):
+            return found
+        return None
+    return shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+
+
 def _script_argv(
     path: Path, interpreter: Optional[str] = None,
 ) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
@@ -406,11 +471,11 @@ def _script_argv(
     / ``_windows_cron_python_invocation``. Interpreter selection reads PM's install records and
     may raise; callers run this inside their ``try``."""
     if path.suffix.lower() in {".sh", ".bash"}:
-        # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
-        _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+        _bash = _resolve_bash()
         if _bash is None:
             return None, {}, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
+                f"Cannot run .sh/.bash script {path.name!r}: no usable bash found "
+                "(the only 'bash' on PATH is the WSL launcher). "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
             )
