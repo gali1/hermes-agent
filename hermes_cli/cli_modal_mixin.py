@@ -586,6 +586,42 @@ class CLIModalMixin:
 
         _run_on_app_loop(app, _emit)
 
+    def _report_agent_status(self, state: str, *, kind: str = "", msg: str = "") -> None:
+        """Tell OSC 7501-aware terminals what this agent is doing (herdr, cmux, Ghostty, Rex).
+
+        A program that never reports is only a terminal to an agent sidebar, so the CLI reports
+        ``idle`` at the prompt, ``working`` per turn, ``blocked`` at a modal, and ``done`` /
+        ``error`` when the turn settles. Same writer discipline as ``_ring_bell``: on the app loop
+        when the TUI owns the tty (a second writer would splice into an in-flight kitty pet
+        frame), ``/dev/tty`` otherwise. Never raises and never blocks a turn.
+        """
+        try:
+            from hermes_cli.cli_terminal_mixin import _run_on_app_loop, _write_terminal_sequence
+            from hermes_cli.terminal_notify import osc7501, status_enabled
+            if not status_enabled():
+                return
+            seq = osc7501(state, kind=kind, msg=msg)
+        except Exception:
+            return
+        app = getattr(self, "_app", None)
+        if app is None or not getattr(app, "_is_running", False):
+            import os
+            from hermes_cli.terminal_notify import write_tty
+            try:
+                if sys.stdout.isatty() or os.path.exists("/dev/tty"):
+                    write_tty(seq)
+            except Exception:
+                pass
+            return
+
+        def _emit() -> None:
+            try:
+                _write_terminal_sequence(app, seq)
+            except (OSError, ValueError):
+                pass  # dead tty: same fail-quiet as _pet_flush_kitty_frame
+
+        _run_on_app_loop(app, _emit)
+
     def _clarify_teardown(self) -> None:
         self._clarify_state = None
         self._clarify_freetext = False
@@ -723,6 +759,7 @@ class CLIModalMixin:
         state["tool_thread_id"] = threading.current_thread().ident
         if state["phase"] != "waiting":
             self._ring_bell(prompt=True, context=t("cli.connect.bell_context"))
+            self._report_agent_status("blocked", kind="question", msg=t("cli.connect.bell_context"))
         return None
 
     def _connection_answer(self, *, approve: bool) -> None:
@@ -1022,6 +1059,7 @@ class CLIModalMixin:
         self._clarify_batch_set_active(state, 0)
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
         self._ring_bell(prompt=True, context=t("cli.clarify.bell_context"))
+        self._report_agent_status("blocked", kind="question", msg=t("cli.clarify.bell_context"))
         self._paint_now()
 
         result = self._poll_modal_queue(response_queue, "_clarify_deadline")
@@ -1044,6 +1082,7 @@ class CLIModalMixin:
         self._sudo_state = {"response_queue": response_queue}
         self._sudo_deadline = _time.monotonic() + 45
         self._ring_bell(prompt=True, context=t("cli.secret.bell_sudo"))
+        self._report_agent_status("blocked", kind="auth", msg=t("cli.secret.bell_sudo"))
         self._paint_now()
 
         result = self._poll_modal_queue(response_queue, "_sudo_deadline", refresh=0)
@@ -1087,6 +1126,7 @@ class CLIModalMixin:
                 "response_queue": response_queue}
             self._approval_deadline = _time.monotonic() + timeout
             self._ring_bell(prompt=True, context=t("cli.approval.bell_context"), detail=command)
+            self._report_agent_status("blocked", kind="permission", msg=command[:200])
             self._paint_now()
 
             result = self._poll_modal_queue(response_queue, "_approval_deadline")
@@ -1150,6 +1190,7 @@ class CLIModalMixin:
         self._sudo_state = {"response_queue": response_queue, "vault_backend": display_name}
         self._sudo_deadline = _time.monotonic() + 120
         self._ring_bell(prompt=True, context=t("cli.secret.bell_unlock", name=display_name))
+        self._report_agent_status("blocked", kind="auth", msg=t("cli.secret.bell_unlock", name=display_name))
         self._paint_now()
 
         result = self._poll_modal_queue(response_queue, "_sudo_deadline", refresh=0)
@@ -1177,6 +1218,7 @@ class CLIModalMixin:
             self._sudo_deadline = _time.monotonic() + 180
             if step == "identifier":
                 self._ring_bell(prompt=True, context=t("cli.secret.bell_save_login", site=site))
+                self._report_agent_status("blocked", kind="question", msg=t("cli.secret.bell_save_login", site=site))
             self._paint_now()
             result = self._poll_modal_queue(response_queue, "_sudo_deadline", refresh=0)
             self._sudo_state = None
@@ -1200,6 +1242,7 @@ class CLIModalMixin:
         self._sudo_state = {"response_queue": response_queue, "vault_code": {"site": site, "hint": hint}}
         self._sudo_deadline = _time.monotonic() + 180
         self._ring_bell(prompt=True, context=t("cli.secret.bell_verification_code", site=site))
+        self._report_agent_status("blocked", kind="auth", msg=t("cli.secret.bell_verification_code", site=site))
         self._paint_now()
         result = self._poll_modal_queue(response_queue, "_sudo_deadline", refresh=0)
         self._sudo_state = None

@@ -1473,6 +1473,8 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
                 if self._tui_multiline_shortcuts:
                     _enable_extended_enter_keys(app.output)
                 self._pet_start_anim()
+                # OSC 7501: announced presence at the prompt so agent sidebars list the pane as idle.
+                self._report_agent_status("idle")
                 app.run()
         except (EOFError, KeyboardInterrupt, BrokenPipeError):
             pass
