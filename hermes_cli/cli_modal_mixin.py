@@ -8,6 +8,7 @@ imported LAZILY inside each method — the mixin never imports ``cli`` at module
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -604,8 +605,17 @@ class CLIModalMixin:
         except Exception:
             return
         app = getattr(self, "_app", None)
+        if os.name == "nt":
+            # prompt_toolkit's Windows console output does not put a raw OSC on the ConPTY stream,
+            # so the pane never sees the record; writing the stdout handle does (verified against
+            # herdr-core on Windows). The sequence is short, so a frame splice is the only risk.
+            try:
+                sys.stdout.flush()
+                os.write(sys.stdout.fileno(), seq.encode("utf-8"))
+            except Exception:
+                pass
+            return
         if app is None or not getattr(app, "_is_running", False):
-            import os
             from hermes_cli.terminal_notify import write_tty
             try:
                 if sys.stdout.isatty() or os.path.exists("/dev/tty"):
