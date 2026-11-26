@@ -1884,6 +1884,10 @@ class CLITuiMixin(CLITuiComposerEditMixin):
         self._image_counter = 0
         # Ctrl+E composer editor: 1-based index of the queued prompt being edited, None when off.
         self._queue_edit_index: int | None = None
+        # True while the numbered queued-prompt menu is showing: bare digits 1-9 select.
+        self._queue_edit_picker: bool = False
+        # True when the composer holds a prompt restored from history (Enter submits, not saves back).
+        self._queue_edit_history: bool = False
 
         # Voice mode state (protected by _voice_lock for cross-thread access).
         self._voice_lock = threading.Lock()
