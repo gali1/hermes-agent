@@ -4024,6 +4024,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        # Ctrl+E queued-prompt editor: 1-based index being edited, None when off.
+        self._queue_edit_index = None
+        # True while the numbered menu is showing: bare digits 1-9 select.
+        self._queue_edit_picker = False
+        # True when the composer holds a prompt restored from history.
+        self._queue_edit_history = False
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -6015,6 +6021,193 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception as exc:
             _cprint(f"{_DIM}Failed to open external editor: {exc}{_RST}")
             return False
+
+    # ── Ctrl+E: edit queued prompts ──────────────────────────────────────
+    # The queue was append-only before this: once a prompt was queued there was
+    # no way to see it, change it, or drop it without a restart. Ctrl+E turns the
+    # queue into something editable — Ctrl+E opens a numbered menu, a digit picks
+    # an entry, Enter writes the edited text back in place, Ctrl+X removes it and
+    # Esc leaves the queue exactly as it was. With no queue at all it restores the
+    # last submitted prompt from this session's history so it can be re-run.
+
+    def _queue_edit_items(self) -> list:
+        """Snapshot of the queued next-turn prompts (raw items, oldest first)."""
+        q = getattr(self, "_pending_input", None)
+        if q is None:
+            return []
+        with q.mutex:
+            return list(q.queue)
+
+    def _queue_edit_text(self, item) -> str:
+        """The queued prompt's exact text — newlines preserved, nothing collapsed."""
+        if isinstance(item, tuple):          # (text, images) from an image-attached submit
+            item = item[0]
+        text = getattr(item, "display_text", None) or getattr(item, "text", None) or str(item)
+        return str(text)
+
+    def _queue_edit_last_submitted(self) -> str:
+        """Most recent submitted prompt from the session history file.
+
+        Slash commands are skipped — editing ``/model`` back into the composer is
+        not what Ctrl+E is for. Returns "" when history is missing or empty.
+        """
+        path = getattr(self, "_history_file", None)
+        if not path:
+            return ""
+        try:
+            raw = Path(str(path)).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        # FileHistory layout: "\n# <timestamp>\n" then one "+<line>" per line.
+        entries, current = [], []
+        for line in raw.splitlines():
+            if line.startswith("#"):
+                if current:
+                    entries.append("\n".join(current))
+                    current = []
+            elif line.startswith("+"):
+                current.append(line[1:])
+        if current:
+            entries.append("\n".join(current))
+        for entry in reversed(entries):          # newest first
+            text = (entry or "").strip()
+            if text and not text.startswith("/"):
+                return entry.rstrip()
+        return ""
+
+    def _queue_edit_render_menu(self, items, selected: int) -> None:
+        """Print every queued prompt with the shortcut that selects it."""
+        _cprint(f"  {_DIM}Queued prompts ({len(items)}) — Ctrl+E then a number to edit, Esc closes.{_RST}")
+        for number, item in enumerate(items, 1):
+            marker = "▸" if number == selected else " "
+            text = self._queue_edit_text(item).replace("\r", " ").replace("\n", " ").strip()
+            if len(text) > 72:
+                text = text[:71] + "…"
+            _cprint(f"   {marker} Ctrl+E {number}  {text}")
+
+    def _queue_edit_load(self, event, idx: int, items, arm_picker: bool = True) -> None:
+        """Put queued item ``idx`` into the composer."""
+        text = self._queue_edit_text(items[idx - 1])
+        buf = event.current_buffer
+        buf.text = text
+        buf.cursor_position = len(text)
+        self._queue_edit_index = idx
+        self._queue_edit_picker = bool(arm_picker)
+        self._queue_edit_history = False
+        _cprint(f"  {_DIM}Editing queued prompt {idx} of {len(items)} — Enter saves · Ctrl+E next · Ctrl+X deletes · Esc cancels.{_RST}")
+        event.app.invalidate()
+
+    def _tui_handle_ctrl_e(self, event) -> None:
+        """Ctrl+E: open the queued-prompt editing workflow."""
+        if getattr(self, "_clarify_state", None) or getattr(self, "_approval_state", None):
+            _cprint(f"  {_DIM}Ctrl+E is waiting on the open prompt above — finish it, then press Ctrl+E again.{_RST}")
+            return
+        self._queue_edit_picker = False
+        self._queue_edit_history = False
+        items = self._queue_edit_items()
+        if items:
+            current = getattr(self, "_queue_edit_index", None)
+            if isinstance(current, int) and 1 <= current <= len(items):
+                idx = current + 1 if current < len(items) else 1
+            else:
+                idx = 1
+            self._queue_edit_render_menu(items, idx)
+            self._queue_edit_load(event, idx, items)
+            return
+        text = self._queue_edit_last_submitted()
+        if not text:
+            _cprint(f"  {_DIM}Nothing to edit yet — the queue is empty and no prompt has been submitted in this session.{_RST}")
+            return
+        buf = event.current_buffer
+        buf.text = text
+        buf.cursor_position = len(text)
+        self._queue_edit_index = None            # Enter must submit, not save back
+        self._queue_edit_picker = False
+        self._queue_edit_history = True
+        _cprint(f"  {_DIM}Restored your last submitted prompt — edit it and press Enter to run it, Esc to cancel.{_RST}")
+        event.app.invalidate()
+
+    def _queue_edit_digit(self, event, number: int) -> None:
+        """Select queued prompt ``number`` while the menu is showing."""
+        self._queue_edit_picker = False
+        items = self._queue_edit_items()
+        if not items:
+            _cprint(f"  {_DIM}Nothing to edit yet — the queue is empty.{_RST}")
+            return
+        if 1 <= number <= len(items):
+            self._queue_edit_load(event, number, items, arm_picker=False)
+        else:
+            _cprint(f"  {_DIM}No queued prompt {number} — there are {len(items)}.{_RST}")
+
+    def _tui_handle_queue_edit_save(self, event) -> bool:
+        """Enter while editing: write the composer text back into the queue in place."""
+        idx = getattr(self, "_queue_edit_index", None)
+        if idx is None:
+            return False
+        buf = event.current_buffer
+        text = buf.text.strip()
+        if not text:
+            _cprint(f"  {_DIM}Edited prompt is empty — nothing saved (Esc cancels the edit).{_RST}")
+            return True
+        q = self._pending_input
+        with q.mutex:
+            items = list(q.queue)
+            if not (1 <= idx <= len(items)):
+                _cprint(f"  {_DIM}Queue item {idx} not found. Current size: {len(items)}{_RST}")
+                self._queue_edit_index = None
+                self._queue_edit_picker = False
+                buf.reset()
+                return True
+            original = items[idx - 1]
+            if isinstance(original, tuple):
+                items[idx - 1] = (text, original[1])
+            else:
+                items[idx - 1] = text
+            q.queue.clear()
+            q.queue.extend(items)
+            q.unfinished_tasks = len(items)
+            if items:
+                q.not_empty.notify_all()
+        preview = text if len(text) <= 80 else text[:77] + "..."
+        _cprint(f"  {_DIM}Updated queue item {idx}: {preview}{_RST}")
+        self._queue_edit_index = None
+        self._queue_edit_picker = False
+        buf.reset()
+        event.app.invalidate()
+        return True
+
+    def _tui_handle_queue_edit_cancel(self, event) -> None:
+        """Esc while editing: clear the composer, leave the queue untouched."""
+        active = (getattr(self, "_queue_edit_index", None) is not None
+                  or getattr(self, "_queue_edit_picker", False)
+                  or getattr(self, "_queue_edit_history", False))
+        self._queue_edit_index = None
+        self._queue_edit_picker = False
+        self._queue_edit_history = False
+        event.current_buffer.reset()
+        if active:
+            _cprint(f"  {_DIM}Queue edit cancelled — the queued prompt is unchanged.{_RST}")
+        event.app.invalidate()
+
+    def _tui_handle_queue_edit_delete(self, event) -> None:
+        """Ctrl+X while editing: remove that queued prompt."""
+        idx = getattr(self, "_queue_edit_index", None)
+        if idx is None:
+            return
+        self._queue_edit_index = None
+        self._queue_edit_picker = False
+        event.current_buffer.reset()
+        q = self._pending_input
+        with q.mutex:
+            items = list(q.queue)
+            if 1 <= idx <= len(items):
+                removed = items.pop(idx - 1)
+                q.queue.clear()
+                q.queue.extend(items)
+                q.unfinished_tasks = len(items)
+                preview = self._queue_edit_text(removed)[:70]
+                _cprint(f"  {_DIM}Removed queue item {idx}: {preview}{_RST}")
+        event.app.invalidate()
 
     def _submit_editor_buffer(self, buffer) -> None:
         """Submit the draft an external editor left in ``buffer``.
@@ -13474,6 +13667,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 event.app.current_buffer.reset(append_to_history=True)
 
         _bind_prompt_submit_keys(kb, handle_enter)
+
+        # ── Ctrl+E queued-prompt editor (registered after the submit keys so the
+        # filtered variants below win while an edit is in progress) ──────────
+        _qe_edit = Condition(lambda: self._queue_edit_index is not None)
+        _qe_picker = Condition(lambda: getattr(cli_ref, "_queue_edit_picker", False))
+        _qe_session = Condition(
+            lambda: (self._queue_edit_index is not None
+                     or getattr(cli_ref, "_queue_edit_picker", False)
+                     or getattr(cli_ref, "_queue_edit_history", False)))
+
+        @kb.add('c-e')
+        def handle_ctrl_e(event):
+            """Ctrl+E opens the queued-prompt editor (or restores the last prompt)."""
+            self._tui_handle_ctrl_e(event)
+
+        @kb.add('enter', filter=_qe_edit)
+        def handle_queue_edit_enter(event):
+            """Enter while editing a queued prompt saves it back — never submits."""
+            self._tui_handle_queue_edit_save(event)
+
+        @kb.add('escape', filter=_qe_session, eager=True)
+        def handle_queue_edit_cancel(event):
+            self._tui_handle_queue_edit_cancel(event)
+
+        @kb.add('c-x', filter=_qe_edit)
+        def handle_queue_edit_delete(event):
+            self._tui_handle_queue_edit_delete(event)
+
+        for _qe_num in range(1, 10):
+            kb.add(str(_qe_num), filter=_qe_picker)(
+                (lambda n: (lambda event: self._queue_edit_digit(event, n)))(_qe_num))
         
         @kb.add('escape', 'enter')
         def handle_alt_enter(event):
