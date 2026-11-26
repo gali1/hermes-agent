@@ -89,3 +89,60 @@ def test_running_app_gets_bell_and_osc9_on_its_loop_never_a_second_tty_writer(mo
     assert len(_Loop.queued) == 1
     _Loop.queued[0]()
     assert _Output.raw == ["\a\x1b]9;Hermes: turn complete\x07", "<flush>"]
+
+
+# --- OSC 7501 (Program Status Protocol) ------------------------------------
+
+
+def test_osc7501_record_shape_and_base64_message():
+    seq = terminal_notify.osc7501("blocked", kind="permission", msg="rm -rf build?")
+    assert seq.startswith("\x1b]7501;state=blocked:kind=permission:app=hermes:msg=")
+    assert seq.endswith("\x1b\\")
+    import base64
+    body = seq[len("\x1b]7501;"):-2]
+    encoded = body.rsplit("msg=", 1)[1]
+    assert base64.b64decode(encoded).decode() == "rm -rf build?"
+
+
+def test_osc7501_drops_unknown_kind_and_sanitizes_app():
+    seq = terminal_notify.osc7501("working", kind="bogus", app="her\x1bmes")
+    assert seq == "\x1b]7501;state=working:app=hermes\x1b\\"
+
+
+def test_status_enabled_honours_kill_switch():
+    assert terminal_notify.status_enabled({}) is True
+    for value in ("0", "off", "FALSE", "no"):
+        assert terminal_notify.status_enabled({"HERMES_OSC_STATUS": value}) is False
+
+
+def test_report_agent_status_writes_tty_without_an_app(monkeypatch):
+    written = []
+    monkeypatch.delenv("HERMES_OSC_STATUS", raising=False)
+    monkeypatch.setattr(terminal_notify, "write_tty", written.append)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._app = None
+    cli._report_agent_status("working")
+    assert written == ["\x1b]7501;state=working:app=hermes\x1b\\"]
+
+
+def test_report_agent_status_respects_kill_switch(monkeypatch):
+    written = []
+    monkeypatch.setenv("HERMES_OSC_STATUS", "0")
+    monkeypatch.setattr(terminal_notify, "write_tty", written.append)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._app = None
+    cli._report_agent_status("working")
+    assert written == []
+
+
+def test_turn_agent_status_maps_result_to_osc7501_state():
+    class _Turn:
+        def __init__(self, result):
+            self.result = result
+
+    cli = HermesCLI.__new__(HermesCLI)
+    assert cli._turn_agent_status(_Turn({"final_response": "ok"})) == "done"
+    assert cli._turn_agent_status(_Turn({"interrupted": True})) == "idle"
+    assert cli._turn_agent_status(_Turn({"failed": True, "error": "boom"})) == "error"
+    assert cli._turn_agent_status(_Turn(None)) == "done"
