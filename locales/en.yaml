@@ -2469,6 +2469,10 @@ cli:
     edit_blank: "Edited prompt is empty — nothing saved (Esc cancels the edit)."
     edit_cancelled: "Queue edit cancelled — the queued prompt is unchanged."
     edit_blocked_modal: "Ctrl+E is waiting on the open prompt above — finish or dismiss it, then press Ctrl+E again."
+    edit_menu_header: "Queued prompts ({count}) — press Ctrl+E then a number to edit one, Esc closes this list."
+    edit_select_invalid: "No queued prompt {index} — there are {count} (choose 1-{count})."
+    edit_history_restored: "Restored your last submitted prompt — edit it and press Enter to run it, Esc to cancel."
+    edit_nothing: "Nothing to edit yet — the queue is empty and no prompt has been submitted in this session."
   reload:
     env_reloaded: "Reloaded .env ({count} var(s) updated)"
   continuation:

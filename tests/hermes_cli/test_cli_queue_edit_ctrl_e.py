@@ -56,14 +56,20 @@ def _enter(shell, buf: Buffer):
     return cprint
 
 
-def test_ctrl_e_on_empty_queue_prints_and_keeps_edit_mode_off():
+def test_ctrl_e_on_empty_queue_without_history_says_so():
+    """Empty queue and no history file: say there is nothing to edit, never go silent.
+
+    (With history present Ctrl+E restores the last submitted prompt instead — see
+    tests/hermes_cli/test_cli_queue_edit_picker.py.)
+    """
     shell = _shell()
     buf = Buffer()
     with patch("cli._cprint") as cprint:
         shell._tui_handle_ctrl_e(_event(buf))
     assert shell._queue_edit_index is None
     assert buf.text == ""
-    cprint.assert_called_once_with(f"  {t('cli.queue.edit_empty')}")
+    assert shell._queue_edit_picker is False
+    cprint.assert_called_once_with(f"  {t('cli.queue.edit_nothing')}")
 
 
 def test_ctrl_e_loads_first_queued_prompt_into_the_composer():
@@ -76,7 +82,11 @@ def test_ctrl_e_loads_first_queued_prompt_into_the_composer():
     assert buf.text == "alpha"
     assert buf.cursor_position == len("alpha")
     assert shell._queue_edit_index == 1
-    cprint.assert_called_once_with(f"  {t('cli.queue.edit_hint', index=1, count=2)}")
+    printed = [c.args[0] for c in cprint.call_args_list]
+    # the numbered menu is printed first, then the editing hint for the loaded item
+    assert any("Ctrl+E 1" in line and "alpha" in line for line in printed)
+    assert any("Ctrl+E 2" in line and "beta" in line for line in printed)
+    assert f"  {t('cli.queue.edit_hint', index=1, count=2)}" in printed
 
 
 def test_ctrl_e_cycles_through_the_queue_and_wraps():
@@ -217,8 +227,9 @@ def test_special_and_multiline_content_round_trips():
     shell._pending_input.put("line one\nline two")
     buf = Buffer()
     _ctrl_e(shell, buf)
-    # The shared dock extractor collapses whitespace for its one-line preview.
-    assert buf.text == "line one line two"
+    # Exact text, not the dock's whitespace-collapsed preview: editing a multi-line
+    # prompt must not flatten it into one line.
+    assert buf.text == "line one\nline two"
     edited = 'line one\nline "two"\n$HOME [not a paste]'
     buf.text = edited
     _enter(shell, buf)
