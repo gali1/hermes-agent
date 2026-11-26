@@ -113,6 +113,8 @@ class CLIChatTurnMixin:
                 # Per-prompt elapsed timer — frozen when the agent thread finishes.
                 self._prompt_start_time = time.time()
                 self._prompt_duration = 0.0
+                # OSC 7501: the turn has begun (herdr/cmux sidebars show "working").
+                self._report_agent_status("working")
                 # Daemon: closing the terminal tab (SIGHUP) must not be kept alive by it.
                 agent_thread = threading.Thread(target=self._chat_run_agent, args=(turn, message), daemon=True)
                 agent_thread.start()
@@ -511,6 +513,17 @@ class CLIChatTurnMixin:
             self.session_id = self.agent.session_id
             self._write_terminal_breadcrumb()
             self._pending_title = None
+        self._report_agent_status(self._turn_agent_status(turn))
+
+    @staticmethod
+    def _turn_agent_status(turn) -> str:
+        """OSC 7501 state for a settled turn: done, idle (interrupted) or error (failed, no answer)."""
+        result = turn.result or {}
+        if result.get("interrupted"):
+            return "idle"
+        if (result.get("failed") or result.get("partial")) and not result.get("final_response"):
+            return "error"
+        return "done"
 
     def _chat_render_turn(self, turn, agent_thread, interrupt_msg):
         """Post-turn display: errors, interrupt marker, reasoning/response panels, bell, re-queues.

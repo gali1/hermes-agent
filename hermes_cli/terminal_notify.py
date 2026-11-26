@@ -13,6 +13,7 @@ terminal). Never raises.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -74,3 +75,32 @@ def notification_sequence(context: str, *, prompt: bool, session_id: str = "", d
         event = "permission_request" if prompt else "stop"
         seq += warp_osc777(event, detail or context, session_id)
     return seq
+
+
+# --- OSC 7501: Program Status Protocol -------------------------------------
+# ``ESC ] 7501 ; state=...:app=...:msg=... ESC \`` — the agent tells the terminal what it is doing
+# (idle, working, done, blocked, error). Herdr, cmux, Ghostty and Rex consume it; every other
+# terminal ignores an unknown OSC, so emitting it is safe everywhere. The record is what populates
+# an agent sidebar: a program that never reports is just a terminal to those tools.
+_OSC7501_END = "\x1b\\"
+_OSC7501_KINDS = frozenset({"permission", "question", "auth"})
+_OSC7501_OFF = {"0", "false", "no", "off"}
+
+
+def status_enabled(env=None) -> bool:
+    """True unless ``HERMES_OSC_STATUS`` is set to 0/false/no/off."""
+    env = os.environ if env is None else env
+    return (env.get("HERMES_OSC_STATUS", "1") or "1").strip().lower() not in _OSC7501_OFF
+
+
+def osc7501(state: str, *, app: str = "hermes", kind: str = "", msg: str = "") -> str:
+    """One OSC 7501 record. ``msg`` is base64 (the protocol's encoding for a human line)."""
+    fields = [f"state={state}"]
+    if kind in _OSC7501_KINDS:
+        fields.append(f"kind={kind}")
+    safe_app = _C0_AND_DEL.sub("", app or "")
+    if safe_app:
+        fields.append(f"app={safe_app}")
+    if msg:
+        fields.append("msg=" + base64.b64encode(msg.encode("utf-8", "replace")).decode("ascii"))
+    return "\x1b]7501;" + ":".join(fields) + _OSC7501_END
