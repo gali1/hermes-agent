@@ -622,6 +622,26 @@ class CLIModalMixin:
 
         _run_on_app_loop(app, _emit)
 
+    def _announce_agent_ready(self, app) -> None:
+        """Emit OSC 7501 ``idle`` on the first paint.
+
+        Reporting before ``app.run()`` races prompt_toolkit's startup reset, which wipes an earlier
+        record — and a first run (migrations, update banner) can clear the screen several times.
+        Pinning the report to the first render makes the pane appear in an agent sidebar reliably.
+        """
+        reported = []
+
+        def _once(*_args, **_kwargs) -> None:
+            if reported:
+                return
+            reported.append(True)
+            self._report_agent_status("idle")
+
+        try:
+            app.after_render += _once
+        except Exception:
+            self._report_agent_status("idle")
+
     def _clarify_teardown(self) -> None:
         self._clarify_state = None
         self._clarify_freetext = False
