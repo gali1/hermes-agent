@@ -226,6 +226,28 @@ class CLIStreamMixin:
 
         return paste_ref_re.sub(_expand_ref, text)
 
+    def _resolve_paste_image_refs(self, text: str | None, images: list | None = None) -> list:
+        """Images named by ``[Pasted image #n → path]`` placeholders, added to *images*.
+
+        The image counterpart of :meth:`_expand_paste_references`: text placeholders become
+        their file contents, image placeholders become an attachment pointing at the staged
+        file in ``~/.hermes/pastes/``. De-duplicated, existing paths only.
+        """
+        from hermes_cli.paste_capture import image_refs
+        out = list(images or [])
+        seen = {str(p) for p in out}
+        for path in image_refs(text):
+            if str(path) in seen:
+                continue
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
+                continue
+            out.append(path)
+            seen.add(str(path))
+        return out
+
     def _print_user_message_preview(self, user_input: str) -> None:
         """Render a user message using the normal chat scrollback style."""
         from cli import ChatConsole, _accent_hex

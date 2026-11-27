@@ -301,6 +301,132 @@ def _windows_save(dest: Path) -> bool:
     return _ps_clipboard(ps, 15, "Windows", dest)
 
 
+# ── Clipboard image *files* (Explorer/Finder/URI-list copies) ────────────
+#
+# Distinct from the bitmap strategies above: copying a file in Explorer puts a FileDrop list
+# on the clipboard, not a bitmap. Reading the file directly keeps the original bytes (no
+# re-encode) and works for any path the OS can open — other volumes, mapped drives, SMB
+# shares, NFS mounts. Paths travel as base64 so non-ASCII names survive the PowerShell hop.
+
+_PS_FILE_LIST = (
+    "try { "
+    "$files = Get-Clipboard -Format FileDropList -ErrorAction Stop;"
+    f"$exts = @({_FILEDROP_IMAGE_EXTS});"
+    "@($files) | Where-Object { $exts -contains "
+    "([System.IO.Path]::GetExtension($_.ToString()).ToLowerInvariant()) } | ForEach-Object { "
+    "$p = $_.ToString(); if (Test-Path -LiteralPath $p -PathType Leaf) { "
+    "[System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($p)) } }"
+    "} catch { }"
+)
+
+
+def _windows_file_images() -> list[Path]:
+    ps = _get_ps_exe()
+    if ps is None:
+        return []
+    try:
+        r = subprocess.run([ps, *_PS_FLAGS, "-Command", _PS_FILE_LIST], timeout=8, **_TEXT)
+    except Exception as e:
+        logger.debug("Windows clipboard file-list probe failed: %s", e)
+        return []
+    if r.returncode != 0:
+        return []
+    out: list[Path] = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            candidate = Path(base64.b64decode(line, validate=True).decode("utf-8"))
+        except Exception:
+            continue
+        if candidate.suffix.lower() in _FILE_IMAGE_EXTS and os.path.isfile(candidate):
+            out.append(candidate)
+    return out
+
+
+_URI_LIST_COMMANDS = (
+    (("wl-paste", "--type", "text/uri-list"), True),
+    (("xclip", "-selection", "clipboard", "-t", "text/uri-list", "-o"), False),
+)
+
+
+def _parse_uri_list(text: str) -> list[Path]:
+    """``file://`` entries of a text/uri-list payload, as local paths."""
+    from urllib.parse import unquote, urlparse
+    from urllib.request import url2pathname
+    out: list[Path] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or not line.lower().startswith("file://"):
+            continue
+        candidate = Path(url2pathname(unquote(urlparse(line).path)))
+        if candidate.suffix.lower() in _FILE_IMAGE_EXTS and os.path.isfile(candidate):
+            out.append(candidate)
+    return out
+
+
+def _linux_file_images() -> list[Path]:
+    for argv, missing_log in _URI_LIST_COMMANDS:
+        try:
+            r = subprocess.run(argv, timeout=3, **_TEXT)
+        except FileNotFoundError:
+            if missing_log:
+                logger.debug("%s not installed — URI-list clipboard unavailable", argv[0])
+            continue
+        except Exception as e:
+            logger.debug("%s uri-list read failed: %s", argv[0], e)
+            continue
+        if r.returncode == 0:
+            found = _parse_uri_list(r.stdout)
+            if found:
+                return found
+    return []
+
+
+def clipboard_image_files() -> list[Path]:
+    """Image files currently sitting on the clipboard (copied in a file manager), if any."""
+    try:
+        if sys.platform == "darwin":
+            single = _macos_clipboard_file_image()
+            return [single] if single else []
+        if sys.platform == "win32":
+            return _windows_file_images()
+        if _is_wsl():
+            found = _windows_file_images_from_wsl()
+            if found:
+                return found
+        return _linux_file_images()
+    except Exception as e:  # a blocked clipboard must never break a paste
+        logger.debug("clipboard image-file probe failed: %s", e)
+        return []
+
+
+def _windows_file_images_from_wsl() -> list[Path]:
+    """WSL2: the Windows clipboard holds Windows paths — translate them to /mnt paths."""
+    try:
+        r = subprocess.run(["powershell.exe", *_PS_FLAGS, "-Command", _PS_FILE_LIST], timeout=8, **_TEXT)
+    except Exception:
+        return []
+    out: list[Path] = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            win = Path(base64.b64decode(line, validate=True).decode("utf-8"))
+        except Exception:
+            continue
+        try:
+            translated = Path(subprocess.run(
+                ["wslpath", "-u", str(win)], timeout=3, **_TEXT).stdout.strip() or "")
+        except Exception:
+            continue
+        if translated and translated.suffix.lower() in _FILE_IMAGE_EXTS and os.path.isfile(translated):
+            out.append(translated)
+    return out
+
+
 # ── Linux: WSL (powershell.exe) → Wayland (wl-paste) → X11 (xclip) ───────
 
 def _linux_save(dest: Path) -> bool:

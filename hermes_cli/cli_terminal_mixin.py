@@ -584,6 +584,41 @@ class CLITerminalMixin:
         self._image_counter -= 1
         return False
 
+    def _capture_paste_image(self):
+        """Stage the pasted image into ``~/.hermes/pastes/`` and attach it.
+
+        The image half of a collapsed paste: the bytes are copied (never re-encoded) into the
+        same directory text pastes use, and a ``[Pasted image #n: WxH FMT → path]`` placeholder
+        names that local path — so the image stays readable for the rest of the session, and
+        after the clipboard has moved on. Mirrors :meth:`_tui_collapse_paste` on purpose.
+        Returns ``(path, placeholder)`` or ``None`` when the clipboard holds no image.
+        """
+        from hermes_cli import paste_capture
+        counter = getattr(self, "_tui_paste_counter", 0) + 1
+        staged = paste_capture.capture_clipboard_image(get_hermes_home() / "pastes", counter)
+        if staged is None:
+            return None
+        path, origin = staged
+        self._tui_paste_counter = counter
+        if path not in self._attached_images:
+            self._attached_images.append(path)
+        return path, paste_capture.image_placeholder(counter, path, origin=origin)
+
+    def _stage_paste_image_file(self, src):
+        """Copy an image file from *src* into ``~/.hermes/pastes/`` and attach it.
+
+        Used by ``/paste <path>`` so an image anywhere the OS can read — another local volume,
+        a mapped drive, an SMB share, an NFS mount — lands in the same place a paste would,
+        byte-for-byte, and gets the same placeholder. Returns ``(path, placeholder)``.
+        """
+        from hermes_cli import paste_capture
+        counter = getattr(self, "_tui_paste_counter", 0) + 1
+        staged = paste_capture.stage_image_file(src, get_hermes_home() / "pastes", counter)
+        self._tui_paste_counter = counter
+        if staged not in self._attached_images:
+            self._attached_images.append(staged)
+        return staged, paste_capture.image_placeholder(counter, staged, origin=src)
+
     def _write_osc52_clipboard(self, text: str) -> None:
         """Copy *text* to the terminal clipboard via OSC 52.
 
