@@ -109,6 +109,11 @@ class CLITuiRuntimeMixin:
 
         if isinstance(user_input, str) and _PASTE_REF_RE.search(user_input):
             user_input = self._expand_paste_references(user_input)
+        # A pasted-image reference names a file staged in ~/.hermes/pastes/. Ride that image
+        # along with the turn like a Ctrl+V attachment, keeping the path in the text so the
+        # file stays reachable later — the same contract a collapsed text paste has.
+        if isinstance(user_input, str):
+            submit_images = self._resolve_paste_image_refs(user_input, submit_images)
         _cprint("")
         self._print_user_message_preview(notification_preview or user_input)
 

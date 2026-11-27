@@ -1706,8 +1706,18 @@ class CLITuiMixin(CLITuiComposerEditMixin):
         pasted_text, _had_mouse_reports = _strip_leaked_terminal_responses_with_meta(pasted_text)
         if _had_mouse_reports:
             self._recover_terminal_input_modes(reason="mouse reports leaked into bracketed paste payload")
-        if _should_auto_attach_clipboard_image_on_paste(pasted_text) and self._try_attach_clipboard_image():
-            event.app.invalidate()
+        if _should_auto_attach_clipboard_image_on_paste(pasted_text):
+            # Image half of the same contract text pastes already use: stage the bytes in
+            # ~/.hermes/pastes/ and leave a reference naming that local path, instead of a
+            # clipboard transient the next copy silently replaces.
+            _captured = self._capture_paste_image()
+            if _captured:
+                _buf = event.current_buffer
+                _prefix = ("\n" if _buf.cursor_position > 0
+                           and _buf.text[_buf.cursor_position - 1] != '\n' else "")
+                _buf.insert_text(_prefix + _captured[1])
+                self._tui_paste_just_collapsed = True
+                event.app.invalidate()
         if pasted_text:
             # Sanitize surrogates (Word/Google Docs paste) before writing.
             from agent.message_sanitization import _sanitize_surrogates

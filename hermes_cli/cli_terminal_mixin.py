@@ -584,6 +584,40 @@ class CLITerminalMixin:
         self._image_counter -= 1
         return False
 
+    def _capture_paste_image(self):
+        """Stage the clipboard image into ``~/.hermes/pastes/`` and attach it.
+
+        The image half of a collapsed paste: bytes are copied (never re-encoded) into the
+        directory text pastes use, and a ``[Pasted image #n: WxH FMT → path]`` reference
+        names that local path — readable for the rest of the session and after the
+        clipboard has moved on. Returns ``(path, placeholder)`` or ``None``.
+        """
+        from hermes_cli import paste_image
+        counter = getattr(self, "_tui_paste_counter", 0) + 1
+        captured = paste_image.capture_clipboard(paste_image.paste_dir(), counter)
+        if captured is None:
+            return None
+        path, origin = captured
+        self._tui_paste_counter = counter
+        if path not in self._attached_images:
+            self._attached_images.append(path)
+        return path, paste_image.placeholder(counter, path, origin=origin)
+
+    def _stage_paste_image_file(self, src):
+        """Copy an image file from *src* into ``~/.hermes/pastes/`` and attach it.
+
+        Used by ``/paste <path>`` so an image anywhere the OS can read — another volume, a
+        mapped drive, an SMB share, an NFS mount — lands where a paste would, byte-for-byte,
+        under the same reference. Returns ``(path, placeholder)``.
+        """
+        from hermes_cli import paste_image
+        counter = getattr(self, "_tui_paste_counter", 0) + 1
+        staged = paste_image.stage_path(src, paste_image.paste_dir(), counter)
+        self._tui_paste_counter = counter
+        if staged not in self._attached_images:
+            self._attached_images.append(staged)
+        return staged, paste_image.placeholder(counter, staged, origin=src)
+
     def _write_osc52_clipboard(self, text: str) -> None:
         """Copy *text* to the terminal clipboard via OSC 52.
 
