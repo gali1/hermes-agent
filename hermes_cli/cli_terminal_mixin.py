@@ -602,6 +602,9 @@ class CLITerminalMixin:
         self._tui_paste_counter = counter
         if path not in self._attached_images:
             self._attached_images.append(path)
+            # The attachment badge numbers itself from _image_counter, not from the paste
+            # counter — without this a staged paste showed "Image #0" under a "#1" reference.
+            self._image_counter = getattr(self, "_image_counter", 0) + 1
         return path, paste_capture.image_placeholder(counter, path, origin=origin)
 
     def _stage_paste_image_file(self, src):
@@ -617,6 +620,7 @@ class CLITerminalMixin:
         self._tui_paste_counter = counter
         if staged not in self._attached_images:
             self._attached_images.append(staged)
+            self._image_counter = getattr(self, "_image_counter", 0) + 1
         return staged, paste_capture.image_placeholder(counter, staged, origin=src)
 
     def _write_osc52_clipboard(self, text: str) -> None:

@@ -311,6 +311,26 @@ def test_resolve_drops_an_attachment_that_no_longer_exists(tmp_path):
     assert HermesCLI._resolve_paste_image_refs(object(), "no refs here", [gone]) == []
 
 
+def test_a_staged_paste_advances_the_attachment_badge_once(tmp_path):
+    """The badge numbers from _image_counter, so a staged paste used to read "Image #0" under a
+    "#1" reference; a re-paste of the same file must not bump it again."""
+    src = _write(tmp_path / "shot.png", _png(12, 7))
+    fake = HermesCLI.__new__(HermesCLI)
+    fake._attached_images = []
+    fake._tui_paste_counter = 0
+    fake._image_counter = 0
+
+    with patch("hermes_cli.clipboard.clipboard_image_files", return_value=[src]), \
+         patch("hermes_cli.cli_terminal_mixin.get_hermes_home", return_value=tmp_path):
+        first = fake._capture_paste_image()
+        second = fake._capture_paste_image()
+
+    assert first and second
+    assert first[0] == second[0]                      # dedupe reused the file
+    assert len(fake._attached_images) == 1
+    assert fake._image_counter == 1                   # one badge, not zero and not two
+
+
 def _write(path: Path, data: bytes) -> Path:
     path.write_bytes(data)
     return path
