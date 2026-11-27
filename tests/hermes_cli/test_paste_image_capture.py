@@ -25,6 +25,8 @@ from hermes_cli.paste_capture import (
     image_dimensions,
     image_placeholder,
     image_refs,
+    load_index,
+    remember_paste,
     stage_image_file,
 )
 
@@ -222,6 +224,91 @@ def test_resolve_paste_image_refs_skips_paths_that_vanished(tmp_path):
     gone = tmp_path / "pastes" / "paste_1_000000.png"
     text = image_placeholder(1, gone)
     assert HermesCLI._resolve_paste_image_refs(object(), text, []) == []
+
+
+# ── hostile file names, repeat pastes, and the index fallback ────────────
+
+
+def test_reference_survives_brackets_in_the_source_name(tmp_path):
+    """A `]` in the copied file's name used to truncate the reference: the tail stopped at the
+    bracket and the image vanished at submit time."""
+    src = _write(tmp_path / "bracket ]name.png", _png(16, 8))
+    paste_dir = tmp_path / "pastes"
+    staged = stage_image_file(src, paste_dir, 11)
+    placeholder = image_placeholder(11, staged, origin=src)
+
+    assert "]" not in placeholder.split("\u2192")[0]        # origin part is escaped for display
+    assert image_refs(placeholder, paste_dir) == [staged]
+
+
+def test_reference_survives_an_arrow_in_the_source_name(tmp_path):
+    """U+2192 inside a file name used to split the tail at the wrong arrow."""
+    src = _write(tmp_path / "arrow \u2192 in name.png", _png(9, 6))
+    paste_dir = tmp_path / "pastes"
+    staged = stage_image_file(src, paste_dir, 12)
+    placeholder = image_placeholder(12, staged, origin=src)
+
+    assert image_refs(placeholder, paste_dir) == [staged]
+
+
+def test_literal_path_wins_over_the_index(tmp_path):
+    """A recalled older prompt must keep its own image even though counters restart per session."""
+    paste_dir = tmp_path / "pastes"
+    first = stage_image_file(_write(tmp_path / "a.png", _png(4, 4)), paste_dir, 1)
+    second = stage_image_file(_write(tmp_path / "b.png", _png(5, 5)), paste_dir, 1)  # same counter, new session
+    assert first != second
+    assert image_refs(image_placeholder(1, first), paste_dir) == [first]
+
+
+def test_the_same_bytes_are_staged_once(tmp_path):
+    """Pasting the same screenshot twice produced two identical files and two copies to the model."""
+    paste_dir = tmp_path / "pastes"
+    src = _write(tmp_path / "shot.png", _png(20, 10))
+    one = stage_image_file(src, paste_dir, 21)
+    two = stage_image_file(src, paste_dir, 22)
+
+    assert one == two
+    assert sorted(p.name for p in paste_dir.glob("*.png")) == [one.name]
+
+
+def test_corrupt_clipboard_bitmap_is_rejected(tmp_path):
+    """The bitmap branch used to trust the extractor: junk bytes became a broken attachment."""
+    def fake_save(dest: Path) -> bool:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"not an image at all")
+        return True
+
+    paste_dir = tmp_path / "pastes"
+    with patch("hermes_cli.clipboard.clipboard_image_files", return_value=[]), \
+         patch("hermes_cli.clipboard.save_clipboard_image", side_effect=fake_save):
+        assert capture_clipboard_image(paste_dir, 31) is None
+
+    assert not list(paste_dir.glob("*.png"))
+
+
+def test_index_drops_entries_whose_file_vanished(tmp_path):
+    paste_dir = tmp_path / "pastes"
+    staged = stage_image_file(_write(tmp_path / "a.png", _png(3, 3)), paste_dir, 41)
+    assert [e["id"] for e in load_index(paste_dir)] == [41]
+
+    staged.unlink()
+    assert load_index(paste_dir) == []
+
+
+def test_remember_paste_keeps_the_latest_entry_per_counter(tmp_path):
+    paste_dir = tmp_path / "pastes"
+    first = _write(tmp_path / "a.png", _png(3, 3))
+    second = _write(tmp_path / "b.png", _png(4, 4))
+    remember_paste(paste_dir, 7, first)
+    remember_paste(paste_dir, 7, second)
+
+    entries = load_index(paste_dir)
+    assert len(entries) == 1 and Path(entries[0]["path"]) == second
+
+
+def test_resolve_drops_an_attachment_that_no_longer_exists(tmp_path):
+    gone = tmp_path / "pastes" / "paste_9_000000.png"
+    assert HermesCLI._resolve_paste_image_refs(object(), "no refs here", [gone]) == []
 
 
 def _write(path: Path, data: bytes) -> Path:

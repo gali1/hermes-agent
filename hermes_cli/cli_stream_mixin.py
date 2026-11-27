@@ -231,21 +231,26 @@ class CLIStreamMixin:
 
         The image counterpart of :meth:`_expand_paste_references`: text placeholders become
         their file contents, image placeholders become an attachment pointing at the staged
-        file in ``~/.hermes/pastes/``. De-duplicated, existing paths only.
+        file in ``~/.hermes/pastes/``. De-duplicated, existing paths only — an attachment whose
+        file was deleted (or a paste reference to a pruned paste) is dropped rather than handed
+        to the model as a path that cannot be read.
         """
+        from cli import logger
         from hermes_cli.paste_capture import image_refs
-        out = list(images or [])
-        seen = {str(p) for p in out}
-        for path in image_refs(text):
-            if str(path) in seen:
-                continue
+        out: list = []
+        for path in list(images or []):
             try:
-                if not path.is_file():
-                    continue
+                if Path(str(path)).is_file():
+                    out.append(path)
+                else:
+                    logger.warning("Dropping attachment that no longer exists: %s", path)
             except OSError:
                 continue
-            out.append(path)
-            seen.add(str(path))
+        seen = {str(p) for p in out}
+        for path in image_refs(text):
+            if str(path) not in seen:
+                out.append(path)
+                seen.add(str(path))
         return out
 
     def _print_user_message_preview(self, user_input: str) -> None:

@@ -210,7 +210,7 @@ class CLICommandsSessionToolsMixin:
                 _path, placeholder = self._stage_paste_image_file(image_path)
             except Exception as exc:
                 return _cp(_dim_line(f"(>_<) Could not stage {image_path.name}: {exc}"))
-            return self._paste_image_reference(placeholder)
+            return self._paste_image_reference(placeholder, label=f"Image staged from {image_path.name}")
 
         captured = self._capture_paste_image()
         if captured is None:
@@ -219,11 +219,12 @@ class CLICommandsSessionToolsMixin:
             return _cp(_dim_line(_t(key)))
         return self._paste_image_reference(captured[1])
 
-    def _paste_image_reference(self, placeholder: str) -> None:
+    def _paste_image_reference(self, placeholder: str, *, label: str | None = None) -> None:
         """Put the image placeholder where the next prompt will carry it.
 
         Inserted into the composer when it is live (so the path travels with the prompt, like a
-        collapsed text paste); printed instead when it is not.
+        collapsed text paste); printed instead when it is not. *label* names the confirmation
+        line, so a staged file does not claim it came from the clipboard.
         """
         app = getattr(self, "_app", None)
         buf = getattr(app, "current_buffer", None) if app is not None else None
@@ -235,7 +236,10 @@ class CLICommandsSessionToolsMixin:
             app.invalidate()
         except Exception:
             pass
-        _cp(f"  {_t('paste.attached', index=len(self._attached_images))}")
+        if label:
+            _cp(f"  \U0001F4CE {label}")
+        else:
+            _cp(f"  {_t('paste.attached', index=len(self._attached_images))}")
 
     def _handle_copy_command(self, cmd_original: str) -> None:
         """Handle /copy [number] — copy assistant output to clipboard."""

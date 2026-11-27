@@ -20,6 +20,8 @@ Pillow is used only as a fallback when it happens to be importable.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -36,6 +38,17 @@ IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif"
 #: ``[Pasted image #3: 1280x720 PNG (copied from E:\a.png) → C:\...\paste_3_231502.png]``
 #: Group 1 is the counter, group 2 the local path (the last thing before the closing bracket).
 PASTE_IMAGE_REF_RE = re.compile(r"\[Pasted image #(\d+):[^\]]*?\u2192\s*(.+?)\]")
+
+#: Counter-only probe. A path may legally contain ``]`` or ``→`` (a file the user copied can
+#: be named anything), which makes the human-readable reference ambiguous — so the index below
+#: is the authoritative counter → path map, and this scan is what survives such a name.
+PASTE_IMAGE_COUNTER_RE = re.compile(r"\[Pasted image #(\d+):")
+
+#: Sidecar in the paste directory. Small, append-only by rewrite, and fail-open: it only exists
+#: to recover the path when the readable reference is ambiguous, and to spot a re-paste of the
+#: same bytes. Never trusted without re-checking the file on disk.
+INDEX_NAME = ".image-index.json"
+_INDEX_MAX = 400
 
 _MAGIC = (
     (b"\x89PNG\r\n\x1a\n", "PNG", ".png"),
@@ -181,13 +194,109 @@ def describe_image(path: Path) -> str:
     return f"{dims[0]}x{dims[1]} {name}" if dims else name
 
 
+# ── paste index (counter → path, and byte dedupe) ────────────────────────
+
+
+def _default_paste_dir() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "pastes"
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / "pastes"
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Streamed digest; None when the file cannot be read."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def load_index(paste_dir: Path | str | None = None) -> list[dict]:
+    """Counter → path entries, oldest first, with vanished files dropped.
+
+    Fail-open by design: a corrupt or missing index only costs the fallback resolution path
+    (the readable reference still works for well-behaved file names).
+    """
+    directory = Path(paste_dir) if paste_dir is not None else _default_paste_dir()
+    try:
+        raw = json.loads((directory / INDEX_NAME).read_text(encoding="utf-8"))
+        entries = raw.get("entries") if isinstance(raw, dict) else raw
+    except (OSError, ValueError):
+        return []
+    out: list[dict] = []
+    for entry in entries or []:
+        try:
+            path = Path(entry["path"])
+            if not path.is_file():
+                continue
+            out.append({"id": int(entry["id"]), "path": str(path), "sha": entry.get("sha"),
+                        "size": entry.get("size"), "origin": entry.get("origin")})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out[-_INDEX_MAX:]
+
+
+def remember_paste(paste_dir: Path | str, counter: int, path: Path, *,
+                   sha: str | None = None, size: int | None = None,
+                   origin: Path | str | None = None) -> None:
+    """Record counter → path so an ambiguous reference can still be resolved later."""
+    try:
+        directory = Path(paste_dir)
+        entries = [e for e in load_index(directory) if e["id"] != int(counter)]
+        if size is None:
+            size = path.stat().st_size if path.is_file() else None
+        entries.append({
+            "id": int(counter), "path": str(path),
+            "sha": sha if sha is not None else _sha256_file(path), "size": size,
+            "origin": str(origin) if origin else None,
+            "at": datetime.now().isoformat(timespec="seconds")})
+        directory.mkdir(parents=True, exist_ok=True)
+        tmp = directory / (INDEX_NAME + ".tmp")
+        tmp.write_text(json.dumps({"entries": entries[-_INDEX_MAX:]}, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, directory / INDEX_NAME)
+    except Exception as e:  # never let bookkeeping break a paste
+        logger.debug("paste index not updated: %s", e)
+
+
+def _already_staged(paste_dir: Path | str, sha: str, size: int) -> Path | None:
+    """An existing paste file with these exact bytes/size — the same image pasted twice."""
+    for entry in reversed(load_index(paste_dir)):
+        if entry.get("sha") != sha:
+            continue
+        candidate = Path(entry["path"])
+        try:
+            if candidate.stat().st_size == size:
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 # ── staging into the paste directory ─────────────────────────────────────
 
 
 def next_paste_path(paste_dir: Path, counter: int, suffix: str = ".png") -> Path:
-    """``<paste_dir>/paste_<counter>_<HHMMSS><suffix>`` — same shape as collapsed text pastes."""
+    """``<paste_dir>/paste_<counter>_<HHMMSS><suffix>`` — same shape as collapsed text pastes.
+
+    Never reuses a name that already exists: a counter restarting in a second session must not
+    overwrite an image pasted earlier in the day (`_2`, `_3`, … disambiguate).
+    """
     paste_dir.mkdir(parents=True, exist_ok=True)
-    return paste_dir / f"paste_{counter}_{datetime.now().strftime('%H%M%S')}{suffix.lower()}"
+    stem = f"paste_{counter}_{datetime.now().strftime('%H%M%S')}"
+    ext = suffix.lower()
+    candidate = paste_dir / f"{stem}{ext}"
+    n = 2
+    while candidate.exists():
+        candidate = paste_dir / f"{stem}_{n}{ext}"
+        n += 1
+    return candidate
 
 
 def _settle_extension(path: Path) -> Path:
@@ -208,11 +317,14 @@ def _settle_extension(path: Path) -> Path:
     return path
 
 
-def stage_image_file(src: Path | str, paste_dir: Path, counter: int) -> Path:
-    """Copy an image file into the paste directory, byte-for-byte, and return the new path.
+def stage_image_file(src: Path | str, paste_dir: Path, counter: int, *,
+                     dedupe: bool = True) -> Path:
+    """Copy an image file into the paste directory, byte-for-byte, and return its path.
 
     Works for any path the OS can read (other volumes, mapped drives, SMB, NFS). The copy is
-    verified against the source size before it is published; a partial copy never survives.
+    verified against the source digest before it is published; a partial copy never survives.
+    With *dedupe*, re-staging bytes that are already in the directory returns the existing
+    file instead of duplicating it (pasting the same screenshot twice is one file, one image).
     """
     src = Path(os.path.expanduser(str(src)))
     if not src.is_file():
@@ -221,6 +333,13 @@ def stage_image_file(src: Path | str, paste_dir: Path, counter: int) -> Path:
     fmt = _detect_format(src)
     if fmt is None:
         raise ValueError(f"not a readable image: {src}")
+    size = src.stat().st_size
+    sha = _sha256_file(src)
+    if dedupe and sha:
+        existing = _already_staged(paste_dir, sha, size)
+        if existing is not None:
+            remember_paste(paste_dir, counter, existing, sha=sha, size=size, origin=src)
+            return existing
     suffix = src.suffix if src.suffix.lower() in IMAGE_EXTS else fmt[1]
     dest = next_paste_path(paste_dir, counter, suffix)
     if src.resolve() == dest.resolve():
@@ -228,14 +347,17 @@ def stage_image_file(src: Path | str, paste_dir: Path, counter: int) -> Path:
     part = dest.with_name(dest.name + ".part")
     try:
         shutil.copyfile(src, part)
-        if part.stat().st_size != src.stat().st_size:
+        if part.stat().st_size != size:
             raise OSError(f"short copy: {src} -> {dest}")
+        if sha and _sha256_file(part) != sha:
+            raise OSError(f"digest mismatch after copy: {src} -> {dest}")
         os.replace(part, dest)
     finally:
         part.unlink(missing_ok=True)
     dest = _settle_extension(dest)
     if not dest.exists() or dest.stat().st_size == 0:
         raise OSError(f"staged image is empty: {dest}")
+    remember_paste(paste_dir, counter, dest, sha=sha, size=size, origin=src)
     return dest
 
 
@@ -259,35 +381,79 @@ def capture_clipboard_image(paste_dir: Path, counter: int) -> tuple[Path, Path |
     try:
         if save_clipboard_image(dest):
             dest = _settle_extension(dest)
-            if dest.exists() and dest.stat().st_size > 0:
-                return dest, None
+            # A bitmap extraction can hand back junk (a partial PNG, a mislabelled container):
+            # hold it to the same bar as a file source instead of passing a broken image on.
+            if not dest.exists() or dest.stat().st_size == 0 or _detect_format(dest) is None:
+                dest.unlink(missing_ok=True)
+                return None
+            size = dest.stat().st_size
+            sha = _sha256_file(dest)
+            if sha:
+                existing = _already_staged(paste_dir, sha, size)
+                if existing is not None:
+                    dest.unlink(missing_ok=True)
+                    remember_paste(paste_dir, counter, existing, sha=sha, size=size)
+                    return existing, None
+            remember_paste(paste_dir, counter, dest, sha=sha, size=size)
+            return dest, None
     except Exception as e:
         logger.debug("clipboard bitmap extraction failed: %s", e)
     dest.unlink(missing_ok=True)
     return None
 
 
+_ORIGIN_ESCAPES = {"[": "(", "]": ")", chr(0x2192): "->"}
+
+
+def _display_origin(origin: Path | str) -> str:
+    """Source path as it may appear inside the reference: brackets and arrows in a file name
+    would otherwise end or split the reference early."""
+    text = str(origin)
+    for bad, good in _ORIGIN_ESCAPES.items():
+        text = text.replace(bad, good)
+    return text
+
+
 def image_placeholder(counter: int, path: Path, *, origin: Path | None = None) -> str:
     """The composer reference for a staged image — same contract as a text-paste placeholder."""
     label = describe_image(path)
     if origin is not None and Path(origin) != Path(path):
-        return f"[Pasted image #{counter}: {label} (copied from {origin}) \u2192 {path}]"
+        return f"[Pasted image #{counter}: {label} (copied from {_display_origin(origin)}) \u2192 {path}]"
     return f"[Pasted image #{counter}: {label} \u2192 {path}]"
 
 
-def image_refs(text: str | None) -> list[Path]:
-    """Local image paths referenced by paste placeholders in *text*, in order, de-duplicated."""
+def image_refs(text: str | None, paste_dir: Path | str | None = None) -> list[Path]:
+    """Local image paths referenced by paste placeholders in *text*, in order, de-duplicated.
+
+    The literal path in the reference is tried first (it names exactly the file the prompt
+    refers to, so a recalled older prompt keeps its own image); the paste index is the fallback
+    for references whose readable part is ambiguous — a source file named with `]` or `→` — and
+    for pastes staged before the index existed.
+    """
     if not isinstance(text, str) or "[Pasted image #" not in text:
         return []
+    directory = Path(paste_dir) if paste_dir is not None else _default_paste_dir()
+    indexed = {entry["id"]: Path(entry["path"]) for entry in load_index(directory)}
+    literal = {int(counter): Path(raw.strip()) for counter, raw in PASTE_IMAGE_REF_RE.findall(text)}
     out: list[Path] = []
-    for _counter, raw in PASTE_IMAGE_REF_RE.findall(text):
-        path = Path(raw.strip())
-        if path not in out:
-            out.append(path)
+    for raw_counter in PASTE_IMAGE_COUNTER_RE.findall(text):
+        counter = int(raw_counter)
+        for candidate in (literal.get(counter), indexed.get(counter)):
+            if candidate is None:
+                continue
+            try:
+                if not candidate.is_file():
+                    continue
+            except OSError:
+                continue
+            if candidate not in out:
+                out.append(candidate)
+            break
     return out
 
 
 __all__ = [
-    "IMAGE_EXTS", "PASTE_IMAGE_REF_RE", "capture_clipboard_image", "describe_image",
-    "image_dimensions", "image_placeholder", "image_refs", "next_paste_path", "stage_image_file",
+    "IMAGE_EXTS", "INDEX_NAME", "PASTE_IMAGE_COUNTER_RE", "PASTE_IMAGE_REF_RE",
+    "capture_clipboard_image", "describe_image", "image_dimensions", "image_placeholder",
+    "image_refs", "load_index", "next_paste_path", "remember_paste", "stage_image_file",
 ]
