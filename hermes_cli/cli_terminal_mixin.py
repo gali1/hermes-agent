@@ -584,6 +584,60 @@ class CLITerminalMixin:
         self._image_counter -= 1
         return False
 
+    def _capture_paste_image(self):
+        """Stage the pasted image into ``~/.hermes/pastes/`` and attach it.
+
+        The image half of a collapsed paste: the bytes are copied (never re-encoded) into the
+        same directory text pastes use, and a ``[Pasted image #n: WxH FMT → path]`` placeholder
+        names that local path — so the image stays readable for the rest of the session, and
+        after the clipboard has moved on. Mirrors :meth:`_tui_collapse_paste` on purpose.
+        Returns ``(path, placeholder)`` or ``None`` when the clipboard holds no image.
+        """
+        from hermes_cli import paste_capture
+        counter = getattr(self, "_tui_paste_counter", 0) + 1
+        staged = paste_capture.capture_clipboard_image(get_hermes_home() / "pastes", counter)
+        if staged is None:
+            return None
+        path, origin = staged
+        return self._register_paste_image(path, origin, counter)
+
+    def _stage_paste_image_file(self, src):
+        """Copy an image file from *src* into ``~/.hermes/pastes/`` and attach it.
+
+        Used by ``/paste <path>`` so an image anywhere the OS can read — another local volume,
+        a mapped drive, an SMB share, an NFS mount — lands in the same place a paste would,
+        byte-for-byte, and gets the same placeholder. Returns ``(path, placeholder)``.
+        """
+        from hermes_cli import paste_capture
+        counter = getattr(self, "_tui_paste_counter", 0) + 1
+        staged = paste_capture.stage_image_file(src, get_hermes_home() / "pastes", counter)
+        return self._register_paste_image(staged, src, counter)
+
+    def _register_paste_image(self, path, origin, counter):
+        """Attach a staged image and give it the one number it will be known by.
+
+        Re-pasting bytes that are already attached must not mint a second reference: the file
+        is the same file, so the placeholder keeps its original number and the attachment list
+        keeps one entry. The badge row is numbered from ``_image_counter``, which is why an
+        attach advances it — otherwise the badge reads "#0" under a "#1" placeholder.
+        """
+        from hermes_cli import paste_capture
+        known = getattr(self, "_paste_image_refs", None)
+        if known is None:
+            known = self._paste_image_refs = {}
+        counter = known.get(path, counter)
+        attached = getattr(self, "_attached_images", None)
+        if attached is None:
+            attached = self._attached_images = []
+        if path not in attached:
+            attached.append(path)
+            self._image_counter = getattr(self, "_image_counter", 0) + 1
+        if path in known:
+            return path, paste_capture.image_placeholder(counter, path, origin=origin)
+        known[path] = counter
+        self._tui_paste_counter = counter
+        return path, paste_capture.image_placeholder(counter, path, origin=origin)
+
     def _write_osc52_clipboard(self, text: str) -> None:
         """Copy *text* to the terminal clipboard via OSC 52.
 

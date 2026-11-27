@@ -183,20 +183,63 @@ class CLICommandsSessionToolsMixin:
         except Exception as exc:
             _cp(f"  {_t('journey.failed', error=exc)}")
 
-    def _handle_paste_command(self):
-        """Handle /paste — explicitly check clipboard for an image.
+    def _handle_paste_command(self, cmd_original: str = ""):
+        """Handle /paste [path] — stage an image into ``~/.hermes/pastes/`` and attach it.
 
-        This is the reliable fallback for terminals where BracketedPaste
-        doesn't fire for image-only clipboard content (e.g., VSCode terminal,
-        Windows Terminal with WSL2).
+        No argument: take whatever image the clipboard holds — a raw bitmap, or an image *file*
+        copied in Explorer/Finder. With a path: copy that file (any path the OS can read, so
+        other volumes, mapped drives, SMB shares and NFS mounts all work).
+
+        Either way the bytes land in the same directory text pastes use and the same
+        ``[Pasted image #n: WxH FMT → path]`` reference is produced, so the image is a plain
+        local file the agent can open — not a clipboard transient. This remains the reliable
+        fallback for terminals where BracketedPaste does not fire for image-only clipboard
+        content (VSCode terminal, Windows Terminal + WSL2).
         """
-        from hermes_cli.clipboard import has_clipboard_image
-        if not has_clipboard_image():
-            _cp(_dim_line(_t("paste.no_image")))
-        elif self._try_attach_clipboard_image():
-            _cp(f"  {_t('paste.attached', index=len(self._attached_images))}")
+        from cli import _IMAGE_EXTENSIONS, _resolve_attachment_path, _split_path_input
+        raw_args = (cmd_original.split(None, 1)[1].strip() if " " in cmd_original else "")
+
+        if raw_args:
+            path_token, _remainder = _split_path_input(raw_args)
+            image_path = _resolve_attachment_path(path_token)
+            if image_path is None:
+                return _cp(_dim_line(_t("image.not_found", path=path_token)))
+            if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
+                return _cp(_dim_line(_t("image.unsupported", name=image_path.name)))
+            try:
+                _path, placeholder = self._stage_paste_image_file(image_path)
+            except Exception as exc:
+                return _cp(_dim_line(f"(>_<) Could not stage {image_path.name}: {exc}"))
+            return self._paste_image_reference(placeholder, label=f"Image staged from {image_path.name}")
+
+        captured = self._capture_paste_image()
+        if captured is None:
+            from hermes_cli.clipboard import has_clipboard_image
+            key = "paste.extract_failed" if has_clipboard_image() else "paste.no_image"
+            return _cp(_dim_line(_t(key)))
+        return self._paste_image_reference(captured[1])
+
+    def _paste_image_reference(self, placeholder: str, *, label: str | None = None) -> None:
+        """Put the image placeholder where the next prompt will carry it.
+
+        Inserted into the composer when it is live (so the path travels with the prompt, like a
+        collapsed text paste); printed instead when it is not. *label* names the confirmation
+        line, so a staged file does not claim it came from the clipboard.
+        """
+        app = getattr(self, "_app", None)
+        buf = getattr(app, "current_buffer", None) if app is not None else None
+        if buf is None or not getattr(app, "is_running", False):
+            return _cp(f"  {placeholder}")
+        prefix = "\n" if buf.cursor_position > 0 and buf.text[buf.cursor_position - 1] != "\n" else ""
+        buf.insert_text(prefix + placeholder)
+        try:
+            app.invalidate()
+        except Exception:
+            pass
+        if label:
+            _cp(f"  \U0001F4CE {label}")
         else:
-            _cp(_dim_line(_t("paste.extract_failed")))
+            _cp(f"  {_t('paste.attached', index=len(self._attached_images))}")
 
     def _handle_copy_command(self, cmd_original: str) -> None:
         """Handle /copy [number] — copy assistant output to clipboard."""
